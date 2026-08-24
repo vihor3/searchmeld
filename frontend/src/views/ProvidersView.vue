@@ -287,6 +287,10 @@
                   <div class="advanced-field-label">代理地址</div>
                   <el-input v-model="providerProxyURL" :disabled="!providerProxyEnabled" placeholder="http://127.0.0.1:7897" />
                 </div>
+                <div v-if="providerForm.name === 'jina'" class="advanced-field advanced-field-wide">
+                  <div class="advanced-field-label">Reader 地址</div>
+                  <el-input v-model="providerExtractBaseURL" placeholder="https://r.jina.ai" />
+                </div>
               </div>
             </el-tab-pane>
           </el-tabs>
@@ -431,6 +435,16 @@ const providerProxyURL = computed<string>({
   set(value: string) {
     if (!providerForm.value) return
     providerForm.value.settings = { ...(providerForm.value.settings || {}), proxy_url: value.trim() }
+  }
+})
+const providerExtractBaseURL = computed<string>({
+  get() {
+    const value = providerForm.value?.settings?.extract_base_url
+    return typeof value === 'string' ? value : ''
+  },
+  set(value: string) {
+    if (!providerForm.value) return
+    providerForm.value.settings = { ...(providerForm.value.settings || {}), extract_base_url: value.trim() }
   }
 })
 const providerPricePerRequest = computed<number>({
@@ -1107,4 +1121,3 @@ onMounted(load)
   }
 }
 </style>
-

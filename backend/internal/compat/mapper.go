@@ -55,6 +55,63 @@ func TavilyFromNative(query string, response model.SearchResponse) TavilySearchR
 	}
 }
 
+func TavilyExtractToNative(req TavilyExtractRequest) model.ExtractRequest {
+	options := map[string]interface{}{}
+	if req.Timeout != nil {
+		options["timeout"] = *req.Timeout
+	}
+	chunksPerSource := 0
+	if req.ChunksPerSource != nil {
+		chunksPerSource = *req.ChunksPerSource
+	}
+	return model.ExtractRequest{
+		URLs:               append([]string(nil), req.URLs...),
+		Providers:          req.Providers,
+		Mode:               model.SearchMode(req.Mode),
+		Query:              req.Query,
+		Format:             model.ExtractFormat(req.Format),
+		ExtractDepth:       req.ExtractDepth,
+		ChunksPerSource:    chunksPerSource,
+		ChunksPerSourceSet: req.ChunksPerSource != nil,
+		IncludeImages:      req.IncludeImages,
+		IncludeFavicon:     req.IncludeFavicon,
+		CompatFormat:       model.CompatFormatTavily,
+		Options:            options,
+	}
+}
+
+func TavilyExtractFromNative(req TavilyExtractRequest, response model.ExtractResponse) TavilyExtractResponse {
+	results := make([]TavilyExtractResult, 0, len(response.Results))
+	for _, item := range response.Results {
+		results = append(results, TavilyExtractResult{
+			URL:        item.URL,
+			RawContent: item.Content,
+			Images:     item.Images,
+			Favicon:    item.Favicon,
+		})
+	}
+	failed := make([]TavilyExtractFailure, 0, len(response.FailedResults))
+	for _, item := range response.FailedResults {
+		failed = append(failed, TavilyExtractFailure{URL: item.URL, Error: item.Error})
+	}
+	mapped := TavilyExtractResponse{
+		Results:       results,
+		FailedResults: failed,
+		ResponseTime:  float64(response.Meta.LatencyMS) / 1000,
+		RequestID:     response.Meta.RequestID,
+	}
+	if req.IncludeUsage {
+		credits := 0.0
+		for _, measurement := range response.Usage {
+			if strings.EqualFold(strings.TrimSpace(measurement.Unit), "credits") {
+				credits += measurement.Quantity
+			}
+		}
+		mapped.Usage = &TavilyExtractUsage{Credits: credits}
+	}
+	return mapped
+}
+
 func SerperToNative(req SerperSearchRequest) model.SearchRequest {
 	options := map[string]interface{}{}
 	if req.Page > 0 {

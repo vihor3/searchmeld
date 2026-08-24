@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net"
 	"net/url"
 	"sort"
 	"strings"
@@ -43,6 +44,7 @@ type Orchestrator struct {
 	quotaMu        sync.Mutex
 	quotaRefreshes map[int64]quotaRefreshState
 	searchGroup    singleflight.Group
+	lookupIPAddr   func(context.Context, string) ([]net.IPAddr, error)
 }
 
 type quotaRefreshState struct {
@@ -52,7 +54,13 @@ type quotaRefreshState struct {
 }
 
 func NewOrchestrator(registry *provider.Registry, keyPool KeyPool, store Store) *Orchestrator {
-	return &Orchestrator{registry: registry, keyPool: keyPool, store: store, quotaRefreshes: map[int64]quotaRefreshState{}}
+	return &Orchestrator{
+		registry:       registry,
+		keyPool:        keyPool,
+		store:          store,
+		quotaRefreshes: map[int64]quotaRefreshState{},
+		lookupIPAddr:   net.DefaultResolver.LookupIPAddr,
+	}
 }
 
 func (o *Orchestrator) Search(ctx context.Context, req model.SearchRequest, requestID string, apiTokenID int64) (model.SearchResponse, error) {
@@ -100,7 +108,7 @@ func (o *Orchestrator) Search(ctx context.Context, req model.SearchRequest, requ
 				cached.Meta.CacheKey = cacheKey
 				requestJSON, _ := json.Marshal(req)
 				responseJSON, _ := json.Marshal(cached)
-				_ = o.store.RecordSearchLog(context.Background(), model.SearchLogInput{
+				if err := o.recordSearchLog(model.SearchLogInput{
 					RequestID:    requestID,
 					APITokenID:   apiTokenID,
 					Query:        req.Query,
@@ -114,7 +122,9 @@ func (o *Orchestrator) Search(ctx context.Context, req model.SearchRequest, requ
 					LatencyMS:    cached.Meta.LatencyMS,
 					RequestJSON:  requestJSON,
 					ResponseJSON: responseJSON,
-				})
+				}); err != nil {
+					return model.SearchResponse{}, fmt.Errorf("record cached search usage: %w", err)
+				}
 				return cached, nil
 			}
 		}
@@ -155,7 +165,7 @@ func (o *Orchestrator) Search(ctx context.Context, req model.SearchRequest, requ
 
 	requestJSON, _ := json.Marshal(req)
 	responseJSON, _ := json.Marshal(responseLogPayload(response, outcome.providerResults))
-	_ = o.store.RecordSearchLog(context.Background(), model.SearchLogInput{
+	if err := o.recordSearchLog(model.SearchLogInput{
 		RequestID:    requestID,
 		APITokenID:   apiTokenID,
 		Query:        req.Query,
@@ -171,8 +181,19 @@ func (o *Orchestrator) Search(ctx context.Context, req model.SearchRequest, requ
 		RequestJSON:  requestJSON,
 		ResponseJSON: responseJSON,
 		Calls:        callLogs(outcome.providerResults),
-	})
+	}); err != nil {
+		return response, fmt.Errorf("record search usage: %w", err)
+	}
 	return response, nil
+}
+
+func (o *Orchestrator) recordSearchLog(input model.SearchLogInput) error {
+	// Usage and billing must still be committed when the client/provider context
+	// has just reached its deadline. Keep that write independent but bounded so
+	// a stalled database cannot hang the response indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), usageLogTimeout)
+	defer cancel()
+	return o.store.RecordSearchLog(ctx, input)
 }
 
 type searchOutcome struct {
@@ -715,7 +736,11 @@ func providerConfigMap(providers []model.ProviderConfig) map[string]model.Provid
 }
 
 func (o *Orchestrator) adapterForProvider(name string, cfg model.ProviderConfig, timeoutMS int, proxyURL string) (provider.Provider, bool) {
-	providerCfg := provider.Config{BaseURL: strings.TrimSpace(cfg.BaseURL), ProxyURL: proxyURL}
+	extractBaseURL := strings.TrimSpace(stringSetting(cfg.Settings, "extract_base_url"))
+	if extractBaseURL == "" {
+		extractBaseURL = strings.TrimSpace(stringSetting(cfg.Settings, "extractBaseURL"))
+	}
+	providerCfg := provider.Config{BaseURL: strings.TrimSpace(cfg.BaseURL), ExtractBaseURL: extractBaseURL, ProxyURL: proxyURL}
 	if timeoutMS <= 0 {
 		timeoutMS = cfg.TimeoutMS
 	}

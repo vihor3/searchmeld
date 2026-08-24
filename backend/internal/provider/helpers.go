@@ -16,11 +16,12 @@ import (
 )
 
 type Config struct {
-	Name      string
-	BaseURL   string
-	UserAgent string
-	Timeout   time.Duration
-	ProxyURL  string
+	Name           string
+	BaseURL        string
+	ExtractBaseURL string
+	UserAgent      string
+	Timeout        time.Duration
+	ProxyURL       string
 }
 
 type HTTPProvider struct {
@@ -230,6 +231,30 @@ func parseTimeValue(value string) *time.Time {
 	return nil
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func shouldRetryExtractRequest(err error) bool {
+	providerErr, ok := err.(*Error)
+	if !ok {
+		return true
+	}
+	switch providerErr.Type {
+	case ErrorTypeAuth, ErrorTypeRateLimited, ErrorTypeQuotaExhausted, ErrorTypeTimeout, ErrorTypeInvalidResponse:
+		return true
+	case ErrorTypeUpstream:
+		return providerErr.StatusCode >= http.StatusInternalServerError
+	default:
+		return false
+	}
+}
+
 func jsonNumber(value float64) string {
 	return strings.TrimRight(strings.TrimRight(strconv.FormatFloat(value, 'f', -1, 64), "0"), ".")
 }
@@ -247,7 +272,7 @@ func usageMeasurements(providerName string, payload map[string]interface{}) []mo
 		measurements = append(measurements, model.UsageMeasurement{Unit: "tokens", Quantity: tokens, Metadata: metadata})
 	}
 	// 仅把明确的 USD 字段当美元；泛化 cost 可能是 credits，避免假账单。
-	cost := usageNumber(payload, "cost_usd", "total_cost_usd", "usage.cost_usd", "usage.total_cost_usd")
+	cost := usageNumber(payload, "cost_usd", "total_cost_usd", "usage.cost_usd", "usage.total_cost_usd", "costDollars.total")
 	if cost > 0 {
 		measurements = append(measurements, model.UsageMeasurement{Unit: "usd", Quantity: cost, CostUSD: float64Pointer(cost), Metadata: metadata})
 	}
@@ -348,6 +373,26 @@ func optionInt(options map[string]interface{}, keys ...string) int {
 			return int(typed)
 		case string:
 			if parsed, err := strconv.Atoi(strings.TrimSpace(typed)); err == nil {
+				return parsed
+			}
+		}
+	}
+	return 0
+}
+
+func optionFloat(options map[string]interface{}, keys ...string) float64 {
+	for _, key := range keys {
+		value, ok := options[key]
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
+		case int:
+			return float64(typed)
+		case float64:
+			return typed
+		case string:
+			if parsed, err := strconv.ParseFloat(strings.TrimSpace(typed), 64); err == nil {
 				return parsed
 			}
 		}

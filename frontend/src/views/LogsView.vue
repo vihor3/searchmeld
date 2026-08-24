@@ -34,6 +34,10 @@
 
       <section class="filters">
         <el-input v-model="filterQ" clearable placeholder="搜索 query / request_id / 错误" :prefix-icon="Search" />
+        <el-select v-model="filterOperation" clearable placeholder="全部操作" style="width: 120px">
+          <el-option label="搜索" value="search" />
+          <el-option label="抽取" value="extract" />
+        </el-select>
         <el-select v-model="filterStatus" clearable placeholder="全部状态" style="width: 120px">
           <el-option label="成功" value="success" />
           <el-option label="失败" value="failed" />
@@ -65,6 +69,7 @@
               <code>{{ shortRequestId(row.request_id) }}</code>
               <div class="tags">
                 <span class="tag" :class="row.status === 'success' ? 'ok' : 'bad'">{{ row.status === 'success' ? '成功' : '失败' }}</span>
+                <span class="tag">{{ operationLabel(row.operation) }}</span>
                 <span class="tag">{{ modeLabel(row.mode) }}</span>
                 <span class="tag">{{ row.compat_format || '-' }}</span>
                 <span class="tag" :class="{ cache: row.cache_hit }">{{ row.cache_hit ? '缓存命中' : '未命中' }}</span>
@@ -196,6 +201,8 @@
                         >
                           <p v-if="item.snippet" class="result-snippet">{{ item.snippet }}</p>
                           <p v-if="item.content" class="result-snippet result-content">{{ item.content }}</p>
+                          <p v-if="item.log_content_truncated || item.raw_omitted" class="muted">日志仅保留正文或 Raw 预览，原请求响应以接口返回为准。</p>
+                          <p v-if="item.content_truncated" class="muted">原始 Extract 响应因大小预算截断了正文。</p>
                         </div>
                       </div>
                     </div>
@@ -208,7 +215,7 @@
 
             <el-tab-pane name="results">
               <template #label>
-                {{ showProviderResults ? '合并结果' : '搜索结果' }}
+                {{ selectedLog?.operation === 'extract' ? '抽取结果' : (showProviderResults ? '合并结果' : '搜索结果') }}
                 <em v-if="searchResults.length" class="tab-count">{{ searchResults.length }}</em>
               </template>
 
@@ -245,10 +252,12 @@
                   >
                     <p v-if="item.snippet" class="result-snippet">{{ item.snippet }}</p>
                     <p v-if="item.content" class="result-snippet result-content">{{ item.content }}</p>
+                    <p v-if="item.log_content_truncated || item.raw_omitted" class="muted">日志仅保留正文或 Raw 预览，原请求响应以接口返回为准。</p>
+                    <p v-if="item.content_truncated" class="muted">原始 Extract 响应因大小预算截断了正文。</p>
                   </div>
                 </div>
               </div>
-              <el-empty v-else description="暂无搜索结果" :image-size="72" />
+              <el-empty v-else :description="selectedLog?.operation === 'extract' ? '暂无抽取结果' : '暂无搜索结果'" :image-size="72" />
             </el-tab-pane>
           </el-tabs>
         </template>
@@ -273,6 +282,9 @@ type SearchResultItem = {
   providers?: string[]
   score?: number
   published_at?: string
+  content_truncated?: boolean
+  log_content_truncated?: boolean
+  raw_omitted?: boolean
 }
 
 type ProviderResultGroup = {
@@ -327,6 +339,7 @@ const openCallKeys = ref<string[]>([])
 let detailRequestSeq = 0
 
 const filterQ = ref('')
+const filterOperation = ref('')
 const filterStatus = ref('')
 const filterMode = ref('')
 const filterCache = ref('')
@@ -338,6 +351,7 @@ const cacheHitCount = computed(() => logs.value.filter((item) => item.cache_hit)
 const filteredLogs = computed(() => {
   const q = filterQ.value.trim().toLowerCase()
   return logs.value.filter((row) => {
+    if (filterOperation.value && (row.operation || 'search') !== filterOperation.value) return false
     if (filterStatus.value === 'success' && row.status !== 'success') return false
     if (filterStatus.value === 'failed' && row.status === 'success') return false
     if (filterMode.value && row.mode !== filterMode.value) return false
@@ -420,8 +434,13 @@ const providerCallRows = computed<ProviderCallRow[]>(() => {
 const showProviderResults = computed(() => selectedLog.value?.mode === 'parallel' && providerCallRows.value.length > 1 && providerCallRows.value.some((row) => row.results.length > 0))
 const requestParams = computed(() => {
   const request = (selectedLog.value?.request_json || {}) as Record<string, unknown>
+  const operation = selectedLog.value?.operation || 'search'
+  const target = operation === 'extract' && Array.isArray(request.urls)
+    ? request.urls.map(String).join('、')
+    : String(request.query || selectedLog.value?.query || '-')
   return [
-    { label: '搜索词', value: String(request.query || selectedLog.value?.query || '-') },
+    { label: '操作', value: operationLabel(operation) },
+    { label: operation === 'extract' ? '目标 URL' : '搜索词', value: target },
     { label: '模式', value: modeLabel(String(request.mode || selectedLog.value?.mode || '-')) },
     { label: '渠道', value: Array.isArray(request.providers) ? request.providers.map((item) => providerLabel(String(item))).join('、') : (selectedLog.value?.providers || []).map(providerLabel).join('、') || '-' },
     { label: '结果数', value: String(request.limit || selectedLog.value?.result_count || '-') },
@@ -436,6 +455,10 @@ const requestParams = computed(() => {
 
 function modeLabel(mode: string) {
   return ({ parallel: '并发', fallback: '转移', single: '单平台' } as Record<string, string>)[mode] || mode
+}
+
+function operationLabel(operation?: string) {
+  return operation === 'extract' ? '抽取' : '搜索'
 }
 
 function resultProviderLabel(item: SearchResultItem, fallback = '未知渠道') {
@@ -484,7 +507,7 @@ function callEmptyDescription(call: ProviderCallRow) {
   if (call.error_message) return call.will_retry ? `${call.error_message}，将换 key 重试` : call.error_message
   if (call.will_retry) return '本次失败，已换 key 重试'
   if (Number(call.result_count || 0) > 0) return `调用摘要显示 ${call.result_count} 条结果，但正文未写入日志（常见于 seed/旧数据）`
-  return '该渠道暂无搜索结果'
+  return selectedLog.value?.operation === 'extract' ? '该渠道暂无抽取结果' : '该渠道暂无搜索结果'
 }
 
 function hasResultDetails(item: SearchResultItem) {

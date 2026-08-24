@@ -64,6 +64,109 @@ func (p *TavilyProvider) Search(ctx context.Context, req model.SearchRequest, ke
 	return model.ProviderResponse{Results: results, Usage: usageMeasurements(model.ProviderTavily, payload), Raw: payload}, nil
 }
 
+func (p *TavilyProvider) Extract(ctx context.Context, req model.ExtractRequest, key model.APIKey) (model.ExtractProviderResponse, error) {
+	body := map[string]interface{}{
+		"urls":          req.URLs,
+		"include_usage": true,
+		"format":        tavilyExtractFormat(req.Format),
+	}
+	if query := strings.TrimSpace(req.Query); query != "" {
+		body["query"] = query
+	}
+	if depth := strings.TrimSpace(req.ExtractDepth); depth != "" {
+		body["extract_depth"] = depth
+	}
+	if req.ChunksPerSource > 0 {
+		body["chunks_per_source"] = req.ChunksPerSource
+	}
+	if req.IncludeImages {
+		body["include_images"] = true
+	}
+	if req.IncludeFavicon {
+		body["include_favicon"] = true
+	}
+	if timeout := optionFloat(req.Options, "timeout"); timeout > 0 {
+		body["timeout"] = timeout
+	}
+
+	request, err := p.newJSONRequest(ctx, http.MethodPost, "/extract", body)
+	if err != nil {
+		return model.ExtractProviderResponse{}, err
+	}
+	request.Header.Set("Authorization", "Bearer "+key.Value)
+	response, err := p.client.Do(request)
+	if err != nil {
+		return model.ExtractProviderResponse{}, err
+	}
+	payload, err := p.decodeResponse(response)
+	if err != nil {
+		return model.ExtractProviderResponse{}, err
+	}
+	results, failures := normalizeTavilyExtractResults(payload, req)
+	return model.ExtractProviderResponse{
+		Results:       results,
+		FailedResults: failures,
+		Usage:         usageMeasurements(model.ProviderTavily, payload),
+		Raw:           payload,
+	}, nil
+}
+
+func tavilyExtractFormat(format model.ExtractFormat) string {
+	switch format {
+	case model.ExtractFormatText:
+		return string(model.ExtractFormatText)
+	default:
+		return string(model.ExtractFormatMarkdown)
+	}
+}
+
+func normalizeTavilyExtractResults(payload map[string]interface{}, req model.ExtractRequest) ([]model.ExtractResult, []model.ExtractFailure) {
+	items := resultArray(payload, "results")
+	results := make([]model.ExtractResult, 0, len(items))
+	for _, rawItem := range items {
+		item := mapFromInterface(rawItem)
+		if item == nil {
+			continue
+		}
+		resultURL := stringValue(item, "url")
+		if resultURL == "" {
+			continue
+		}
+		result := model.ExtractResult{
+			URL:       resultURL,
+			Title:     stringValue(item, "title"),
+			Content:   stringValue(item, "raw_content", "content"),
+			Format:    model.ExtractFormat(tavilyExtractFormat(req.Format)),
+			Provider:  model.ProviderTavily,
+			Providers: []string{model.ProviderTavily},
+			Images:    stringArrayValue(item, "images"),
+			Favicon:   stringValue(item, "favicon"),
+			Author:    stringValue(item, "author"),
+			PublishedAt: parseTimeValue(stringValue(item,
+				"published_date", "publishedDate", "date")),
+		}
+		if req.IncludeRaw {
+			result.Raw = item
+		}
+		results = append(results, result)
+	}
+
+	failures := make([]model.ExtractFailure, 0)
+	for _, rawItem := range resultArray(payload, "failed_results") {
+		item := mapFromInterface(rawItem)
+		if item == nil {
+			continue
+		}
+		failures = append(failures, model.ExtractFailure{
+			URL:       stringValue(item, "url"),
+			Provider:  model.ProviderTavily,
+			ErrorType: ErrorTypeUpstream,
+			Error:     firstNonEmpty(stringValue(item, "error", "message"), "Tavily could not extract this URL"),
+		})
+	}
+	return results, failures
+}
+
 func tavilyTimeRange(req model.SearchRequest) string {
 	if value := optionString(req.Options, "time_range", "timeRange"); value != "" {
 		return value

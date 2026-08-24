@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/one-search/one-search/backend/internal/compat"
 	"github.com/one-search/one-search/backend/internal/model"
+	"github.com/one-search/one-search/backend/internal/provider"
 	"github.com/one-search/one-search/backend/internal/search"
 )
 
@@ -32,7 +34,7 @@ type AppStore interface {
 	ListAPITokens(ctx context.Context) ([]model.APIToken, error)
 	CreateAPIToken(ctx context.Context, name string, scopes []string, allowedProviders []string, rateLimit, dailyQuota, monthlyQuota int) (model.APIToken, string, error)
 	UpdateAPITokenStatus(ctx context.Context, id int64, status string) error
-	UpdateAPIToken(ctx context.Context, id int64, name string, allowedProviders []string, rateLimit, dailyQuota, monthlyQuota int) error
+	UpdateAPIToken(ctx context.Context, id int64, name string, scopes, allowedProviders []string, rateLimit, dailyQuota, monthlyQuota int) error
 	DeleteAPIToken(ctx context.Context, id int64) error
 	GetAdminAPIKey(ctx context.Context) (model.AdminAPIKey, error)
 	RotateAdminAPIKey(ctx context.Context) (model.AdminAPIKey, string, error)
@@ -103,10 +105,12 @@ func (h *Handler) Mount(r chi.Router) {
 	}
 
 	r.Route("/v1", func(r chi.Router) {
-		r.With(h.auth.requireAPIToken).Post("/search", h.search)
-		r.With(h.auth.requireAPIToken).Post("/compat/tavily/search", h.tavilySearch)
-		r.With(h.auth.requireAPIToken).Post("/compat/serper/search", h.serperSearch)
-		r.With(h.auth.requireAPIToken).Post("/compat/openai/responses-search", h.openAISearch)
+		r.With(h.auth.requireAPITokenScope("search")).Post("/search", h.search)
+		r.With(h.auth.requireAPITokenScope("extract")).Post("/extract", h.extract)
+		r.With(h.auth.requireAPITokenScope("search")).Post("/compat/tavily/search", h.tavilySearch)
+		r.With(h.auth.requireAPITokenScope("extract")).Post("/compat/tavily/extract", h.tavilyExtract)
+		r.With(h.auth.requireAPITokenScope("search")).Post("/compat/serper/search", h.serperSearch)
+		r.With(h.auth.requireAPITokenScope("search")).Post("/compat/openai/responses-search", h.openAISearch)
 		r.With(h.auth.requireAPIToken).Get("/providers", h.providers)
 		r.With(h.auth.requireAPIToken).Get("/usage/summary", h.usageSummary)
 	})
@@ -162,6 +166,23 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 	req.ProvidersExplicit = hasJSONField(body, "providers")
 	req.CompatFormat = model.CompatFormatNative
 	h.runSearch(w, r, req)
+}
+
+func (h *Handler) extract(w http.ResponseWriter, r *http.Request) {
+	body, err := readBody(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	var req model.ExtractRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	req.ProvidersExplicit = hasJSONField(body, "providers")
+	req.ChunksPerSourceSet = hasJSONField(body, "chunks_per_source")
+	req.CompatFormat = model.CompatFormatNative
+	h.runExtract(w, r, req)
 }
 
 func (h *Handler) adminSearch(w http.ResponseWriter, r *http.Request) {
@@ -223,6 +244,66 @@ func (h *Handler) tavilySearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, compat.TavilyFromNative(req.Query, response))
+}
+
+func (h *Handler) tavilyExtract(w http.ResponseWriter, r *http.Request) {
+	body, err := readBody(r)
+	if err != nil {
+		writeTavilyExtractError(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	var req compat.TavilyExtractRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeTavilyExtractError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	native := compat.TavilyExtractToNative(req)
+	native.ProvidersExplicit = hasJSONField(body, "providers")
+	if err := validateExtractRequest(native); err != nil {
+		writeTavilyExtractError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	requestCtx := r.Context()
+	cancel := func() {}
+	if req.Timeout != nil && !math.IsNaN(*req.Timeout) && !math.IsInf(*req.Timeout, 0) && *req.Timeout > 0 {
+		requestCtx, cancel = context.WithTimeout(requestCtx, time.Duration(int64(math.Ceil(*req.Timeout*1000))+2000)*time.Millisecond)
+	}
+	defer cancel()
+	r = r.WithContext(requestCtx)
+
+	settings, err := h.store.RuntimeSettings(r.Context())
+	if err != nil {
+		writeTavilyExtractError(w, extractErrorStatus(err), err.Error())
+		return
+	}
+	if !settings.CompatTavilyEnabled {
+		writeTavilyExtractError(w, http.StatusNotFound, "tavily compatibility endpoint is disabled")
+		return
+	}
+	if token, ok := APIToken(r.Context()); ok {
+		filtered, err := applyTokenExtractProviders(native.Providers, token.AllowedProviders)
+		if err != nil {
+			writeTavilyExtractError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		native.Providers = filtered
+	}
+	response, err := h.orchestrator.Extract(r.Context(), native, RequestID(r.Context()), APITokenID(r.Context()))
+	if err != nil {
+		if message, ok := extractValidationMessage(err); ok {
+			writeTavilyExtractError(w, http.StatusBadRequest, message)
+			return
+		}
+		writeTavilyExtractError(w, extractErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, compat.TavilyExtractFromNative(req, response))
+}
+
+func writeTavilyExtractError(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]interface{}{
+		"detail": map[string]interface{}{"error": message},
+	})
 }
 
 func (h *Handler) serperSearch(w http.ResponseWriter, r *http.Request) {
@@ -306,6 +387,74 @@ func (h *Handler) runSearch(w http.ResponseWriter, r *http.Request, req model.Se
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) runExtract(w http.ResponseWriter, r *http.Request, req model.ExtractRequest) {
+	if err := validateExtractRequest(req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if token, ok := APIToken(r.Context()); ok {
+		filtered, err := applyTokenExtractProviders(req.Providers, token.AllowedProviders)
+		if err != nil {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		req.Providers = filtered
+	}
+	response, err := h.orchestrator.Extract(r.Context(), req, RequestID(r.Context()), APITokenID(r.Context()))
+	if err != nil {
+		if message, ok := extractValidationMessage(err); ok {
+			writeError(w, http.StatusBadRequest, message)
+			return
+		}
+		writeError(w, extractErrorStatus(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func validateExtractRequest(req model.ExtractRequest) error {
+	if len(req.URLs) == 0 {
+		return fmt.Errorf("urls are required")
+	}
+	if len(req.URLs) > 20 {
+		return fmt.Errorf("urls must contain at most 20 items")
+	}
+	for _, item := range req.URLs {
+		if strings.TrimSpace(item) == "" {
+			return fmt.Errorf("urls must not contain empty items")
+		}
+	}
+	return nil
+}
+
+func extractValidationMessage(err error) (string, bool) {
+	var validationError *search.ExtractValidationError
+	if errors.As(err, &validationError) {
+		return validationError.Error(), true
+	}
+	return "", false
+}
+
+func extractErrorStatus(err error) int {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
+	var providerErr *provider.Error
+	if !errors.As(err, &providerErr) {
+		return http.StatusInternalServerError
+	}
+	switch providerErr.Type {
+	case provider.ErrorTypeRateLimited, provider.ErrorTypeQuotaExhausted:
+		return http.StatusTooManyRequests
+	case provider.ErrorTypeNoKey:
+		return http.StatusServiceUnavailable
+	case provider.ErrorTypeAuth, provider.ErrorTypeUpstream, provider.ErrorTypeInvalidResponse:
+		return http.StatusBadGateway
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 func (h *Handler) providers(w http.ResponseWriter, r *http.Request) {
@@ -659,7 +808,7 @@ func (h *Handler) createToken(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	h.audit(r, "admin", "api_token.create", "api_token", strconv.FormatInt(token.ID, 10), map[string]interface{}{"name": token.Name, "rate_limit_per_min": token.RateLimitPerMin, "daily_quota": token.DailyQuota, "monthly_quota": token.MonthlyQuota})
+	h.audit(r, "admin", "api_token.create", "api_token", strconv.FormatInt(token.ID, 10), map[string]interface{}{"name": token.Name, "scopes": token.Scopes, "rate_limit_per_min": token.RateLimitPerMin, "daily_quota": token.DailyQuota, "monthly_quota": token.MonthlyQuota})
 	writeJSON(w, http.StatusCreated, map[string]interface{}{"token": token, "raw_token": raw})
 }
 
@@ -671,6 +820,7 @@ func (h *Handler) updateToken(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Name             string   `json:"name"`
+		Scopes           []string `json:"scopes"`
 		AllowedProviders []string `json:"allowed_providers"`
 		RateLimitPerMin  int      `json:"rate_limit_per_min"`
 		DailyQuota       int      `json:"daily_quota"`
@@ -682,11 +832,11 @@ func (h *Handler) updateToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Name != "" {
-		if err := h.store.UpdateAPIToken(r.Context(), id, req.Name, req.AllowedProviders, req.RateLimitPerMin, req.DailyQuota, req.MonthlyQuota); err != nil {
+		if err := h.store.UpdateAPIToken(r.Context(), id, req.Name, req.Scopes, req.AllowedProviders, req.RateLimitPerMin, req.DailyQuota, req.MonthlyQuota); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		h.audit(r, "admin", "api_token.update", "api_token", strconv.FormatInt(id, 10), map[string]interface{}{"name": req.Name, "rate_limit_per_min": req.RateLimitPerMin, "daily_quota": req.DailyQuota, "monthly_quota": req.MonthlyQuota})
+		h.audit(r, "admin", "api_token.update", "api_token", strconv.FormatInt(id, 10), map[string]interface{}{"name": req.Name, "scopes": req.Scopes, "rate_limit_per_min": req.RateLimitPerMin, "daily_quota": req.DailyQuota, "monthly_quota": req.MonthlyQuota})
 	} else if req.Status != "" {
 		if err := h.store.UpdateAPITokenStatus(r.Context(), id, req.Status); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -749,7 +899,7 @@ func (h *Handler) updateSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	h.audit(r, "admin", "settings.update", "settings", "runtime", map[string]interface{}{"request_timeout_ms": settings.RequestTimeoutMS, "api_auth_required": settings.APIAuthRequired})
+	h.audit(r, "admin", "settings.update", "settings", "runtime", map[string]interface{}{"request_timeout_ms": settings.RequestTimeoutMS, "api_auth_required": settings.APIAuthRequired, "allow_private_extract_targets": settings.AllowPrivateExtractTargets})
 	writeJSON(w, http.StatusOK, settings)
 }
 
@@ -836,4 +986,25 @@ func applyTokenProviders(requested, allowed []string) ([]string, error) {
 		filtered = append(filtered, item)
 	}
 	return filtered, nil
+}
+
+func applyTokenExtractProviders(requested, allowed []string) ([]string, error) {
+	filtered, err := applyTokenProviders(requested, allowed)
+	if err != nil || len(allowed) == 0 || len(requested) > 0 {
+		return filtered, err
+	}
+	capable := map[string]bool{}
+	for _, name := range model.ExtractProviders {
+		capable[name] = true
+	}
+	items := make([]string, 0, len(filtered))
+	for _, name := range filtered {
+		if capable[name] {
+			items = append(items, name)
+		}
+	}
+	if len(items) == 0 {
+		return nil, fmt.Errorf("api token is not allowed to use an extract-capable provider")
+	}
+	return items, nil
 }

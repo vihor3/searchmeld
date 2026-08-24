@@ -218,6 +218,7 @@ export interface RuntimeSettings {
   compat_serper_enabled: boolean
   compat_openai_enabled: boolean
   api_auth_required: boolean
+  allow_private_extract_targets: boolean
   provider_health_window_minutes: number
   provider_routing_strategy: string
   log_retention_days: number
@@ -227,6 +228,7 @@ export interface RuntimeSettings {
 export interface SearchLog {
   id: number
   request_id: string
+  operation: 'search' | 'extract' | string
   query: string
   mode: string
   compat_format: string

@@ -15,6 +15,8 @@ import (
 const (
 	mcpLatestProtocolVersion  = "2025-06-18"
 	mcpDefaultProtocolVersion = "2025-03-26"
+	maxMCPExtractTextRunes    = 16 * 1024
+	maxMCPExtractPreviewRunes = 512
 )
 
 var mcpSupportedProtocolVersions = []string{mcpLatestProtocolVersion, mcpDefaultProtocolVersion, "2024-11-05"}
@@ -74,7 +76,7 @@ func (h *Handler) mcpInfo(w http.ResponseWriter, r *http.Request) {
 		"supported_protocol_versions": mcpSupportedProtocolVersions,
 		"endpoint":                    r.URL.Path,
 		"auth":                        "Authorization: Bearer <osr_...|oak_...> or X-API-Key",
-		"tools":                       []string{"search"},
+		"tools":                       []string{"search", "extract"},
 	})
 }
 
@@ -98,6 +100,10 @@ func (h *Handler) mcp(w http.ResponseWriter, r *http.Request) {
 		var requests []mcpRequest
 		if err := json.Unmarshal(trimmed, &requests); err != nil {
 			writeMCPError(w, http.StatusBadRequest, nil, -32700, "parse error", err.Error())
+			return
+		}
+		if countMCPToolCalls(requests) > 1 {
+			writeMCPError(w, http.StatusBadRequest, firstMCPRequestID(trimmed), -32600, "a JSON-RPC batch may contain at most one tools/call", nil)
 			return
 		}
 		if h.mcpRequestsRequireAuth(requests) {
@@ -131,6 +137,16 @@ func (h *Handler) mcp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeMCPResponse(w, http.StatusOK, response)
+}
+
+func countMCPToolCalls(requests []mcpRequest) int {
+	count := 0
+	for _, request := range requests {
+		if request.Method == "tools/call" {
+			count++
+		}
+	}
+	return count
 }
 
 func (h *Handler) handleMCPBatch(w http.ResponseWriter, r *http.Request, requests []mcpRequest) {
@@ -170,7 +186,7 @@ func (h *Handler) handleMCPRequest(r *http.Request, req mcpRequest) (mcpResponse
 	case "ping":
 		return newMCPResult(req.ID, map[string]interface{}{}), true
 	case "tools/list":
-		return newMCPResult(req.ID, map[string]interface{}{"tools": []interface{}{mcpSearchToolSchema()}}), true
+		return newMCPResult(req.ID, map[string]interface{}{"tools": []interface{}{mcpSearchToolSchema(), mcpExtractToolSchema()}}), true
 	case "tools/call":
 		result, errResp := h.handleMCPToolCall(r, req)
 		if errResp != nil {
@@ -206,22 +222,29 @@ func (h *Handler) handleMCPToolCall(r *http.Request, req mcpRequest) (interface{
 	if err := json.Unmarshal(req.Params, &params); err != nil {
 		return nil, mcpInvalidParams(req.ID, "invalid params")
 	}
-	if params.Name != "search" {
+	switch params.Name {
+	case "search":
+		return h.handleMCPSearchTool(r, req.ID, params.Arguments)
+	case "extract":
+		return h.handleMCPExtractTool(r, req.ID, params.Arguments)
+	default:
 		return nil, mcpInvalidParams(req.ID, "unknown tool: "+params.Name)
 	}
+}
 
+func (h *Handler) handleMCPSearchTool(r *http.Request, requestID json.RawMessage, arguments json.RawMessage) (interface{}, *mcpResponse) {
 	var searchReq model.SearchRequest
-	if len(params.Arguments) > 0 {
-		if err := json.Unmarshal(params.Arguments, &searchReq); err != nil {
-			return nil, mcpInvalidParams(req.ID, "invalid search arguments")
+	if len(arguments) > 0 {
+		if err := json.Unmarshal(arguments, &searchReq); err != nil {
+			return nil, mcpInvalidParams(requestID, "invalid search arguments")
 		}
 	}
 	searchReq.Query = strings.TrimSpace(searchReq.Query)
 	if searchReq.Query == "" {
-		return nil, mcpInvalidParams(req.ID, "query is required")
+		return nil, mcpInvalidParams(requestID, "query is required")
 	}
-	searchReq.LimitExplicit = hasJSONField(params.Arguments, "limit")
-	searchReq.ProvidersExplicit = hasJSONField(params.Arguments, "providers")
+	searchReq.LimitExplicit = hasJSONField(arguments, "limit")
+	searchReq.ProvidersExplicit = hasJSONField(arguments, "providers")
 	searchReq.CompatFormat = model.CompatFormatNative
 	if searchReq.Options == nil {
 		searchReq.Options = map[string]interface{}{}
@@ -229,14 +252,17 @@ func (h *Handler) handleMCPToolCall(r *http.Request, req mcpRequest) (interface{
 	searchReq.Options["source"] = "mcp"
 
 	if token, ok := APIToken(r.Context()); ok {
+		if !apiTokenHasScope(token, "search") {
+			return nil, &mcpResponse{JSONRPC: "2.0", ID: requestID, Error: &mcpError{Code: -32003, Message: "api token does not include search scope"}}
+		}
 		filtered, err := applyTokenProviders(searchReq.Providers, token.AllowedProviders)
 		if err != nil {
-			return nil, &mcpResponse{JSONRPC: "2.0", ID: req.ID, Error: &mcpError{Code: -32003, Message: err.Error()}}
+			return nil, &mcpResponse{JSONRPC: "2.0", ID: requestID, Error: &mcpError{Code: -32003, Message: err.Error()}}
 		}
 		searchReq.Providers = filtered
 	}
 
-	response, err := h.orchestrator.Search(r.Context(), searchReq, RequestID(r.Context()), APITokenID(r.Context()))
+	response, err := h.orchestrator.Search(r.Context(), searchReq, mcpInvocationRequestID(r), APITokenID(r.Context()))
 	if err != nil {
 		return mcpToolError(err.Error()), nil
 	}
@@ -249,6 +275,99 @@ func (h *Handler) handleMCPToolCall(r *http.Request, req mcpRequest) (interface{
 		"structuredContent": response,
 		"isError":           false,
 	}, nil
+}
+
+func mcpExtractText(response model.ExtractResponse) string {
+	var builder strings.Builder
+	fmt.Fprintf(&builder, "Extract completed: %d succeeded, %d failed. Full page content is available in structuredContent.", len(response.Results), len(response.FailedResults))
+	if response.Meta.RequestID != "" {
+		fmt.Fprintf(&builder, "\nRequest ID: %s", boundedText(response.Meta.RequestID, 256))
+	}
+	for index, result := range response.Results {
+		fmt.Fprintf(&builder, "\n\n%d. %s", index+1, boundedText(result.URL, 768))
+		if result.Title != "" {
+			fmt.Fprintf(&builder, "\nTitle: %s", boundedText(result.Title, 256))
+		}
+		if result.Provider != "" {
+			fmt.Fprintf(&builder, "\nProvider: %s", boundedText(result.Provider, 64))
+		}
+		if result.Content != "" {
+			fmt.Fprintf(&builder, "\nPreview: %s", boundedText(result.Content, maxMCPExtractPreviewRunes))
+		}
+	}
+	for _, failure := range response.FailedResults {
+		fmt.Fprintf(&builder, "\n\nFailed: %s", boundedText(failure.URL, 768))
+		if failure.Error != "" {
+			fmt.Fprintf(&builder, "\nError: %s", boundedText(failure.Error, 256))
+		}
+	}
+	return boundedText(builder.String(), maxMCPExtractTextRunes)
+}
+
+func boundedText(value string, maxRunes int) string {
+	runes := []rune(value)
+	if maxRunes <= 0 || len(runes) <= maxRunes {
+		return value
+	}
+	if maxRunes == 1 {
+		return "…"
+	}
+	return string(runes[:maxRunes-1]) + "…"
+}
+
+func (h *Handler) handleMCPExtractTool(r *http.Request, requestID json.RawMessage, arguments json.RawMessage) (interface{}, *mcpResponse) {
+	var extractReq model.ExtractRequest
+	if len(arguments) > 0 {
+		if err := json.Unmarshal(arguments, &extractReq); err != nil {
+			return nil, mcpInvalidParams(requestID, "invalid extract arguments")
+		}
+	}
+	if err := validateExtractRequest(extractReq); err != nil {
+		return nil, mcpInvalidParams(requestID, err.Error())
+	}
+	extractReq.ProvidersExplicit = hasJSONField(arguments, "providers")
+	extractReq.ChunksPerSourceSet = hasJSONField(arguments, "chunks_per_source")
+	extractReq.CompatFormat = model.CompatFormatNative
+	if extractReq.Options == nil {
+		extractReq.Options = map[string]interface{}{}
+	}
+	extractReq.Options["source"] = "mcp"
+
+	if token, ok := APIToken(r.Context()); ok {
+		if !apiTokenHasScope(token, "extract") {
+			return nil, &mcpResponse{JSONRPC: "2.0", ID: requestID, Error: &mcpError{Code: -32003, Message: "api token does not include extract scope"}}
+		}
+		filtered, err := applyTokenExtractProviders(extractReq.Providers, token.AllowedProviders)
+		if err != nil {
+			return nil, &mcpResponse{JSONRPC: "2.0", ID: requestID, Error: &mcpError{Code: -32003, Message: err.Error()}}
+		}
+		extractReq.Providers = filtered
+	}
+
+	response, err := h.orchestrator.Extract(r.Context(), extractReq, mcpInvocationRequestID(r), APITokenID(r.Context()))
+	if err != nil {
+		if message, ok := extractValidationMessage(err); ok {
+			return nil, mcpInvalidParams(requestID, message)
+		}
+		return mcpToolError(err.Error()), nil
+	}
+	return mcpExtractToolResult(response), nil
+}
+
+func mcpExtractToolResult(response model.ExtractResponse) map[string]interface{} {
+	return map[string]interface{}{
+		"content":           []mcpContent{{Type: "text", Text: mcpExtractText(response)}},
+		"structuredContent": response,
+		"isError":           len(response.Results) == 0,
+	}
+}
+
+func mcpInvocationRequestID(r *http.Request) string {
+	invocationID := newRequestID()
+	if parentID := RequestID(r.Context()); parentID != "" {
+		return parentID + "-" + invocationID
+	}
+	return invocationID
 }
 
 func (h *Handler) mcpRequestsRequireAuth(requests []mcpRequest) bool {
@@ -313,7 +432,7 @@ func mcpInitializeResult(params json.RawMessage) map[string]interface{} {
 			"title":   "One Search Relay",
 			"version": "0.1.0",
 		},
-		"instructions": "Use tools/call with the search tool to run web search through configured One Search Relay providers.",
+		"instructions": "Use tools/call with search for web search or extract to fetch content from known URLs through configured One Search Relay providers.",
 	}
 }
 
@@ -385,6 +504,78 @@ func mcpSearchToolSchema() map[string]interface{} {
 		},
 		"annotations": map[string]interface{}{
 			"title":         "One Search",
+			"readOnlyHint":  true,
+			"openWorldHint": true,
+		},
+	}
+}
+
+func mcpExtractToolSchema() map[string]interface{} {
+	return map[string]interface{}{
+		"name":        "extract",
+		"title":       "One Search Extract",
+		"description": "Extract page content from known URLs through configured One Search Relay providers.",
+		"inputSchema": map[string]interface{}{
+			"type": "object",
+			"dependentRequired": map[string]interface{}{
+				"chunks_per_source": []string{"query"},
+			},
+			"properties": map[string]interface{}{
+				"urls": map[string]interface{}{
+					"type":        "array",
+					"description": "URLs to extract, up to 20 per call.",
+					"items":       map[string]interface{}{"type": "string", "format": "uri"},
+					"minItems":    1,
+					"maxItems":    20,
+				},
+				"providers": map[string]interface{}{
+					"type":        "array",
+					"description": "Optional extract-capable providers to use. Defaults to runtime settings.",
+					"items":       map[string]interface{}{"type": "string", "enum": model.ExtractProviders},
+				},
+				"mode": map[string]interface{}{
+					"type":        "string",
+					"description": "Provider execution mode.",
+					"enum":        []string{string(model.SearchModeParallel), string(model.SearchModeFallback), string(model.SearchModeSingle)},
+				},
+				"query": map[string]interface{}{
+					"type":        "string",
+					"description": "Optional query used to focus extracted content when supported.",
+					"minLength":   1,
+				},
+				"format": map[string]interface{}{
+					"type":        "string",
+					"description": "Requested output format.",
+					"enum":        []string{string(model.ExtractFormatMarkdown), string(model.ExtractFormatText), string(model.ExtractFormatHTML), string(model.ExtractFormatRawHTML)},
+				},
+				"extract_depth": map[string]interface{}{
+					"type":        "string",
+					"description": "Extraction depth hint.",
+					"enum":        []string{"basic", "advanced"},
+				},
+				"chunks_per_source": map[string]interface{}{
+					"type":        "integer",
+					"description": "Number of relevant chunks per source when query-focused extraction is supported.",
+					"minimum":     1,
+					"maximum":     5,
+				},
+				"include_images": map[string]interface{}{
+					"type":        "boolean",
+					"description": "Whether to include extracted image URLs when supported.",
+				},
+				"include_favicon": map[string]interface{}{
+					"type":        "boolean",
+					"description": "Whether to include a favicon URL when supported.",
+				},
+				"include_raw": map[string]interface{}{
+					"type":        "boolean",
+					"description": "Whether to include raw upstream payload fields.",
+				},
+			},
+			"required": []string{"urls"},
+		},
+		"annotations": map[string]interface{}{
+			"title":         "One Search Extract",
 			"readOnlyHint":  true,
 			"openWorldHint": true,
 		},

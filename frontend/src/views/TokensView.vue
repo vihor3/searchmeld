@@ -22,6 +22,13 @@
     <el-card class="soft-card" shadow="never" v-loading="loading">
       <el-table :data="tokens" stripe>
         <el-table-column prop="name" label="名称" min-width="120" />
+        <el-table-column label="权限" min-width="120">
+          <template #default="scope">
+            <div class="provider-tags">
+              <el-tag v-for="item in scope.row.scopes" :key="item" size="small" type="info">{{ scopeLabel(item) }}</el-tag>
+            </div>
+          </template>
+        </el-table-column>
         <el-table-column label="令牌" min-width="160">
           <template #default="scope">
             <span class="mono">{{ displayToken(scope.row) }}</span>
@@ -74,6 +81,12 @@
     <el-dialog v-model="dialog" :title="editingToken ? '编辑接口令牌' : '新增接口令牌'" width="520px">
       <el-form label-position="top">
         <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
+        <el-form-item label="接口权限">
+          <el-checkbox-group v-model="form.scopes">
+            <el-checkbox-button value="search">搜索</el-checkbox-button>
+            <el-checkbox-button value="extract">正文抽取</el-checkbox-button>
+          </el-checkbox-group>
+        </el-form-item>
         <el-form-item label="允许请求渠道">
           <el-select v-model="form.allowed_providers" multiple collapse-tags collapse-tags-tooltip placeholder="不选择表示全部渠道">
             <el-option v-for="item in providerOptions" :key="item.value" :label="item.label" :value="item.value" />
@@ -133,6 +146,10 @@ function formatQuota(value: number) {
   return new Intl.NumberFormat('en-US').format(value)
 }
 
+function scopeLabel(scope: string) {
+  return ({ search: '搜索', extract: '抽取', '*': '全部' } as Record<string, string>)[scope] || scope
+}
+
 function resetForm() {
   form.name = '默认客户端'
   form.scopes = ['search']
@@ -166,6 +183,10 @@ async function copyText(text: string) {
 }
 
 async function saveToken() {
+  if (!form.scopes.length) {
+    ElMessage.warning('请至少选择一个接口权限')
+    return
+  }
   if (editingToken.value) {
     await api.updateToken(editingToken.value.id, { ...form })
     ElMessage.success('令牌已保存')

@@ -1,6 +1,6 @@
 # 管理员 API Key 接口文档
 
-管理员 API Key 是 One Search Relay 提供给可信外部系统使用的超级凭据。它可以调用需要管理员权限的 `/api/admin/*` 接口，也可以调用需要普通 API Token 的 `/v1/*` 搜索接口。
+管理员 API Key 是 One Search Relay 提供给可信外部系统使用的超级凭据。它可以调用需要管理员权限的 `/api/admin/*` 接口，也可以调用需要普通 API Token 的 `/v1/*` 搜索与抽取接口。
 
 > 代码依据：后端在 `backend/internal/api/auth.go` 中的 `requireAdmin` 和 `requireAPIToken` 都会识别管理员 API Key；路由注册见 `backend/internal/api/handlers.go`。
 
@@ -11,7 +11,7 @@
 - 管理员登录 Session Token 前缀：`adm_`
 - 系统同时只保存一个管理员 API Key。每次重新生成都会让旧 Key 立即失效。
 - 管理员 API Key 明文只在生成响应中显示一次，之后只能查看 `key_prefix`、`created_at`、`updated_at`。
-- 管理员 API Key 拥有完整管理权限，请只保存在可信服务端环境中。
+- 管理员 API Key 拥有完整管理权限，并可调用 Extract 而无需单独声明 `extract` scope，请只保存在可信服务端环境中。
 
 ## 2. 生成和查看管理员 API Key
 
@@ -129,7 +129,7 @@ curl "$BASE_URL/api/admin/dashboard" \
 除 `POST /api/admin/login` 是用户名密码登录入口外，管理员 API Key 可调用以下两类接口：
 
 1. 所有受管理员权限保护的 `/api/admin/*` 接口。
-2. 所有受 API Token 保护的 `/v1/*` 搜索接口。
+2. 所有受 API Token 保护的 `/v1/*` 搜索与抽取接口。
 
 `GET /healthz` 不需要鉴权。
 
@@ -157,28 +157,30 @@ curl "$BASE_URL/api/admin/dashboard" \
 | `PUT` | `/api/admin/settings` | 可以 | 覆盖更新运行时设置。 |
 | `GET` | `/api/admin/settings/admin-api-key` | 可以 | 查看管理员 API Key 元信息。 |
 | `POST` | `/api/admin/settings/admin-api-key` | 可以 | 生成/轮换管理员 API Key。 |
-| `GET` | `/api/admin/logs` | 可以 | 获取搜索日志列表。支持 `limit`。 |
-| `GET` | `/api/admin/logs/{id}` | 可以 | 获取单条搜索日志详情和 Provider 调用明细。 |
+| `GET` | `/api/admin/logs` | 可以 | 获取请求日志列表（Search / Extract）。支持 `limit`。 |
+| `GET` | `/api/admin/logs/{id}` | 可以 | 获取单条请求日志详情和 Provider 调用明细。 |
 | `GET` | `/api/admin/usage/summary` | 可以 | 获取总体用量汇总。 |
 | `GET` | `/api/admin/usage/billing` | 可以 | 获取账单/计量汇总。支持 `days`。 |
 | `GET` | `/api/admin/metrics` | 可以 | 获取网关指标聚合。 |
 | `GET` | `/api/admin/audit-logs` | 可以 | 获取审计日志列表。支持 `limit`。 |
 | `POST` | `/api/admin/playground/search` | 可以 | 管理台搜索调试接口，不绑定外部 API Token ID。 |
 
-### 4.2 搜索接口 `/v1/*`
+### 4.2 搜索与抽取接口 `/v1/*`
 
-管理员 API Key 也可用于搜索接口，效果类似超级 API Token：
+管理员 API Key 也可用于搜索与抽取接口，效果类似超级 API Token：
 
 | 方法 | 路径 | 能否使用管理员 API Key | 说明 |
 | --- | --- | --- | --- |
 | `POST` | `/v1/search` | 可以 | 原生搜索接口。 |
+| `POST` | `/v1/extract` | 可以 | 原生 URL 内容抽取接口。 |
 | `POST` | `/v1/compat/tavily/search` | 可以 | Tavily-like 兼容搜索接口。 |
+| `POST` | `/v1/compat/tavily/extract` | 可以 | Tavily-like 兼容抽取接口。 |
 | `POST` | `/v1/compat/serper/search` | 可以 | Serper-like 兼容搜索接口。 |
 | `POST` | `/v1/compat/openai/responses-search` | 可以 | OpenAI-like 兼容搜索接口。 |
 | `GET` | `/v1/providers` | 可以 | 获取 Provider 配置列表。 |
 | `GET` | `/v1/usage/summary` | 可以 | 获取用量汇总。 |
 
-与普通 `osr_` API Token 不同，管理员 API Key 不会受到 `allowed_providers` 限制，也不会作为 `api_token_id` 写入用量归属。
+与普通 `osr_` API Token 不同，管理员 API Key 不受 scopes 或 `allowed_providers` 限制，也不会作为 `api_token_id` 写入用量归属。普通 Token 调用 `/v1/search` 需要 `search` scope；调用 `/v1/extract`、`/v1/compat/tavily/extract` 或 MCP `extract` 必须显式包含 `extract` scope。
 
 ## 5. 管理接口调用示例
 
@@ -401,8 +403,8 @@ curl -X POST "$BASE_URL/api/admin/tokens" \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "client-a",
-    "scopes": ["search"],
-    "allowed_providers": ["exa", "you"],
+    "scopes": ["search", "extract"],
+    "allowed_providers": ["exa", "jina", "tavily", "firecrawl"],
     "rate_limit_per_min": 60,
     "daily_quota": 1000,
     "monthly_quota": 30000
@@ -417,8 +419,8 @@ curl -X POST "$BASE_URL/api/admin/tokens" \
     "id": 1,
     "name": "client-a",
     "token_prefix": "osr_abcd",
-    "scopes": ["search"],
-    "allowed_providers": ["exa", "you"],
+    "scopes": ["search", "extract"],
+    "allowed_providers": ["exa", "jina", "tavily", "firecrawl"],
     "status": "enabled",
     "rate_limit_per_min": 60,
     "daily_quota": 1000,
@@ -431,11 +433,11 @@ curl -X POST "$BASE_URL/api/admin/tokens" \
 }
 ```
 
-`raw_token` 只显示一次。
+`raw_token` 只显示一次。`scopes` 省略或传空数组时默认保存为 `["search"]`。既有 Token 也保持原 scopes，升级不会自动增加 `extract`；需要正文抽取时必须显式加入 `extract`。
 
 ### 5.9 更新外部 API Token
 
-更新配额/允许 Provider：
+更新 scopes、配额和允许 Provider：
 
 ```bash
 curl -X PATCH "$BASE_URL/api/admin/tokens/1" \
@@ -443,12 +445,15 @@ curl -X PATCH "$BASE_URL/api/admin/tokens/1" \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "client-a",
+    "scopes": ["search", "extract"],
     "allowed_providers": ["exa", "you", "jina", "tavily", "firecrawl", "serper", "brave"],
     "rate_limit_per_min": 120,
     "daily_quota": 2000,
     "monthly_quota": 60000
   }'
 ```
+
+更新 Token 时会保存请求中的完整 scopes 列表；省略或传空数组会回到默认 `["search"]`，从列表中移除 `extract` 会立即禁止该 Token 调用原生、Tavily 兼容和 MCP Extract。
 
 启用/禁用 Token：
 
@@ -487,9 +492,10 @@ curl -X PUT "$BASE_URL/api/admin/settings" \
     "cache_max_results": 20,
     "compat_tavily_enabled": true,
     "compat_serper_enabled": true,
-    "compat_openai_enabled": true,
-    "api_auth_required": true,
-    "provider_health_window_minutes": 15,
+	    "compat_openai_enabled": true,
+	    "api_auth_required": true,
+	    "allow_private_extract_targets": false,
+	    "provider_health_window_minutes": 15,
     "provider_routing_strategy": "fixed",
     "log_retention_days": 3
   }'
@@ -503,7 +509,7 @@ curl -X PUT "$BASE_URL/api/admin/settings" \
 | `default_providers` | 默认 Provider 列表；新库初始化和默认 fallback 为 `exa`、`you`、`jina`、`tavily`、`firecrawl`、`serper`、`brave`。 |
 | `default_limit` | 默认返回结果数，搜索时最大限制为 50。 |
 | `default_dedupe` | 是否默认去重。 |
-| `request_timeout_ms` | 单次搜索总超时。 |
+| `request_timeout_ms` | 搜索请求总超时基线；Extract 会按 Provider 的单次超时、URL 批次和并发波次扩展必要预算。 |
 | `cache_enabled` | 是否开启缓存。 |
 | `cache_ttl_seconds` | 缓存 TTL；空结果会用更短 TTL（60s，且不超过该值）。 |
 | `cache_max_results` | 单次响应最多缓存的结果条数，超出截断后写入；0 表示不截断。 |
@@ -511,6 +517,7 @@ curl -X PUT "$BASE_URL/api/admin/settings" \
 | `compat_serper_enabled` | 是否启用 Serper-like 兼容接口。 |
 | `compat_openai_enabled` | 是否启用 OpenAI-like 兼容接口。 |
 | `api_auth_required` | `/v1/*` 是否需要 API Token 或管理员 API Key。 |
+| `allow_private_extract_targets` | 是否允许 Extract 请求明显的私网、环回、链路本地或常见内网域名目标；默认 `false`，仅可信内网场景开启。 |
 | `provider_health_window_minutes` | Provider 健康统计窗口。 |
 | `provider_routing_strategy` | Provider 级路由策略：`fixed`、`priority`、`weighted`、`weighted_random`、`available_keys`、`random`。 |
 | `log_retention_days` | 搜索日志和审计日志保留天数。 |
@@ -557,9 +564,9 @@ curl -X POST "$BASE_URL/api/admin/playground/search" \
 
 该接口与 `/v1/search` 使用相同的原生搜索请求格式，但作为管理台调试接口，不要求外部 API Token，也不会绑定 `api_token_id`。
 
-## 6. 搜索接口调用示例
+## 6. 搜索与抽取接口调用示例
 
-管理员 API Key 可直接调用搜索接口。
+管理员 API Key 可直接调用搜索与抽取接口，不需要普通 Token 的 `search` / `extract` scopes。
 
 ### 6.1 原生搜索
 
@@ -577,7 +584,23 @@ curl -X POST "$BASE_URL/v1/search" \
   }'
 ```
 
-### 6.2 Tavily-like
+### 6.2 原生 Extract
+
+```bash
+curl -X POST "$BASE_URL/v1/extract" \
+  -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "urls": ["https://example.com/article"],
+    "providers": ["exa", "jina", "tavily", "firecrawl"],
+    "mode": "fallback",
+    "format": "markdown"
+  }'
+```
+
+完整字段和 Tavily Extract 兼容格式见 [extract.md](extract.md)。
+
+### 6.3 Tavily-like Search
 
 ```bash
 curl -X POST "$BASE_URL/v1/compat/tavily/search" \
@@ -594,7 +617,25 @@ curl -X POST "$BASE_URL/v1/compat/tavily/search" \
   }'
 ```
 
-### 6.3 Serper-like
+### 6.4 Tavily-like Extract
+
+```bash
+curl -X POST "$BASE_URL/v1/compat/tavily/extract" \
+  -H "Authorization: Bearer $ADMIN_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "urls": "https://example.com/article",
+    "query": "database migration",
+    "chunks_per_source": 3,
+    "extract_depth": "advanced",
+    "timeout": 12.5,
+    "include_usage": true
+  }'
+```
+
+`timeout` 支持 1–60 秒及小数；`chunks_per_source` 使用时必须同时提供非空 `query`；`include_usage=true` 会请求响应中的 `usage.credits`。管理员 API Key 可直接调用，普通 Token 则必须拥有 `extract` scope。
+
+### 6.5 Serper-like
 
 ```bash
 curl -X POST "$BASE_URL/v1/compat/serper/search" \
@@ -610,7 +651,7 @@ curl -X POST "$BASE_URL/v1/compat/serper/search" \
   }'
 ```
 
-### 6.4 OpenAI-like
+### 6.6 OpenAI-like
 
 ```bash
 curl -X POST "$BASE_URL/v1/compat/openai/responses-search" \
@@ -624,7 +665,7 @@ curl -X POST "$BASE_URL/v1/compat/openai/responses-search" \
   }'
 ```
 
-### 6.5 查看 `/v1` Provider 和用量
+### 6.7 查看 `/v1` Provider 和用量
 
 ```bash
 curl "$BASE_URL/v1/providers" \
@@ -653,7 +694,7 @@ curl "$BASE_URL/v1/usage/summary" \
 | --- | --- |
 | `400` | JSON 格式错误、路径参数错误、请求体非法。 |
 | `401` | 缺少或使用了无效管理员 Session / 管理员 API Key / API Token。 |
-| `403` | 普通 API Token 请求了未授权 Provider。管理员 API Key 不受此限制。 |
+| `403` | 普通 API Token 缺少接口所需 scope，或请求了未授权 Provider。管理员 API Key 不受此限制。 |
 | `404` | 兼容接口被禁用时返回；或反向代理未命中路径。 |
 | `429` | 管理员登录失败次数过多，或普通 API Token 触发 RPM 限制。 |
 | `502` | Provider Key 测试或官方额度查询时上游失败。 |
@@ -687,6 +728,7 @@ admin_api_key:oak_abcd
 
 - 管理员 API Key 适合 CI/CD、内部运维平台、自动化配置同步、可信后端服务调用。
 - 不建议把管理员 API Key 放入浏览器前端、移动端或第三方不可控环境。
-- 如只需要搜索能力，应创建 `osr_` 外部 API Token，并用 `allowed_providers`、RPM、日/月额度做限制。
+- 如只需要搜索能力，应创建仅含 `search` scope 的 `osr_` 外部 API Token，并用 `allowed_providers`、RPM、日/月额度做限制。
+- Extract 默认校验目标 IP 和域名解析结果，但仍不要向不可信方授予 `extract` scope；自托管 Jina Reader、Firecrawl 或其它抓取服务时，应配置出口 ACL、连接时地址复核或目标白名单，防止 DNS 重绑定、重定向访问内网、云元数据和管理端点。
 - 轮换管理员 API Key 前确认所有依赖方都能同步更新；轮换后旧 Key 会立即失效。
 - 建议定期查看 `/api/admin/audit-logs`，确认管理操作来源符合预期。

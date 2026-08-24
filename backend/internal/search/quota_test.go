@@ -13,6 +13,8 @@ import (
 )
 
 func TestQueryTavilyQuota(t *testing.T) {
+	t.Parallel()
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/usage" {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
@@ -34,9 +36,10 @@ func TestQueryTavilyQuota(t *testing.T) {
 		})
 	}))
 	defer server.Close()
-	withQuotaEndpoint(t, &tavilyUsageURL, server.URL+"/usage")
+	config := defaultQuotaQueryConfig()
+	config.tavilyUsageURL = server.URL + "/usage"
 
-	result, err := QueryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderTavily, Alias: "tavily", Value: "tavily-key"}, model.ProviderKeyQuotaRequest{})
+	result, err := queryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderTavily, Alias: "tavily", Value: "tavily-key"}, model.ProviderKeyQuotaRequest{}, config)
 	if err != nil {
 		t.Fatalf("QueryOfficialQuota returned error: %v", err)
 	}
@@ -46,6 +49,8 @@ func TestQueryTavilyQuota(t *testing.T) {
 }
 
 func TestQueryFirecrawlQuota(t *testing.T) {
+	t.Parallel()
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v2/team/credit-usage" {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
@@ -64,9 +69,10 @@ func TestQueryFirecrawlQuota(t *testing.T) {
 		})
 	}))
 	defer server.Close()
-	withQuotaEndpoint(t, &firecrawlCreditUsageURL, server.URL+"/v2/team/credit-usage")
+	config := defaultQuotaQueryConfig()
+	config.firecrawlCreditUsageURL = server.URL + "/v2/team/credit-usage"
 
-	result, err := QueryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderFirecrawl, Alias: "firecrawl", Value: "firecrawl-key"}, model.ProviderKeyQuotaRequest{})
+	result, err := queryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderFirecrawl, Alias: "firecrawl", Value: "firecrawl-key"}, model.ProviderKeyQuotaRequest{}, config)
 	if err != nil {
 		t.Fatalf("QueryOfficialQuota returned error: %v", err)
 	}
@@ -86,24 +92,26 @@ func TestQuerySerperQuota(t *testing.T) {
 }
 
 func TestQueryOfficialQuotaUsesBoundedTimeout(t *testing.T) {
-	originalTimeout := quotaRequestTimeout
-	quotaRequestTimeout = 20 * time.Millisecond
-	t.Cleanup(func() { quotaRequestTimeout = originalTimeout })
+	t.Parallel()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(200 * time.Millisecond)
 		writeQuotaJSON(t, w, map[string]interface{}{"data": map[string]interface{}{"attributes": map[string]interface{}{"balance": 100}}})
 	}))
 	defer server.Close()
-	withQuotaEndpoint(t, &youQuotaURL, server.URL)
+	config := defaultQuotaQueryConfig()
+	config.youQuotaURL = server.URL
+	config.requestTimeout = 20 * time.Millisecond
 
-	_, err := QueryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderYou, Alias: "you", Value: "you-key"}, model.ProviderKeyQuotaRequest{})
+	_, err := queryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderYou, Alias: "you", Value: "you-key"}, model.ProviderKeyQuotaRequest{}, config)
 	if err == nil {
 		t.Fatalf("QueryOfficialQuota returned nil error")
 	}
 }
 
 func TestQueryBraveQuota(t *testing.T) {
+	t.Parallel()
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/res/v1/web/search" {
 			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
@@ -121,22 +129,16 @@ func TestQueryBraveQuota(t *testing.T) {
 		writeQuotaJSON(t, w, map[string]interface{}{"type": "search", "web": map[string]interface{}{"results": []map[string]interface{}{}}})
 	}))
 	defer server.Close()
-	withQuotaEndpoint(t, &braveWebSearchURL, server.URL+"/res/v1/web/search")
+	config := defaultQuotaQueryConfig()
+	config.braveWebSearchURL = server.URL + "/res/v1/web/search"
 
-	result, err := QueryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderBrave, Alias: "brave", Value: "brave-key"}, model.ProviderKeyQuotaRequest{})
+	result, err := queryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderBrave, Alias: "brave", Value: "brave-key"}, model.ProviderKeyQuotaRequest{}, config)
 	if err != nil {
 		t.Fatalf("QueryOfficialQuota returned error: %v", err)
 	}
 	if !result.Supported || result.Status != "success" || result.Unit != "requests" || result.Balance == nil || *result.Balance != 14523 || result.TotalQuantity == nil || *result.TotalQuantity != 477 || !strings.Contains(result.RawText, "X-RateLimit-Remaining") {
 		t.Fatalf("unexpected result: %#v", result)
 	}
-}
-
-func withQuotaEndpoint(t *testing.T, target *string, value string) {
-	t.Helper()
-	original := *target
-	*target = value
-	t.Cleanup(func() { *target = original })
 }
 
 func writeQuotaJSON(t *testing.T, w http.ResponseWriter, payload interface{}) {

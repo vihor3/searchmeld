@@ -12,6 +12,19 @@ type Provider interface {
 	HealthCheck(ctx context.Context, key model.APIKey) error
 }
 
+// Extractor is an optional provider capability. Search-only providers do not
+// need to implement it and remain valid Provider implementations.
+type Extractor interface {
+	Extract(ctx context.Context, req model.ExtractRequest, key model.APIKey) (model.ExtractProviderResponse, error)
+}
+
+// ExtractBatchSizer lets adapters declare the maximum number of URLs covered
+// by one upstream request. A value <= 0 means the adapter handles the full
+// request as one metered attempt.
+type ExtractBatchSizer interface {
+	ExtractBatchSize() int
+}
+
 type Factory func(Config) Provider
 
 type Registry struct {

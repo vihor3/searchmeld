@@ -1,6 +1,35 @@
 package compat
 
-import "github.com/one-search/one-search/backend/internal/model"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+
+	"github.com/one-search/one-search/backend/internal/model"
+)
+
+// StringList accepts either a single JSON string or an array of strings.
+// Tavily's extract endpoint supports both forms for the urls field.
+type StringList []string
+
+func (items *StringList) UnmarshalJSON(data []byte) error {
+	data = bytes.TrimSpace(data)
+	if bytes.Equal(data, []byte("null")) {
+		*items = nil
+		return nil
+	}
+	var single string
+	if err := json.Unmarshal(data, &single); err == nil {
+		*items = StringList{single}
+		return nil
+	}
+	var list []string
+	if err := json.Unmarshal(data, &list); err != nil {
+		return fmt.Errorf("must be a string or an array of strings: %w", err)
+	}
+	*items = StringList(list)
+	return nil
+}
 
 type TavilySearchRequest struct {
 	Query             string   `json:"query"`
@@ -32,6 +61,44 @@ type TavilyResult struct {
 	Content    string  `json:"content"`
 	RawContent string  `json:"raw_content,omitempty"`
 	Score      float64 `json:"score"`
+}
+
+type TavilyExtractRequest struct {
+	URLs            StringList `json:"urls"`
+	Query           string     `json:"query,omitempty"`
+	ChunksPerSource *int       `json:"chunks_per_source,omitempty"`
+	ExtractDepth    string     `json:"extract_depth,omitempty"`
+	IncludeImages   bool       `json:"include_images,omitempty"`
+	IncludeFavicon  bool       `json:"include_favicon,omitempty"`
+	Format          string     `json:"format,omitempty"`
+	Timeout         *float64   `json:"timeout,omitempty"`
+	IncludeUsage    bool       `json:"include_usage,omitempty"`
+	Providers       []string   `json:"providers,omitempty"`
+	Mode            string     `json:"mode,omitempty"`
+}
+
+type TavilyExtractResponse struct {
+	Results       []TavilyExtractResult  `json:"results"`
+	FailedResults []TavilyExtractFailure `json:"failed_results"`
+	ResponseTime  float64                `json:"response_time"`
+	RequestID     string                 `json:"request_id"`
+	Usage         *TavilyExtractUsage    `json:"usage,omitempty"`
+}
+
+type TavilyExtractUsage struct {
+	Credits float64 `json:"credits"`
+}
+
+type TavilyExtractResult struct {
+	URL        string   `json:"url"`
+	RawContent string   `json:"raw_content"`
+	Images     []string `json:"images,omitempty"`
+	Favicon    string   `json:"favicon,omitempty"`
+}
+
+type TavilyExtractFailure struct {
+	URL   string `json:"url"`
+	Error string `json:"error"`
 }
 
 type SerperSearchRequest struct {

@@ -76,6 +76,7 @@ type ProviderKeyView struct {
 type SearchLog struct {
 	ID           int64           `json:"id"`
 	RequestID    string          `json:"request_id"`
+	Operation    string          `json:"operation"`
 	Query        string          `json:"query"`
 	Mode         string          `json:"mode"`
 	CompatFormat string          `json:"compat_format"`
@@ -117,6 +118,7 @@ type ProviderCallLog struct {
 type SearchLogInput struct {
 	RequestID    string
 	APITokenID   int64
+	Operation    string
 	Query        string
 	Mode         string
 	CompatFormat string
@@ -247,10 +249,10 @@ type ProviderUsagePoint struct {
 }
 
 type HealthSegmentPoint struct {
-	Status   string `json:"status"` // ok | degraded | down | off
-	Success  int64  `json:"success"`
-	Failed   int64  `json:"failed"`
-	Total    int64  `json:"total"`
+	Status  string `json:"status"` // ok | degraded | down | off
+	Success int64  `json:"success"`
+	Failed  int64  `json:"failed"`
+	Total   int64  `json:"total"`
 }
 
 type HealthSegmentSeries struct {

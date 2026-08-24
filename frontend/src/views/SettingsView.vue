@@ -143,6 +143,18 @@
             <p>管理员 API Key 拥有完整管理权限，轮换后旧 Key 立即失效</p>
           </div>
         </div>
+        <div class="field-grid security-options">
+          <div class="field field-switch field-full">
+            <div>
+              <label>允许 Extract 访问私网目标</label>
+              <span class="hint">默认阻止 localhost、私网/链路本地 IP 与常见内网域名；仅在受信环境启用</span>
+            </div>
+            <el-switch v-model="settings.allow_private_extract_targets" />
+          </div>
+        </div>
+        <div v-if="settings.allow_private_extract_targets" class="warn-banner private-target-warning">
+          Extract 私网保护已关闭。请只向受信 Token 授予 extract scope，并为自托管抓取服务配置出口 ACL。
+        </div>
         <div class="admin-key-banner">
           <div class="admin-key-info">
             <strong>管理员 API Key</strong>

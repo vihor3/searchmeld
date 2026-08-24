@@ -19,4 +19,5 @@ frontend/dist/
 # coverage / local agent / design drafts
 coverage/
 .pi-subagents/
-docs/
+docs/*
+!docs/extract.md

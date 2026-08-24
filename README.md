@@ -1,13 +1,14 @@
 # One Search
 
-自托管 Web Search API 中转 / 聚合网关。
+自托管 Web Search / Extract API 中转与聚合网关。
 
 统一接入 Exa、You.com、Jina、Tavily、Firecrawl、Serper、Brave，提供：
 
 - 统一搜索接口 `POST /v1/search`（`parallel` / `fallback` / `single`）
-- Tavily / Serper / OpenAI 兼容接口
+- URL 内容抽取接口 `POST /v1/extract`，支持 Exa、Jina、Tavily、Firecrawl
+- Tavily Search / Extract、Serper、OpenAI 兼容接口
 - Web 管理台：Provider、Key、Token、调试、日志、用量、审计
-- 可选 MCP（`search` 工具）
+- 可选 MCP（`search` / `extract` 工具）
 
 预览图
 <p>
@@ -17,7 +18,7 @@
 
 ## 快速部署
 
-需要 Docker 24+ / Compose v2，以及至少一个上游搜索 API Key。
+需要 Docker 24+ / Compose v2，以及至少一个上游 Provider API Key。
 
 ### 一键安装
 
@@ -145,7 +146,7 @@ docker build --target all-in-one -t one-search:all-in-one .
 1. **平台管理**：启用要用的 Provider  
 2. **Key 管理**：添加上游 API Key  
 3. **搜索调试**：验证可用性  
-4. **API 令牌**：创建业务用的 `osr_...` Token  
+4. **API 令牌**：创建业务用的 `osr_...` Token；需要正文抽取时同时勾选 `extract` 权限
 
 ## 使用
 
@@ -163,17 +164,43 @@ curl -X POST http://localhost:5173/v1/search \
 
 也可用 `X-API-Key: osr_xxx`。
 
+已知 URL 的正文抽取：
+
+> 普通 `osr_` Token 必须在 `scopes` 中显式包含 `extract`。新建 Token 未选择权限、既有 Token 或默认 Token 都只有 `search`，升级后不会自动获得 Extract 权限；管理员 API Key `oak_...` 可以直接调用。
+
+```bash
+curl -X POST http://localhost:5173/v1/extract \
+  -H "Authorization: Bearer osr_你的令牌" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "urls": [
+      "https://example.com/article-a",
+      "https://example.com/article-b"
+    ],
+    "mode": "fallback",
+    "providers": ["exa", "jina", "tavily", "firecrawl"],
+    "format": "markdown",
+    "include_images": true
+  }'
+```
+
+`fallback` 是 Extract 的默认模式：第一个渠道成功的 URL 不会再请求后续渠道，只把失败或缺失的 URL 继续向后补齐。单次最多 20 个绝对 `http` / `https` URL。完整参数和响应见 [docs/extract.md](docs/extract.md)。
+
+安全提示：Extract 默认拒绝明显的私网、环回、链路本地和常见内网域名目标，并在调用上游前检查域名解析结果；可信内网场景可在“系统设置 → 安全”显式开启。不要向不可信用户授予 `extract` scope；自托管 Jina Reader、Firecrawl 或其它抓取服务时，仍应在抓取服务一侧配置出口 ACL、连接时地址复核或目标白名单，防止 DNS 重绑定、重定向访问云元数据和集群管理地址。
+
 | 路径 | 说明 |
 | --- | --- |
 | `/` | 管理台 |
 | `/healthz` | 健康检查 |
 | `/v1/search` | 统一搜索 |
+| `/v1/extract` | 统一 URL 内容抽取 |
 | `/v1/compat/tavily/search` | Tavily 兼容 |
+| `/v1/compat/tavily/extract` | Tavily Extract 兼容 |
 | `/v1/compat/serper/search` | Serper 兼容 |
 | `/v1/compat/openai/responses-search` | OpenAI 兼容 |
 | `/mcp` | MCP（默认开启） |
 
-完整接口见 [docs/admin-api-key.md](docs/admin-api-key.md)、[docs/mcp.md](docs/mcp.md)。
+完整接口见 [docs/extract.md](docs/extract.md)、[docs/admin-api-key.md](docs/admin-api-key.md)、[docs/mcp.md](docs/mcp.md)。
 
 ## MCP 配置
 
@@ -183,11 +210,11 @@ curl -X POST http://localhost:5173/v1/search \
 http://localhost:5173/mcp
 ```
 
-先在管理台创建 `osr_...` Token（`API_AUTH_REQUIRED=true` 时必须）。自检：
+先在管理台创建 `osr_...` Token（`API_AUTH_REQUIRED=true` 时必须）。需要同时使用 `search` 和 `extract` 工具时，Token 的 scopes 必须同时包含 `search` 和 `extract`；默认及既有 Token 不会自动增加 `extract`。自检：
 
 ```bash
 curl http://localhost:5173/mcp
-# 应返回 enabled:true、tools:["search"]
+# 应返回 enabled:true、tools:["search","extract"]
 ```
 
 ### Codex
@@ -204,10 +231,10 @@ url = "http://localhost:5173/mcp"
 bearer_token_env_var = "ONE_SEARCH_API_TOKEN"
 enabled = true
 tool_timeout_sec = 60
-enabled_tools = ["search"]
+enabled_tools = ["search", "extract"]
 ```
 
-启动 Codex 后输入 `/mcp`，应能看到 `one_search` / `search`。
+启动 Codex 后输入 `/mcp`，应能看到 `one_search` 的 `search` 和 `extract`。
 
 ### Claude Desktop / 通用 HTTP MCP
 

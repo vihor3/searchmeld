@@ -1,6 +1,6 @@
 # MCP 接口文档
 
-One Search Relay 支持可选 MCP Streamable HTTP / HTTP JSON-RPC 接口，用于让 MCP 客户端通过统一的 `search` 工具调用已配置的搜索 Provider。
+One Search Relay 支持可选 MCP Streamable HTTP / HTTP JSON-RPC 接口，用于让 MCP 客户端通过统一的 `search` 和 `extract` 工具调用已配置的 Provider。
 
 ## 1. 是否已经内置 MCP
 
@@ -46,7 +46,7 @@ Content-Type: application/json
 
 `GET /mcp` 默认返回接口元信息，便于浏览器或 curl 探测当前是否启用；如果客户端带 `Accept: text/event-stream` 试图建立 SSE 流，服务端会返回 `405 Method Not Allowed`。
 
-鉴权复用搜索 API：
+鉴权复用 `/v1/*` API：
 
 - 当 `API_AUTH_REQUIRED=true` 时，必须传入外部 API Token 或管理员 API Key。
 - 当 `API_AUTH_REQUIRED=false` 时，MCP 工具调用不要求鉴权。
@@ -69,7 +69,7 @@ X-API-Key: osr_xxx
 Authorization: Bearer oak_xxx
 ```
 
-普通 `osr_` API Token 的 `allowed_providers`、RPM 限制会继续生效；管理员 API Key 不受 `allowed_providers` 限制。
+普通 `osr_` API Token 的 scopes、`allowed_providers`、RPM 限制会继续生效：调用 `search` 需要 `search` scope，调用 `extract` 必须显式包含 `extract` scope。新建 Token 未选择 scopes、既有 Token 和默认 Token 都只有 `search`，不会在升级后自动获得 Extract 权限。管理员 API Key 不受普通 Token scopes 或 `allowed_providers` 限制。
 
 ## 4. 支持的方法
 
@@ -78,13 +78,17 @@ Authorization: Bearer oak_xxx
 | `initialize` | 返回协议版本、服务信息和能力。 |
 | `ping` | 健康探测，返回空对象。 |
 | `tools/list` | 返回可用工具列表。 |
-| `tools/call` | 调用工具。当前支持 `search`。 |
+| `tools/call` | 调用工具。当前支持 `search` 和 `extract`。 |
 | `resources/list` | 返回空资源列表。 |
 | `prompts/list` | 返回空提示词列表。 |
 
 通知请求，即没有 `id` 的 JSON-RPC 请求，会返回 `204 No Content`。
 
-## 5. 工具：`search`
+JSON-RPC batch 可以合并初始化、列表和通知类方法，但每个 batch 最多只能包含一个 `tools/call`。这样每次实际 Search / Extract 都会独立经过 Token RPM 和日月配额检查；需要调用多个工具时请发送多个 HTTP JSON-RPC 请求。
+
+## 5. 工具
+
+### 5.1 `search`
 
 `search` 工具会调用后端同一套 `search.Orchestrator`，因此 Provider、缓存、日志、用量统计、Token 限制与 `/v1/search` 保持一致。
 
@@ -106,6 +110,33 @@ Authorization: Bearer oak_xxx
 - `content`：MCP 文本内容，包含格式化后的搜索响应 JSON。
 - `structuredContent`：结构化搜索响应，格式与 `/v1/search` 的 `SearchResponse` 一致。
 - `isError`：工具执行是否失败。
+
+### 5.2 `extract`
+
+`extract` 从一个或多个已知 URL 获取正文，调用与 `/v1/extract` 相同的编排逻辑。默认使用 `fallback`：只把未成功的 URL 继续交给后续 Provider。
+
+输入参数：
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `urls` | string[] | 是 | 1–20 个绝对 `http` / `https` URL。 |
+| `providers` | string[] | 否 | 可选 `exa`、`jina`、`tavily`、`firecrawl`。 |
+| `mode` | string | 否 | `fallback`、`parallel`、`single`；默认 `fallback`。 |
+| `query` | string | 否 | 在上游支持时聚焦相关内容。 |
+| `format` | string | 否 | `markdown`、`text`、`html`、`raw_html`。 |
+| `extract_depth` | string | 否 | `basic` 或 `advanced`。 |
+| `chunks_per_source` | integer | 否 | 1–5；提供时必须同时提供非空 `query`。 |
+| `include_images` | boolean | 否 | 请求图片 URL。 |
+| `include_favicon` | boolean | 否 | 请求 favicon。 |
+| `include_raw` | boolean | 否 | 附带上游原始条目。 |
+
+返回结果：
+
+- `content`：只包含有界的正文预览和执行摘要，适合直接放入 MCP 文本上下文；它不是完整正文。
+- `structuredContent`：与 `/v1/extract` 一致，包含完整 `results[].content`、逐 URL 的 `failed_results`、Provider 调用摘要和 `meta`。需要全文时读取这里。
+- `isError`：工具执行是否失败。
+
+普通 Token 调用此工具需要 `extract` scope。网关默认检查目标 IP 和域名解析结果并拒绝私网/保留地址，但仍不应向不可信方开放该 scope。自托管 Jina Reader、Firecrawl 或其它抓取服务时，需在实际抓取服务侧配置出口 ACL、连接时地址复核或目标白名单，防止 DNS 重绑定、重定向访问云元数据和集群管理地址。完整字段和安全说明见 [extract.md](extract.md)。
 
 ## 6. 调用示例
 
@@ -129,9 +160,9 @@ curl "$BASE_URL/mcp"
   "auth": "Authorization: Bearer <osr_...|oak_...> or X-API-Key",
   "enabled": true,
   "endpoint": "/mcp",
-  "protocol_version": "2025-03-26",
-  "tools": ["search"],
-  "transport": "http-json-rpc"
+  "protocol_version": "2025-06-18",
+  "tools": ["search", "extract"],
+  "transport": "streamable-http"
 }
 ```
 
@@ -210,6 +241,27 @@ curl -X POST "$BASE_URL/mcp" \
   }'
 ```
 
+### 6.6 调用 Extract 工具
+
+```bash
+curl -X POST "$BASE_URL/mcp" \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jsonrpc":"2.0",
+    "id":5,
+    "method":"tools/call",
+    "params":{
+      "name":"extract",
+      "arguments":{
+        "urls":["https://example.com/article"],
+        "mode":"fallback",
+        "format":"markdown"
+      }
+    }
+  }'
+```
+
 ## 7. 错误格式
 
 MCP 接口使用 JSON-RPC 错误格式：
@@ -234,7 +286,7 @@ MCP 接口使用 JSON-RPC 错误格式：
 | `-32601` | 方法不存在。 |
 | `-32602` | 工具参数错误。 |
 | `-32001` | 缺少或无效 Token。 |
-| `-32003` | 普通 API Token 请求了未授权 Provider。 |
+| `-32003` | 普通 API Token 缺少所调用工具的 scope，或请求了未授权 Provider。 |
 
 工具执行期间如果搜索链路返回错误，会以工具结果形式返回：
 
@@ -268,6 +320,8 @@ export ONE_SEARCH_API_TOKEN=osr_xxx
 # export ONE_SEARCH_API_TOKEN=oak_xxx
 ```
 
+若配置中同时启用 `search` 和 `extract`，这里的普通 Token 必须同时拥有这两个 scopes。只拥有默认 `search` scope 的旧 Token 可以列出工具，但调用 `extract` 会返回 `-32003`。
+
 编辑 `~/.codex/config.toml`：
 
 ```toml
@@ -278,8 +332,8 @@ enabled = true
 startup_timeout_sec = 10
 tool_timeout_sec = 60
 
-# 可选：只暴露 search 工具
-enabled_tools = ["search"]
+# 可选：只暴露需要的工具
+enabled_tools = ["search", "extract"]
 ```
 
 说明：
@@ -299,7 +353,7 @@ url = "http://localhost:5173/mcp"
 http_headers = { "Authorization" = "Bearer osr_xxx" }
 enabled = true
 tool_timeout_sec = 60
-enabled_tools = ["search"]
+enabled_tools = ["search", "extract"]
 ```
 
 不建议把这种配置提交到项目仓库，因为会泄露 Token。
@@ -330,10 +384,11 @@ codex
 /mcp
 ```
 
-应能看到 `one_search` MCP 服务和 `search` 工具。随后可以在对话中让 Codex 使用该工具，例如：
+应能看到 `one_search` MCP 服务及 `search`、`extract` 工具。随后可以在对话中让 Codex 使用，例如：
 
 ```text
 使用 one_search 的 search 工具搜索 “latest web search APIs”，返回 5 条结果。
+使用 one_search 的 extract 工具抽取 https://example.com/article 的 Markdown 正文。
 ```
 
 如果没有出现：
@@ -354,7 +409,7 @@ url = "http://localhost:5173/mcp"
 bearer_token_env_var = "ONE_SEARCH_API_TOKEN"
 enabled = true
 tool_timeout_sec = 60
-enabled_tools = ["search"]
+enabled_tools = ["search", "extract"]
 ```
 
 项目级配置只引用环境变量，不要写入真实 `osr_` 或 `oak_` Token。
@@ -430,7 +485,7 @@ docker compose up -d --build
 curl -i http://localhost:5173/mcp
 ```
 
-应返回 `200` 和包含 `tools:["search"]` 的 JSON。
+应返回 `200` 和包含 `tools:["search","extract"]` 的 JSON。
 
 3. 用 Streamable HTTP 客户端常用请求头测试初始化：
 
@@ -483,7 +538,7 @@ curl -i -X POST "$BASE_URL/mcp" \
   }'
 ```
 
-应返回 `search` 工具。
+应返回 `search` 和 `extract` 工具。
 
 6. 如果返回 `401`：
 

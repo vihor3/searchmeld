@@ -116,27 +116,31 @@ type ProviderConfig struct {
 }
 
 type APIKey struct {
-	ID                int64     `json:"id"`
-	ProviderID        int64     `json:"provider_id"`
-	ProviderName      string    `json:"provider_name"`
-	Alias             string    `json:"alias"`
-	Value             string    `json:"-"`
-	KeyHint           string    `json:"key_hint"`
-	ExaAPIKeyID       string    `json:"exa_api_key_id,omitempty"`
-	ExaServiceKey     string    `json:"-"`
-	ExaServiceKeyHint string    `json:"exa_service_key_hint,omitempty"`
-	Status            string    `json:"status"`
-	Weight            int       `json:"weight"`
-	RPMLimit          int       `json:"rpm_limit"`
-	DailyQuota        int       `json:"daily_quota"`
-	MonthlyQuota      int       `json:"monthly_quota"`
-	MonthlyUsed       int64     `json:"monthly_used,omitempty"`
-	MonthlyCredits    float64   `json:"monthly_credits,omitempty"`
-	MaxConcurrency    int       `json:"max_concurrency"`
-	TotalSuccesses    int64     `json:"total_successes"`
-	TotalFailures     int64     `json:"total_failures"`
-	LastUsedAt        time.Time `json:"last_used_at,omitempty"`
-	CooldownUntil     time.Time `json:"cooldown_until,omitempty"`
+	ID                 int64     `json:"id"`
+	ProviderID         int64     `json:"provider_id"`
+	ProviderName       string    `json:"provider_name"`
+	Alias              string    `json:"alias"`
+	Value              string    `json:"-"`
+	KeyHint            string    `json:"key_hint"`
+	ExaAPIKeyID        string    `json:"exa_api_key_id,omitempty"`
+	ExaServiceKey      string    `json:"-"`
+	ExaServiceKeyHint  string    `json:"exa_service_key_hint,omitempty"`
+	Status             string    `json:"status"`
+	Weight             int       `json:"weight"`
+	RPMLimit           int       `json:"rpm_limit"`
+	DailyQuota         int       `json:"daily_quota"`
+	MonthlyQuota       int       `json:"monthly_quota"`
+	DailyUsagePeriod   string    `json:"-"`
+	DailyUsed          int64     `json:"daily_used,omitempty"`
+	MonthlyUsagePeriod string    `json:"-"`
+	MonthlyUsed        int64     `json:"monthly_used,omitempty"`
+	UsageRequestsTotal int64     `json:"-"`
+	MonthlyCredits     float64   `json:"monthly_credits,omitempty"`
+	MaxConcurrency     int       `json:"max_concurrency"`
+	TotalSuccesses     int64     `json:"total_successes"`
+	TotalFailures      int64     `json:"total_failures"`
+	LastUsedAt         time.Time `json:"last_used_at,omitempty"`
+	CooldownUntil      time.Time `json:"cooldown_until,omitempty"`
 }
 
 type RuntimeSettings struct {
@@ -152,6 +156,7 @@ type RuntimeSettings struct {
 	CompatSerperEnabled         bool       `json:"compat_serper_enabled"`
 	CompatOpenAIEnabled         bool       `json:"compat_openai_enabled"`
 	APIAuthRequired             bool       `json:"api_auth_required"`
+	AllowPrivateExtractTargets  bool       `json:"allow_private_extract_targets"`
 	ProviderHealthWindowMinutes int        `json:"provider_health_window_minutes"`
 	ProviderRoutingStrategy     string     `json:"provider_routing_strategy"`
 	LogRetentionDays            int        `json:"log_retention_days"`

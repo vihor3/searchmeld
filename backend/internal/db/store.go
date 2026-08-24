@@ -258,7 +258,11 @@ func (s *Store) ListAvailableProviderKeys(ctx context.Context, providerName stri
 		SELECT k.id, k.provider_id, p.name, k.alias, k.key_ciphertext, k.key_hint,
 		       COALESCE(k.exa_api_key_id, ''), COALESCE(k.exa_service_key_ciphertext, ''), COALESCE(k.exa_service_key_hint, ''),
 		       k.status, k.weight, k.rpm_limit, k.daily_quota, k.monthly_quota,
+		       to_char(CURRENT_DATE, 'YYYY-MM-DD') AS daily_usage_period,
+		       COALESCE((SELECT SUM(u.requests_total) FROM usage_daily u WHERE u.provider_key_id=k.id AND u.usage_date=CURRENT_DATE),0) AS daily_used,
+		       to_char(date_trunc('month', CURRENT_DATE), 'YYYY-MM') AS monthly_usage_period,
 		       COALESCE((SELECT SUM(u.requests_total) FROM usage_daily u WHERE u.provider_key_id=k.id AND u.usage_date >= date_trunc('month', CURRENT_DATE)::date),0) AS monthly_used,
+		       COALESCE((SELECT SUM(u.requests_total) FROM usage_daily u WHERE u.provider_key_id=k.id),0) AS usage_requests_total,
 		       COALESCE((SELECT SUM(m.quantity_total) FROM usage_meter_daily m WHERE m.provider_key_id=k.id AND m.provider_name=p.name AND m.unit='credits' AND m.usage_date >= date_trunc('month', CURRENT_DATE)::date),0)::float8 AS monthly_credits,
 		       k.max_concurrency,
 		       k.total_successes, k.total_failures, COALESCE(k.last_used_at, '0001-01-01'::timestamptz), COALESCE(k.cooldown_until, '0001-01-01'::timestamptz)
@@ -278,7 +282,7 @@ func (s *Store) ListAvailableProviderKeys(ctx context.Context, providerName stri
 	for rows.Next() {
 		var item model.APIKey
 		var ciphertext, exaServiceKeyCiphertext string
-		if err := rows.Scan(&item.ID, &item.ProviderID, &item.ProviderName, &item.Alias, &ciphertext, &item.KeyHint, &item.ExaAPIKeyID, &exaServiceKeyCiphertext, &item.ExaServiceKeyHint, &item.Status, &item.Weight, &item.RPMLimit, &item.DailyQuota, &item.MonthlyQuota, &item.MonthlyUsed, &item.MonthlyCredits, &item.MaxConcurrency, &item.TotalSuccesses, &item.TotalFailures, &item.LastUsedAt, &item.CooldownUntil); err != nil {
+		if err := rows.Scan(&item.ID, &item.ProviderID, &item.ProviderName, &item.Alias, &ciphertext, &item.KeyHint, &item.ExaAPIKeyID, &exaServiceKeyCiphertext, &item.ExaServiceKeyHint, &item.Status, &item.Weight, &item.RPMLimit, &item.DailyQuota, &item.MonthlyQuota, &item.DailyUsagePeriod, &item.DailyUsed, &item.MonthlyUsagePeriod, &item.MonthlyUsed, &item.UsageRequestsTotal, &item.MonthlyCredits, &item.MaxConcurrency, &item.TotalSuccesses, &item.TotalFailures, &item.LastUsedAt, &item.CooldownUntil); err != nil {
 			return nil, err
 		}
 		plain, err := s.crypto.Decrypt(ciphertext)
@@ -303,7 +307,11 @@ func (s *Store) GetAPIKeyByID(ctx context.Context, id int64) (model.APIKey, erro
 		SELECT k.id, k.provider_id, p.name, k.alias, k.key_ciphertext, k.key_hint,
 		       COALESCE(k.exa_api_key_id, ''), COALESCE(k.exa_service_key_ciphertext, ''), COALESCE(k.exa_service_key_hint, ''),
 		       k.status, k.weight, k.rpm_limit, k.daily_quota, k.monthly_quota,
+		       to_char(CURRENT_DATE, 'YYYY-MM-DD') AS daily_usage_period,
+		       COALESCE((SELECT SUM(u.requests_total) FROM usage_daily u WHERE u.provider_key_id=k.id AND u.usage_date=CURRENT_DATE),0) AS daily_used,
+		       to_char(date_trunc('month', CURRENT_DATE), 'YYYY-MM') AS monthly_usage_period,
 		       COALESCE((SELECT SUM(u.requests_total) FROM usage_daily u WHERE u.provider_key_id=k.id AND u.usage_date >= date_trunc('month', CURRENT_DATE)::date),0) AS monthly_used,
+		       COALESCE((SELECT SUM(u.requests_total) FROM usage_daily u WHERE u.provider_key_id=k.id),0) AS usage_requests_total,
 		       COALESCE((SELECT SUM(m.quantity_total) FROM usage_meter_daily m WHERE m.provider_key_id=k.id AND m.provider_name=p.name AND m.unit='credits' AND m.usage_date >= date_trunc('month', CURRENT_DATE)::date),0)::float8 AS monthly_credits,
 		       k.max_concurrency,
 		       k.total_successes, k.total_failures, COALESCE(k.last_used_at, '0001-01-01'::timestamptz), COALESCE(k.cooldown_until, '0001-01-01'::timestamptz)
@@ -313,7 +321,7 @@ func (s *Store) GetAPIKeyByID(ctx context.Context, id int64) (model.APIKey, erro
 	`, id)
 	var item model.APIKey
 	var ciphertext, exaServiceKeyCiphertext string
-	if err := row.Scan(&item.ID, &item.ProviderID, &item.ProviderName, &item.Alias, &ciphertext, &item.KeyHint, &item.ExaAPIKeyID, &exaServiceKeyCiphertext, &item.ExaServiceKeyHint, &item.Status, &item.Weight, &item.RPMLimit, &item.DailyQuota, &item.MonthlyQuota, &item.MonthlyUsed, &item.MonthlyCredits, &item.MaxConcurrency, &item.TotalSuccesses, &item.TotalFailures, &item.LastUsedAt, &item.CooldownUntil); err != nil {
+	if err := row.Scan(&item.ID, &item.ProviderID, &item.ProviderName, &item.Alias, &ciphertext, &item.KeyHint, &item.ExaAPIKeyID, &exaServiceKeyCiphertext, &item.ExaServiceKeyHint, &item.Status, &item.Weight, &item.RPMLimit, &item.DailyQuota, &item.MonthlyQuota, &item.DailyUsagePeriod, &item.DailyUsed, &item.MonthlyUsagePeriod, &item.MonthlyUsed, &item.UsageRequestsTotal, &item.MonthlyCredits, &item.MaxConcurrency, &item.TotalSuccesses, &item.TotalFailures, &item.LastUsedAt, &item.CooldownUntil); err != nil {
 		return model.APIKey{}, err
 	}
 	plain, err := s.crypto.Decrypt(ciphertext)
@@ -550,11 +558,22 @@ func (s *Store) RecordKeyResult(ctx context.Context, key model.APIKey, success b
 	}
 	_, err := s.pool.Exec(ctx, `
 		UPDATE provider_keys
-		SET status=$2,
+		SET status=CASE
+		        WHEN status='disabled' THEN status
+		        WHEN status='exhausted' AND $2 <> 'disabled' THEN status
+		        WHEN status='cooling' AND cooldown_until > now() AND $2='enabled' THEN status
+		        ELSE $2
+		    END,
 		    current_failures=CASE WHEN $3 THEN 0 ELSE current_failures + 1 END,
 		    total_successes=CASE WHEN $3 THEN total_successes + 1 ELSE total_successes END,
 		    total_failures=CASE WHEN $3 THEN total_failures ELSE total_failures + 1 END,
-		    cooldown_until=$4,
+		    cooldown_until=CASE
+		        WHEN $2='cooling' AND status NOT IN ('disabled', 'exhausted')
+		            THEN GREATEST(COALESCE(cooldown_until, $4), $4)
+		        WHEN $2='enabled' AND NOT (status='cooling' AND cooldown_until > now())
+		             AND status NOT IN ('disabled', 'exhausted') THEN NULL
+		        ELSE cooldown_until
+		    END,
 		    last_used_at=now(),
 		    updated_at=now()
 		WHERE id=$1
@@ -632,12 +651,15 @@ func (s *Store) UpdateAPITokenStatus(ctx context.Context, id int64, status strin
 	return err
 }
 
-func (s *Store) UpdateAPIToken(ctx context.Context, id int64, name string, allowedProviders []string, rateLimit, dailyQuota, monthlyQuota int) error {
+func (s *Store) UpdateAPIToken(ctx context.Context, id int64, name string, scopes, allowedProviders []string, rateLimit, dailyQuota, monthlyQuota int) error {
+	if len(scopes) == 0 {
+		scopes = []string{"search"}
+	}
 	_, err := s.pool.Exec(ctx, `
 		UPDATE api_tokens
-		SET name=$2, allowed_providers=$3, rate_limit_per_min=$4, daily_quota=$5, monthly_quota=$6, updated_at=now()
+		SET name=$2, scopes=$3, allowed_providers=$4, rate_limit_per_min=$5, daily_quota=$6, monthly_quota=$7, updated_at=now()
 		WHERE id=$1
-	`, id, name, allowedProviders, rateLimit, dailyQuota, monthlyQuota)
+	`, id, name, scopes, allowedProviders, rateLimit, dailyQuota, monthlyQuota)
 	return err
 }
 
@@ -708,11 +730,15 @@ func (s *Store) RecordSearchLog(ctx context.Context, input model.SearchLogInput)
 	if len(responseJSON) == 0 {
 		responseJSON = []byte("{}")
 	}
+	operation := strings.TrimSpace(input.Operation)
+	if operation == "" {
+		operation = "search"
+	}
 	if err := tx.QueryRow(ctx, `
-		INSERT INTO search_requests (request_id, api_token_id, query, mode, compat_format, providers, cache_policy, cache_hit, result_count, status, error_message, latency_ms, request_json, response_json)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb)
+		INSERT INTO search_requests (request_id, api_token_id, operation, query, mode, compat_format, providers, cache_policy, cache_hit, result_count, status, error_message, latency_ms, request_json, response_json)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15::jsonb)
 		RETURNING id
-	`, input.RequestID, apiToken, input.Query, input.Mode, input.CompatFormat, input.Providers, input.CachePolicy, input.CacheHit, input.ResultCount, input.Status, input.ErrorMessage, int(input.LatencyMS), string(requestJSON), string(responseJSON)).Scan(&searchRequestID); err != nil {
+	`, input.RequestID, apiToken, operation, input.Query, input.Mode, input.CompatFormat, input.Providers, input.CachePolicy, input.CacheHit, input.ResultCount, input.Status, input.ErrorMessage, int(input.LatencyMS), string(requestJSON), string(responseJSON)).Scan(&searchRequestID); err != nil {
 		return err
 	}
 	for _, call := range input.Calls {
@@ -899,7 +925,7 @@ func (s *Store) ListSearchLogs(ctx context.Context, limit int) ([]model.SearchLo
 		limit = 1000
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, request_id, query, mode, compat_format, providers, cache_policy, cache_hit, result_count, status, error_message, latency_ms, created_at
+		SELECT id, request_id, operation, query, mode, compat_format, providers, cache_policy, cache_hit, result_count, status, error_message, latency_ms, created_at
 		FROM search_requests ORDER BY created_at DESC LIMIT $1
 	`, limit)
 	if err != nil {
@@ -909,7 +935,7 @@ func (s *Store) ListSearchLogs(ctx context.Context, limit int) ([]model.SearchLo
 	items := []model.SearchLog{}
 	for rows.Next() {
 		var item model.SearchLog
-		if err := rows.Scan(&item.ID, &item.RequestID, &item.Query, &item.Mode, &item.CompatFormat, &item.Providers, &item.CachePolicy, &item.CacheHit, &item.ResultCount, &item.Status, &item.ErrorMessage, &item.LatencyMS, &item.CreatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.RequestID, &item.Operation, &item.Query, &item.Mode, &item.CompatFormat, &item.Providers, &item.CachePolicy, &item.CacheHit, &item.ResultCount, &item.Status, &item.ErrorMessage, &item.LatencyMS, &item.CreatedAt); err != nil {
 			return nil, err
 		}
 		items = append(items, item)
@@ -927,11 +953,11 @@ func (s *Store) GetSearchLogByRequestID(ctx context.Context, requestID string) (
 
 func (s *Store) getSearchLog(ctx context.Context, field string, value interface{}) (model.SearchLog, []model.ProviderCallLog, error) {
 	row := s.pool.QueryRow(ctx, fmt.Sprintf(`
-		SELECT id, request_id, query, mode, compat_format, providers, cache_policy, cache_hit, result_count, status, error_message, latency_ms, request_json, response_json, created_at
+		SELECT id, request_id, operation, query, mode, compat_format, providers, cache_policy, cache_hit, result_count, status, error_message, latency_ms, request_json, response_json, created_at
 		FROM search_requests WHERE %s=$1
 	`, field), value)
 	var item model.SearchLog
-	if err := row.Scan(&item.ID, &item.RequestID, &item.Query, &item.Mode, &item.CompatFormat, &item.Providers, &item.CachePolicy, &item.CacheHit, &item.ResultCount, &item.Status, &item.ErrorMessage, &item.LatencyMS, &item.RequestJSON, &item.ResponseJSON, &item.CreatedAt); err != nil {
+	if err := row.Scan(&item.ID, &item.RequestID, &item.Operation, &item.Query, &item.Mode, &item.CompatFormat, &item.Providers, &item.CachePolicy, &item.CacheHit, &item.ResultCount, &item.Status, &item.ErrorMessage, &item.LatencyMS, &item.RequestJSON, &item.ResponseJSON, &item.CreatedAt); err != nil {
 		return model.SearchLog{}, nil, err
 	}
 	rows, err := s.pool.Query(ctx, `

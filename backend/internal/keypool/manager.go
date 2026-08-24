@@ -17,18 +17,29 @@ type Store interface {
 	RecordKeyResult(ctx context.Context, key model.APIKey, success bool, errorType string) error
 }
 
+const maxPendingReservationAge = time.Hour
+
 type Manager struct {
 	store          Store
 	mu             sync.Mutex
 	positions      map[string]int
 	states         map[int64]*keyState
 	providerStates map[string]*providerState
+	now            func() time.Time
 }
 
 type keyState struct {
-	active      int
-	windowStart time.Time
-	windowCount int
+	active              int
+	windowStart         time.Time
+	windowCount         int
+	usageInitialized    bool
+	usageObserved       int64
+	pendingReservations int64
+	pendingLast         time.Time
+	dailyPeriod         string
+	dailyObserved       int64
+	monthlyPeriod       string
+	monthlyObserved     int64
 }
 
 type providerState struct {
@@ -37,12 +48,21 @@ type providerState struct {
 
 func NewManager(store Store) *Manager {
 	rand.Seed(time.Now().UnixNano())
-	return &Manager{store: store, positions: map[string]int{}, states: map[int64]*keyState{}, providerStates: map[string]*providerState{}}
+	return &Manager{
+		store:          store,
+		positions:      map[string]int{},
+		states:         map[int64]*keyState{},
+		providerStates: map[string]*providerState{},
+		now:            time.Now,
+	}
 }
 
 func (m *Manager) Acquire(ctx context.Context, providerName string) (model.APIKey, func(bool, error), error) {
 	keys, err := m.store.ListAvailableProviderKeys(ctx, providerName)
 	if err != nil {
+		return model.APIKey{}, nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return model.APIKey{}, nil, err
 	}
 	if len(keys) == 0 {
@@ -53,9 +73,12 @@ func (m *Manager) Acquire(ctx context.Context, providerName string) (model.APIKe
 	if err != nil {
 		return model.APIKey{}, nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return model.APIKey{}, nil, err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	now := time.Now()
+	now := m.now()
 	providerState := m.providerStateFor(providerName)
 	if maxConcurrency > 0 && providerState.active >= maxConcurrency {
 		return model.APIKey{}, nil, &provider.Error{Type: provider.ErrorTypeRateLimited, Message: "all keys are limited or busy for " + providerName}
@@ -65,12 +88,13 @@ func (m *Manager) Acquire(ctx context.Context, providerName string) (model.APIKe
 	for attempt := 0; attempt < len(keys); attempt++ {
 		index := (start + attempt) % len(keys)
 		key := keys[index]
-		state := m.stateFor(key.ID)
+		state := m.stateFor(key.ID, now)
 		if !m.canUse(state, key, now) {
 			continue
 		}
 		state.active++
 		state.windowCount++
+		m.reserveQuota(state, now)
 		providerState.active++
 		if m.usesPosition(strategy) {
 			m.positions[providerName] = (index + 1) % len(keys)
@@ -89,7 +113,7 @@ func (m *Manager) Acquire(ctx context.Context, providerName string) (model.APIKe
 			}
 			m.mu.Unlock()
 			errorType := provider.ErrorType(err)
-			_ = m.store.RecordKeyResult(context.Background(), key, success, errorType)
+			_ = m.store.RecordKeyResult(ctx, key, success, errorType)
 		}
 		return key, release, nil
 	}
@@ -169,10 +193,10 @@ func weightedKeyOrder(keys []model.APIKey) []model.APIKey {
 	return ordered
 }
 
-func (m *Manager) stateFor(keyID int64) *keyState {
+func (m *Manager) stateFor(keyID int64, now time.Time) *keyState {
 	state := m.states[keyID]
 	if state == nil {
-		state = &keyState{windowStart: time.Now()}
+		state = &keyState{windowStart: now}
 		m.states[keyID] = state
 	}
 	return state
@@ -188,6 +212,10 @@ func (m *Manager) providerStateFor(providerName string) *providerState {
 }
 
 func (m *Manager) canUse(state *keyState, key model.APIKey, now time.Time) bool {
+	m.syncQuotaState(state, key, now)
+	if key.MaxConcurrency > 0 && state.active >= key.MaxConcurrency {
+		return false
+	}
 	if key.RPMLimit > 0 {
 		if now.Sub(state.windowStart) >= time.Minute {
 			state.windowStart = now
@@ -197,5 +225,102 @@ func (m *Manager) canUse(state *keyState, key model.APIKey, now time.Time) bool 
 			return false
 		}
 	}
+	if key.DailyQuota > 0 && state.dailyObserved+state.pendingReservations >= int64(key.DailyQuota) {
+		return false
+	}
+	if key.MonthlyQuota > 0 && state.monthlyObserved+state.pendingReservations >= int64(key.MonthlyQuota) {
+		return false
+	}
 	return true
+}
+
+func (m *Manager) syncQuotaState(state *keyState, key model.APIKey, now time.Time) {
+	reconcileReservationSnapshot(state, key.UsageRequestsTotal)
+	if state.pendingReservations > 0 && state.active == 0 && !state.pendingLast.IsZero() && now.Sub(state.pendingLast) >= maxPendingReservationAge {
+		// Normal relay requests are bounded to well under an hour. A reservation
+		// still missing after that point means its usage log was lost or failed;
+		// retain fail-closed behavior temporarily without poisoning the key forever.
+		state.pendingReservations = 0
+		state.pendingLast = time.Time{}
+		state.usageInitialized = true
+		state.usageObserved = nonNegative(key.UsageRequestsTotal)
+	}
+
+	dailyPeriod := key.DailyUsagePeriod
+	if dailyPeriod == "" {
+		dailyPeriod = now.Format("2006-01-02")
+	}
+	reconcileUsagePeriod(
+		&state.dailyPeriod,
+		&state.dailyObserved,
+		dailyPeriod,
+		key.DailyUsed,
+	)
+
+	monthlyPeriod := key.MonthlyUsagePeriod
+	if monthlyPeriod == "" {
+		monthlyPeriod = now.Format("2006-01")
+	}
+	reconcileUsagePeriod(
+		&state.monthlyPeriod,
+		&state.monthlyObserved,
+		monthlyPeriod,
+		key.MonthlyUsed,
+	)
+}
+
+func (m *Manager) reserveQuota(state *keyState, now time.Time) {
+	// A release only means the upstream call finished; its usage log can still be
+	// pending. Keep the reservation until a later database snapshot accounts for it.
+	state.pendingReservations++
+	state.pendingLast = now
+}
+
+func reconcileReservationSnapshot(state *keyState, snapshot int64) {
+	snapshot = nonNegative(snapshot)
+	if !state.usageInitialized {
+		state.usageInitialized = true
+		state.usageObserved = snapshot
+		return
+	}
+	if snapshot <= state.usageObserved {
+		return
+	}
+	delta := snapshot - state.usageObserved
+	state.usageObserved = snapshot
+	if delta >= state.pendingReservations {
+		state.pendingReservations = 0
+		state.pendingLast = time.Time{}
+		return
+	}
+	state.pendingReservations -= delta
+}
+
+func reconcileUsagePeriod(period *string, observed *int64, nextPeriod string, currentUsed int64) {
+	currentUsed = nonNegative(currentUsed)
+	if *period == "" {
+		*period = nextPeriod
+		*observed = currentUsed
+		return
+	}
+	if nextPeriod == *period {
+		if currentUsed > *observed {
+			*observed = currentUsed
+		}
+		return
+	}
+	if nextPeriod < *period {
+		// A query started before a period rollover can complete afterwards. Ignore
+		// that older snapshot rather than rolling the quota state backwards.
+		return
+	}
+	*period = nextPeriod
+	*observed = currentUsed
+}
+
+func nonNegative(value int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	return value
 }

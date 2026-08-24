@@ -186,6 +186,30 @@ func (a *AuthService) requireAPIToken(next http.Handler) http.Handler {
 	})
 }
 
+func (a *AuthService) requireAPITokenScope(scope string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		scoped := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if token, ok := APIToken(r.Context()); ok && !apiTokenHasScope(token, scope) {
+				writeError(w, http.StatusForbidden, "api token does not include "+scope+" scope")
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+		return a.requireAPIToken(scoped)
+	}
+}
+
+func apiTokenHasScope(token model.APIToken, required string) bool {
+	required = strings.ToLower(strings.TrimSpace(required))
+	for _, rawScope := range token.Scopes {
+		scope := strings.ToLower(strings.TrimSpace(rawScope))
+		if scope == required || scope == "*" {
+			return true
+		}
+	}
+	return false
+}
+
 func adminAPIKeyActor(key model.AdminAPIKey) string {
 	if key.KeyPrefix == "" {
 		return "admin_api_key"

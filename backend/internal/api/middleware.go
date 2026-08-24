@@ -23,14 +23,30 @@ const (
 
 func requestIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestID := r.Header.Get("X-Request-ID")
-		if requestID == "" {
-			requestID = newRequestID()
+		requestID := newRequestID()
+		if clientPrefix := clientRequestIDPrefix(r.Header.Get("X-Request-ID")); clientPrefix != "" {
+			// search_requests.request_id is unique and also anchors usage/billing
+			// writes. Preserve a bounded client correlation prefix, but always add a
+			// server-generated suffix so a reused header cannot roll back accounting.
+			requestID = clientPrefix + "-" + requestID
 		}
 		ctx := context.WithValue(r.Context(), requestIDKey, requestID)
 		w.Header().Set("X-Request-ID", requestID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func clientRequestIDPrefix(value string) string {
+	value = strings.TrimSpace(value)
+	var prefix strings.Builder
+	for index := 0; index < len(value) && prefix.Len() < 32; index++ {
+		character := value[index]
+		if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') || character == '-' || character == '_' || character == '.' {
+			prefix.WriteByte(character)
+		}
+	}
+	return strings.Trim(prefix.String(), "-_.")
 }
 
 func corsMiddleware(origins []string) func(http.Handler) http.Handler {
