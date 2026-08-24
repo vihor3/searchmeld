@@ -13,6 +13,10 @@ escape_sql_ident() {
   printf '"%s"' "$(printf "%s" "$1" | sed 's/"/""/g')"
 }
 
+escape_conninfo_value() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e "s/'/\\\\'/g"
+}
+
 normalize_container_proxy_env() {
   normalize_one_proxy HTTP_PROXY
   normalize_one_proxy HTTPS_PROXY
@@ -47,6 +51,96 @@ cleanup() {
       kill "$pid" 2>/dev/null || true
     fi
   done
+}
+
+load_database_url() {
+  if [ -n "${DATABASE_URL:-}" ]; then
+    return
+  fi
+  if [ -z "${DATABASE_URL_FILE:-}" ]; then
+    return
+  fi
+  if [ ! -r "$DATABASE_URL_FILE" ]; then
+    log "DATABASE_URL_FILE is not readable: $DATABASE_URL_FILE"
+    exit 1
+  fi
+  DATABASE_URL=$(tr -d '\r\n' < "$DATABASE_URL_FILE")
+  if [ -z "$DATABASE_URL" ]; then
+    log "DATABASE_URL_FILE is empty: $DATABASE_URL_FILE"
+    exit 1
+  fi
+  export DATABASE_URL
+}
+
+select_database_mode() {
+  requested_mode=$(printf '%s' "${DATABASE_MODE:-${ONE_SEARCH_DEFAULT_DATABASE_MODE:-auto}}" | tr '[:upper:]' '[:lower:]')
+  case "$requested_mode" in
+    external)
+      load_database_url
+      if [ -z "${DATABASE_URL:-}" ]; then
+        log "DATABASE_URL or DATABASE_URL_FILE is required when DATABASE_MODE=external"
+        exit 1
+      fi
+      database_mode="external"
+      ;;
+    embedded)
+      if [ "${ONE_SEARCH_EMBEDDED_POSTGRES:-false}" != "true" ]; then
+        log "DATABASE_MODE=embedded requires the all-in-one image"
+        exit 1
+      fi
+      if [ -n "${DATABASE_URL:-}${DATABASE_URL_FILE:-}" ]; then
+        log "external database settings are ignored because DATABASE_MODE=embedded"
+      fi
+      database_mode="embedded"
+      ;;
+    auto)
+      load_database_url
+      if [ -n "${DATABASE_URL:-}" ]; then
+        database_mode="external"
+      elif [ "${ONE_SEARCH_EMBEDDED_POSTGRES:-false}" = "true" ]; then
+        database_mode="embedded"
+      else
+        log "DATABASE_URL or DATABASE_URL_FILE is required by the external image"
+        exit 1
+      fi
+      ;;
+    *)
+      log "DATABASE_MODE must be embedded, external, or auto"
+      exit 1
+      ;;
+  esac
+}
+
+prepare_embedded_postgres() {
+  for binary in postgres initdb pg_isready psql su-exec; do
+    if ! command -v "$binary" >/dev/null 2>&1; then
+      log "embedded PostgreSQL support is unavailable: missing $binary"
+      exit 1
+    fi
+  done
+
+  : "${PGDATA:=/var/lib/postgresql/data}"
+  : "${POSTGRES_DB:=one_search}"
+  : "${POSTGRES_USER:=one_search}"
+  : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required when using the embedded database}"
+
+  mkdir -p "$PGDATA" /run/postgresql
+  chown -R postgres:postgres "$PGDATA" /run/postgresql
+
+  if [ ! -s "$PGDATA/PG_VERSION" ]; then
+    log "initializing postgres data directory"
+    pwfile=$(mktemp)
+    printf '%s\n' "$POSTGRES_PASSWORD" > "$pwfile"
+    chown postgres:postgres "$pwfile"
+    su-exec postgres initdb \
+      -D "$PGDATA" \
+      --username="$POSTGRES_USER" \
+      --pwfile="$pwfile" \
+      --auth-local=trust \
+      --auth-host=scram-sha-256 \
+      >/proc/1/fd/1 2>&1
+    rm -f "$pwfile"
+  fi
 }
 
 wait_for_backend() {
@@ -118,9 +212,14 @@ start_backend() {
   export CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:8080}"
   export UPSTREAM_USER_AGENT="${UPSTREAM_USER_AGENT:-OneSearchRelay/0.1}"
   export REQUEST_TIMEOUT_MS="${REQUEST_TIMEOUT_MS:-20000}"
-  export DATABASE_URL="postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@127.0.0.1:5432/${POSTGRES_DB}?sslmode=disable"
+  if [ "$database_mode" = "embedded" ]; then
+    database_user=$(escape_conninfo_value "$POSTGRES_USER")
+    database_password=$(escape_conninfo_value "$POSTGRES_PASSWORD")
+    database_name=$(escape_conninfo_value "$POSTGRES_DB")
+    export DATABASE_URL="host=127.0.0.1 port=5432 user='$database_user' password='$database_password' dbname='$database_name' sslmode=disable"
+  fi
 
-  log "starting backend on ${HTTP_ADDR}"
+  log "starting backend on ${HTTP_ADDR} with ${database_mode} database"
   /usr/local/bin/one-search &
   backend_pid=$!
 
@@ -135,43 +234,26 @@ start_nginx() {
 }
 
 main() {
-  : "${PGDATA:=/var/lib/postgresql/data}"
-  : "${POSTGRES_DB:=one_search}"
-  : "${POSTGRES_USER:=one_search}"
-  : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}"
-
   trap 'cleanup; exit 0' INT TERM
   trap cleanup EXIT
 
-  mkdir -p "$PGDATA" /run/postgresql
-  chown -R postgres:postgres "$PGDATA" /run/postgresql
-
-  if [ ! -s "$PGDATA/PG_VERSION" ]; then
-    log "initializing postgres data directory"
-    pwfile=$(mktemp)
-    printf '%s\n' "$POSTGRES_PASSWORD" > "$pwfile"
-    chown postgres:postgres "$pwfile"
-    su-exec postgres initdb \
-      -D "$PGDATA" \
-      --username="$POSTGRES_USER" \
-      --pwfile="$pwfile" \
-      --auth-local=trust \
-      --auth-host=scram-sha-256 \
-      >/proc/1/fd/1 2>&1
-    rm -f "$pwfile"
-  fi
-
   normalize_container_proxy_env
+  select_database_mode
 
-  start_postgres
-  ensure_database
+  if [ "$database_mode" = "embedded" ]; then
+    prepare_embedded_postgres
+    start_postgres
+    ensure_database
+  else
+    log "using configured external PostgreSQL"
+  fi
   start_backend
   start_nginx
 
-  log "all-in-one stack is ready"
+  log "one-search stack is ready"
 
   while true; do
-    if ! kill -0 "$postgres_pid" 2>/dev/null; then
+    if [ "$database_mode" = "embedded" ] && ! kill -0 "$postgres_pid" 2>/dev/null; then
       log "postgres stopped unexpectedly"
       exit 1
     fi
@@ -187,4 +269,6 @@ main() {
   done
 }
 
-main "$@"
+if [ "${ONE_SEARCH_ENTRYPOINT_SKIP_MAIN:-false}" != "true" ]; then
+  main "$@"
+fi

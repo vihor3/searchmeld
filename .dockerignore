@@ -1,0 +1,15 @@
+.git
+.env
+.env.*
+!.env.example
+*.log
+*.dump
+*.key
+*.pem
+backups/
+secrets/
+coverage
+backend/one-search
+backend/tmp
+frontend/node_modules
+frontend/dist

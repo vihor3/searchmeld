@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+.one-search-install.lock/
 
 # logs / os junk
 *.log

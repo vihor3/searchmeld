@@ -1,0 +1,10 @@
+services:
+  app:
+    networks:
+      - default
+      - database
+
+networks:
+  database:
+    external: true
+    name: ${DATABASE_DOCKER_NETWORK:-shared-db}

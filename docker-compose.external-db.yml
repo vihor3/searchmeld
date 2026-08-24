@@ -4,12 +4,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: all-in-one
+      target: external
     environment:
       APP_ENV: ${APP_ENV:-production}
-      POSTGRES_DB: ${POSTGRES_DB:-one_search}
-      POSTGRES_USER: ${POSTGRES_USER:-one_search}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set a strong postgres password}
+      DATABASE_MODE: external
+      DATABASE_URL: ${DATABASE_URL:?set the external PostgreSQL DATABASE_URL}
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
@@ -21,15 +20,13 @@ services:
       HTTP_PROXY: ${ONE_SEARCH_HTTP_PROXY:-}
       HTTPS_PROXY: ${ONE_SEARCH_HTTPS_PROXY:-}
       ALL_PROXY: ${ONE_SEARCH_ALL_PROXY:-}
-      NO_PROXY: ${ONE_SEARCH_NO_PROXY:-localhost,127.0.0.1,::1}
+      NO_PROXY: ${ONE_SEARCH_NO_PROXY:-localhost,127.0.0.1,::1,shared-postgres}
       http_proxy: ${ONE_SEARCH_HTTP_PROXY:-}
       https_proxy: ${ONE_SEARCH_HTTPS_PROXY:-}
       all_proxy: ${ONE_SEARCH_ALL_PROXY:-}
-      no_proxy: ${ONE_SEARCH_NO_PROXY:-localhost,127.0.0.1,::1}
+      no_proxy: ${ONE_SEARCH_NO_PROXY:-localhost,127.0.0.1,::1,shared-postgres}
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
     ports:
       - "${HOST_PORT:-5173}:80"
     healthcheck:
@@ -38,6 +35,3 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-
-volumes:
-  postgres_data:

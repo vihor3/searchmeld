@@ -19,6 +19,52 @@
 
 需要 Docker 24+ / Compose v2，以及至少一个上游搜索 API Key。
 
+### 一键安装
+
+默认安装包含内置 PostgreSQL 的一体化版本，自动生成数据库密码、管理员密码和加密密钥：
+
+```bash
+git clone https://github.com/CncCbz/one-search.git
+cd one-search
+./install.sh
+```
+
+安装完成后脚本会等待健康检查通过，并显示管理台地址和首次管理员密码。配置保存在权限为 `600` 的 `.env` 中；重复运行会沿用现有持久化密码和 `ENCRYPTION_KEY`，不会静默替换。
+
+使用独立的外部 PostgreSQL：
+
+```bash
+./install.sh --mode external
+# 根据隐藏提示输入 DATABASE_URL
+```
+
+也可以把连接串放入权限受限的文件：
+
+```bash
+./install.sh --mode external --database-url-file ./secrets/one-search-database-url
+```
+
+数据库位于另一个 Compose 项目的共享网络中：
+
+```bash
+./install.sh --mode external --database-network shared-db
+```
+
+非交互式安装示例：
+
+```bash
+export DATABASE_URL='postgres://one_search:URL编码后的密码@shared-postgres:5432/one_search?sslmode=disable'
+./install.sh --mode external --database-network shared-db --yes
+```
+
+查看所有参数：
+
+```bash
+./install.sh --help
+```
+
+### 手动安装
+
 ```bash
 git clone https://github.com/CncCbz/one-search.git
 cd one-search
@@ -39,6 +85,60 @@ curl http://localhost:5173/healthz
 ```
 
 打开 <http://localhost:5173>，用管理员账号登录。
+
+## 使用外部 PostgreSQL
+
+后端原生读取 `DATABASE_URL`。`external` 镜像默认使用外部数据库，不会初始化本地数据目录或覆盖连接串；`all-in-one` 镜像默认仍使用内置数据库，避免升级时被 `.env` 中遗留的开发连接串意外切换。外部数据库要求 PostgreSQL 15+，因为迁移使用了 `UNIQUE NULLS NOT DISTINCT`。
+
+先创建项目专用账号和数据库，确保该账号拥有目标数据库及 schema，能够执行建表、索引和后续迁移：
+
+```sql
+CREATE ROLE one_search LOGIN;
+\password one_search
+CREATE DATABASE one_search OWNER one_search;
+```
+
+如果数据库运行在另一个 Compose 项目的 `shared-db` 网络中，在 `.env` 中填写：
+
+```dotenv
+DATABASE_URL=postgres://one_search:URL编码后的密码@shared-postgres:5432/one_search?sslmode=disable
+DATABASE_DOCKER_NETWORK=shared-db
+ADMIN_PASSWORD=管理员密码
+ENCRYPTION_KEY=至少32字符
+```
+
+确保共享网络已经存在，然后组合外部数据库和共享网络两个 Compose 文件启动：
+
+```bash
+docker network inspect shared-db >/dev/null 2>&1 || docker network create --internal shared-db
+docker compose \
+  -f docker-compose.external-db.yml \
+  -f docker-compose.shared-db.yml \
+  up --build -d
+curl http://localhost:5173/healthz
+```
+
+`docker-compose.external-db.yml` 会构建 Dockerfile 的 `external` 目标。该目标只包含前端、后端和 Nginx，不安装 PostgreSQL server、client 或 `su-exec`，也不声明数据库数据卷。`docker-compose.shared-db.yml` 只负责把应用接入已有的 `shared-db` 网络。
+
+数据库位于远程服务器或宿主机时，只使用第一个文件即可，不要求 `shared-db` 网络：
+
+```bash
+docker compose -f docker-compose.external-db.yml up --build -d
+```
+
+也可以直接构建镜像：
+
+```bash
+# 轻量镜像：必须提供 DATABASE_URL 或 DATABASE_URL_FILE
+docker build --target external -t one-search:external .
+
+# 原有一体化镜像：默认目标和默认 embedded 模式
+docker build --target all-in-one -t one-search:all-in-one .
+```
+
+`all-in-one` 镜像也保留了连接外部数据库的能力，但必须显式传入 `DATABASE_MODE=external` 和 `DATABASE_URL`；它仍然包含 PostgreSQL 软件及数据卷声明。希望镜像和运行配置都不包含内置数据库时，请使用 `external` 构建目标或专用 Compose 文件。
+
+外部数据库暂时不可用时后端会退出，Compose 的 `restart: unless-stopped` 会继续重启；健康检查只有在数据库和 HTTP 服务均可用后才会通过。多副本部署时建议只让一个实例执行迁移，其他实例设置 `RUN_MIGRATIONS=false`。
 
 ## 首次配置
 
@@ -131,7 +231,9 @@ enabled_tools = ["search"]
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `HOST_PORT` | `5173` | 宿主机端口 |
-| `POSTGRES_PASSWORD` | — | **必填** |
+| `POSTGRES_PASSWORD` | — | 使用内置 PostgreSQL 时**必填**；外部数据库模式不需要 |
+| `DATABASE_URL` | 空 | 外部 Compose 或容器直接运行时使用的 PostgreSQL 连接串 |
+| `DATABASE_MODE` | 取决于镜像 | `all-in-one` 默认 `embedded`，`external` 默认 `external`；一体化镜像切外部库时须显式设为 `external` |
 | `ADMIN_USERNAME` | `admin` | 首次管理员用户名 |
 | `ADMIN_PASSWORD` | — | 生产**必填** |
 | `ENCRYPTION_KEY` | — | **必填**，≥32 字符，加密敏感 Key |
@@ -144,10 +246,11 @@ enabled_tools = ["search"]
 | --- | --- | --- |
 | `APP_ENV` | Compose 下 `production` | 生产请保持 `production` |
 | `POSTGRES_DB` / `POSTGRES_USER` | `one_search` | 库名 / 用户 |
-| `HTTP_ADDR` | `:8080` | 容器内后端监听地址 |
+| `HTTP_ADDR` | `:8080` | 仅独立后端部署可改；根 Dockerfile 的 Nginx 和健康检查固定使用 `8080` |
 | `MCP_PATH` | `/mcp` | MCP 路径 |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:5173,http://localhost:8080` | CORS 白名单 |
-| `DATABASE_URL` | 本地开发用 | all-in-one 会自动生成，无需手写 |
+| `DATABASE_URL_FILE` | 空 | 外部连接串在容器内的文件路径，适合 Docker Secret；需要自行挂载，与 `DATABASE_URL` 二选一 |
+| `DATABASE_DOCKER_NETWORK` | `shared-db` | 外部数据库 Compose 使用的 Docker 网络 |
 | `RUN_MIGRATIONS` | `true` | 启动时自动迁移 |
 | `REQUEST_TIMEOUT_MS` | `20000` | 上游请求超时 |
 | `REQUEST_BODY_LIMIT_BYTES` | `1048576` | 请求体上限 |
