@@ -304,13 +304,38 @@ func (o *Orchestrator) searchParallel(ctx context.Context, req model.SearchReque
 func (o *Orchestrator) searchFallback(ctx context.Context, req model.SearchRequest, providerConfigs map[string]model.ProviderConfig, providerLimits map[string]int, keyRetryCounts map[string]int, providerTimeouts map[string]int, providerProxies map[string]string, retryableErrors map[string]map[string]bool) []providerExecution {
 	results := []providerExecution{}
 	for _, name := range req.Providers {
+		if ctx.Err() != nil {
+			break
+		}
 		execution := o.callProvider(ctx, req, name, providerConfigs, providerLimits, keyRetryCounts, providerTimeouts, providerProxies, retryableErrors)
 		results = append(results, execution)
-		if execution.err == nil && len(execution.results) > 0 {
+		if !shouldContinueFallback(execution) {
 			break
 		}
 	}
 	return results
+}
+
+// shouldContinueFallback decides whether fallback mode tries the next provider.
+// Continues on operational failures (rate limit / quota / timeout / upstream / no_key / auth / invalid_response)
+// and empty success. Stops only when a provider returns non-empty results.
+func shouldContinueFallback(execution providerExecution) bool {
+	if execution.err == nil {
+		return len(execution.results) == 0
+	}
+	switch execution.errorType {
+	case provider.ErrorTypeRateLimited,
+		provider.ErrorTypeQuotaExhausted,
+		provider.ErrorTypeTimeout,
+		provider.ErrorTypeUpstream,
+		provider.ErrorTypeNoKey,
+		provider.ErrorTypeAuth,
+		provider.ErrorTypeInvalidResponse:
+		return true
+	default:
+		// Unknown error types still skip this provider and try the next one.
+		return true
+	}
 }
 
 func (o *Orchestrator) searchSingle(ctx context.Context, req model.SearchRequest, providerConfigs map[string]model.ProviderConfig, providerLimits map[string]int, keyRetryCounts map[string]int, providerTimeouts map[string]int, providerProxies map[string]string, retryableErrors map[string]map[string]bool) []providerExecution {

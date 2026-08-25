@@ -445,3 +445,55 @@ func stringSlicesEqual(left, right []string) bool {
 	rightJSON, _ := json.Marshal(right)
 	return string(leftJSON) == string(rightJSON)
 }
+
+func TestShouldContinueFallback(t *testing.T) {
+	if !shouldContinueFallback(providerExecution{err: nil, results: nil}) {
+		t.Fatal("empty success should continue")
+	}
+	if shouldContinueFallback(providerExecution{err: nil, results: []model.SearchResult{{URL: "https://x"}}}) {
+		t.Fatal("non-empty success should stop")
+	}
+	for _, errorType := range []string{
+		provider.ErrorTypeRateLimited,
+		provider.ErrorTypeQuotaExhausted,
+		provider.ErrorTypeTimeout,
+		provider.ErrorTypeUpstream,
+		provider.ErrorTypeNoKey,
+		provider.ErrorTypeAuth,
+		provider.ErrorTypeInvalidResponse,
+	} {
+		if !shouldContinueFallback(providerExecution{err: &provider.Error{Type: errorType, Message: "x"}, errorType: errorType}) {
+			t.Fatalf("%s should continue", errorType)
+		}
+	}
+}
+
+func TestSearchFallbackSkipsFailedProvider(t *testing.T) {
+	registry := provider.NewRegistry(
+		orchestratorTestProvider{name: "a", err: &provider.Error{Type: provider.ErrorTypeRateLimited, Message: "limited"}},
+		orchestratorTestProvider{name: "b", resultN: 1},
+	)
+	store := &orchestratorTestStore{
+		settings: model.RuntimeSettings{
+			DefaultMode: model.SearchModeFallback, DefaultProviders: []string{"a", "b"}, DefaultLimit: 5,
+			DefaultDedupe: true, RequestTimeoutMS: 2000, CacheEnabled: false,
+		},
+		providers: []model.ProviderConfig{
+			{Name: "a", Enabled: true, Priority: 1, Weight: 1},
+			{Name: "b", Enabled: true, Priority: 2, Weight: 1},
+		},
+	}
+	orch := NewOrchestrator(registry, &orchestratorTestKeyPool{}, store)
+	resp, err := orch.Search(context.Background(), model.SearchRequest{
+		Query: "q", Providers: []string{"a", "b"}, ProvidersExplicit: true, Mode: model.SearchModeFallback,
+	}, "req-fallback", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].Provider != "b" {
+		t.Fatalf("expected result from b, got %+v", resp.Results)
+	}
+	if len(resp.Providers) != 2 {
+		t.Fatalf("expected both provider summaries, got %+v", resp.Providers)
+	}
+}
