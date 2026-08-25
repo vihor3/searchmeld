@@ -82,7 +82,7 @@ func (o *Orchestrator) Search(ctx context.Context, req model.SearchRequest, requ
 			req.Limit = limit
 		}
 	}
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(effectiveRequestTimeoutMS(settings.RequestTimeoutMS, providerTimeouts, req.Providers))*time.Millisecond)
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(effectiveRequestTimeoutMS(settings.RequestTimeoutMS, providerTimeouts, keyRetryCounts, req.Providers))*time.Millisecond)
 	defer cancel()
 
 	cacheKey := o.cacheKey(req, providerLimits)
@@ -449,7 +449,7 @@ func shouldRetryWithNextKey(err error, allowed map[string]bool) bool {
 	errorType := provider.ErrorType(err)
 	if len(allowed) == 0 {
 		switch errorType {
-		case provider.ErrorTypeAuth, provider.ErrorTypeQuotaExhausted, provider.ErrorTypeRateLimited:
+		case provider.ErrorTypeAuth, provider.ErrorTypeQuotaExhausted, provider.ErrorTypeRateLimited, provider.ErrorTypeTimeout, provider.ErrorTypeUpstream:
 			return true
 		default:
 			return false
@@ -460,6 +460,9 @@ func shouldRetryWithNextKey(err error, allowed map[string]bool) bool {
 
 func (o *Orchestrator) refreshOfficialQuota(key model.APIKey) {
 	if key.ID == 0 || !autoRefreshOfficialQuota(key.ProviderName) {
+		return
+	}
+	if key.ProviderName == model.ProviderExa && strings.TrimSpace(key.ExaServiceKey) == "" {
 		return
 	}
 	now := time.Now()
@@ -776,11 +779,19 @@ func providerTimeouts(settings map[string]map[string]interface{}) map[string]int
 	return timeouts
 }
 
-func effectiveRequestTimeoutMS(runtimeTimeoutMS int, providerTimeouts map[string]int, providerNames []string) int {
+func effectiveRequestTimeoutMS(runtimeTimeoutMS int, providerTimeouts map[string]int, keyRetryCounts map[string]int, providerNames []string) int {
 	timeout := runtimeTimeoutMS
 	for _, name := range providerNames {
-		if providerTimeouts[name] > 0 && providerTimeouts[name]+1000 > timeout {
-			timeout = providerTimeouts[name] + 1000
+		providerTimeout := providerTimeouts[name]
+		if providerTimeout <= 0 {
+			continue
+		}
+		needed := providerTimeout + 1000
+		if keyRetryCounts[name] > 0 {
+			needed += providerTimeout
+		}
+		if needed > timeout {
+			timeout = needed
 		}
 	}
 	if timeout <= 0 {

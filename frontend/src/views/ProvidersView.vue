@@ -121,8 +121,9 @@
                           class="key-input"
                           type="password"
                           show-password
-                          placeholder="Exa x-api-key / 管理密钥"
+                          placeholder="Exa 管理密钥（选填）"
                         />
+                        <p v-if="providerForm?.name === 'exa' && !draftExaServiceKey.trim()" class="muted exa-local-billing-hint">不填将使用本地计算费用模式</p>
                       </div>
                       <div class="new-key-actions">
                         <el-tooltip content="保存密钥" placement="top">
@@ -146,7 +147,7 @@
                               <el-icon><WarnTriangleFilled /></el-icon>
                             </span>
                           </el-tooltip>
-                          <span v-if="row.provider_name === 'exa' && row.exa_service_key_hint">x-api-key {{ row.exa_service_key_hint }}</span>
+                          <span v-if="row.provider_name === 'exa'">{{ row.exa_service_key_hint ? `x-api-key ${row.exa_service_key_hint}` : '本地计费' }}</span>
                         </div>
                       </div>
                       <el-tooltip content="复制密钥" placement="top">
@@ -273,6 +274,7 @@
                     <el-option label="鉴权失败" value="auth" />
                     <el-option label="额度耗尽" value="quota_exhausted" />
                     <el-option label="限流" value="rate_limited" />
+                    <el-option label="超时" value="timeout" />
                     <el-option label="上游错误" value="upstream" />
                     <el-option label="响应异常" value="invalid_response" />
                   </el-select>
@@ -374,7 +376,7 @@ const providerRetryErrorTypes = computed<string[]>({
   get() {
     const value = providerForm.value?.settings?.retry_error_types
     if (Array.isArray(value)) return value.filter((item): item is string => typeof item === 'string')
-    return ['auth', 'quota_exhausted', 'rate_limited']
+    return ['auth', 'quota_exhausted', 'rate_limited', 'timeout', 'upstream']
   },
   set(value: string[]) {
     if (!providerForm.value) return
@@ -641,11 +643,11 @@ function cancelCreateKey() {
 async function createKey() {
   if (!providerForm.value) return
   if (!draftKey.value.trim()) { ElMessage.warning('请填写平台密钥'); return }
-  if (providerForm.value.name === 'exa' && !draftExaServiceKey.value.trim()) { ElMessage.warning('请填写 Exa x-api-key'); return }
+  const exaServiceKey = draftExaServiceKey.value.trim()
   creatingKey.value = true
   try {
-    await api.createKey({ provider_name: providerForm.value.name, alias: `${providerForm.value.name}-${Date.now()}`, key: draftKey.value.trim(), exa_service_key: draftExaServiceKey.value.trim(), weight: 1, rpm_limit: 0, daily_quota: 0, monthly_quota: 0 })
-    ElMessage.success('密钥已添加')
+    await api.createKey({ provider_name: providerForm.value.name, alias: `${providerForm.value.name}-${Date.now()}`, key: draftKey.value.trim(), exa_service_key: exaServiceKey, weight: 1, rpm_limit: 0, daily_quota: 0, monthly_quota: 0 })
+    ElMessage.success(providerForm.value.name === 'exa' && !exaServiceKey ? '密钥已添加，将使用本地计算费用模式' : '密钥已添加')
     cancelCreateKey()
     await load()
   } finally {
@@ -679,6 +681,10 @@ async function testKey(row: EditableKey) {
 }
 
 async function queryQuota(row: EditableKey) {
+  if (row.provider_name === 'exa' && !row.exa_service_key_hint) {
+    ElMessage.info('未配置 Exa 管理密钥，当前使用本地计算费用模式')
+    return
+  }
   quotaLoadingKeyId.value = row.id
   try {
     const quota = await api.queryKeyQuota(row.id)
@@ -905,6 +911,10 @@ onMounted(load)
   flex-direction: column;
   gap: 8px;
   min-width: 0;
+}
+.exa-local-billing-hint {
+  margin: 0;
+  font-size: 12px;
 }
 .api-key-row > * { min-width: 0; }
 .api-key-row .row-icon-button {

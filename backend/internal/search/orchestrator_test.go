@@ -390,9 +390,13 @@ func TestProviderResultLimitsDoNotCapAtFifty(t *testing.T) {
 }
 
 func TestEffectiveRequestTimeoutUsesProviderTimeoutWhenLarger(t *testing.T) {
-	got := effectiveRequestTimeoutMS(20000, map[string]int{model.ProviderFirecrawl: 60000}, []string{model.ProviderFirecrawl})
+	got := effectiveRequestTimeoutMS(20000, map[string]int{model.ProviderFirecrawl: 60000}, nil, []string{model.ProviderFirecrawl})
 	if want := 61000; got != want {
 		t.Fatalf("effective timeout = %d, want %d", got, want)
+	}
+	got = effectiveRequestTimeoutMS(20000, map[string]int{model.ProviderJina: 15000}, map[string]int{model.ProviderJina: 3}, []string{model.ProviderJina})
+	if want := 31000; got != want {
+		t.Fatalf("retry timeout = %d, want %d", got, want)
 	}
 }
 
@@ -444,6 +448,42 @@ func stringSlicesEqual(left, right []string) bool {
 	leftJSON, _ := json.Marshal(left)
 	rightJSON, _ := json.Marshal(right)
 	return string(leftJSON) == string(rightJSON)
+}
+
+func TestShouldRetryWithNextKeyIncludesTimeout(t *testing.T) {
+	if !shouldRetryWithNextKey(context.DeadlineExceeded, nil) {
+		t.Fatal("timeout should retry with next key")
+	}
+	if !shouldRetryWithNextKey(fmt.Errorf("dial tcp: i/o timeout"), nil) {
+		t.Fatal("network/upstream error should retry with next key")
+	}
+	if shouldRetryWithNextKey(&provider.Error{Type: provider.ErrorTypeInvalidResponse, Message: "bad json"}, nil) {
+		t.Fatal("invalid_response should not retry by default")
+	}
+}
+
+func TestSearchRetriesTimeoutWithNextKey(t *testing.T) {
+	keyPool := &orchestratorTestKeyPool{}
+	registry := provider.NewRegistry(orchestratorTestProvider{name: model.ProviderJina, err: context.DeadlineExceeded})
+	store := &orchestratorTestStore{
+		settings: model.RuntimeSettings{
+			DefaultMode: model.SearchModeSingle, DefaultProviders: []string{model.ProviderJina}, DefaultLimit: 5,
+			DefaultDedupe: true, RequestTimeoutMS: 2000, CacheEnabled: false,
+		},
+		providers: []model.ProviderConfig{
+			{Name: model.ProviderJina, Enabled: true, Priority: 1, Weight: 1, TimeoutMS: 50, Settings: map[string]interface{}{"key_retry_count": 1}},
+		},
+	}
+	orch := NewOrchestrator(registry, keyPool, store)
+	_, err := orch.Search(context.Background(), model.SearchRequest{
+		Query: "q", Providers: []string{model.ProviderJina}, ProvidersExplicit: true, Mode: model.SearchModeSingle,
+	}, "req-jina-retry", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keyPool.acquired) != 2 {
+		t.Fatalf("expected 2 key attempts, got %v", keyPool.acquired)
+	}
 }
 
 func TestShouldContinueFallback(t *testing.T) {

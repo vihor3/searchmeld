@@ -569,10 +569,6 @@ func (h *Handler) createKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
-	if req.ProviderName == model.ProviderExa && strings.TrimSpace(req.ExaServiceKey) == "" {
-		writeError(w, http.StatusBadRequest, "Exa x-api-key is required")
-		return
-	}
 	key, err := h.store.CreateProviderKey(r.Context(), req.ProviderName, req.Alias, req.Key, req.ExaAPIKeyID, req.ExaServiceKey, req.Weight, req.RPMLimit, req.DailyQuota, req.MonthlyQuota, req.MaxConcurrency)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
