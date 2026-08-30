@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"net"
 	"net/http"
 	"strings"
@@ -18,6 +19,7 @@ const (
 	requestIDKey  contextKey = "request_id"
 	apiTokenIDKey contextKey = "api_token_id"
 	apiTokenKey   contextKey = "api_token"
+	compatAPIKey  contextKey = "compat_api_key"
 	adminActorKey contextKey = "admin_actor"
 )
 
@@ -173,6 +175,45 @@ func bearerToken(r *http.Request) string {
 		return key
 	}
 	return ""
+}
+
+// apiTokenCredential returns the normal header credential first, then a
+// compatibility credential injected by a narrowly scoped route middleware.
+// Admin authentication intentionally continues to use bearerToken directly.
+func apiTokenCredential(r *http.Request) string {
+	if token := bearerToken(r); token != "" {
+		return token
+	}
+	token, _ := r.Context().Value(compatAPIKey).(string)
+	return strings.TrimSpace(token)
+}
+
+// tavilyBodyAPIKeyMiddleware accepts the legacy Tavily JSON authentication
+// shape on Tavily-compatible routes only. The body is restored so the handler
+// can decode it normally, and header credentials retain precedence.
+func tavilyBodyAPIKeyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if bearerToken(r) != "" || r.Body == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		body, err := readBody(r)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid body")
+			return
+		}
+		var payload struct {
+			APIKey string `json:"api_key"`
+		}
+		if err := json.Unmarshal(body, &payload); err == nil {
+			if token := strings.TrimSpace(payload.APIKey); token != "" {
+				ctx := context.WithValue(r.Context(), compatAPIKey, token)
+				r = r.WithContext(ctx)
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func newRequestID() string {

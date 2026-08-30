@@ -108,8 +108,8 @@ func (h *Handler) Mount(r chi.Router) {
 	r.Route("/v1", func(r chi.Router) {
 		r.With(h.auth.requireAPITokenScope("search")).Post("/search", h.search)
 		r.With(h.auth.requireAPITokenScope("extract")).Post("/extract", h.extract)
-		r.With(h.auth.requireAPITokenScope("search")).Post("/compat/tavily/search", h.tavilySearch)
-		r.With(h.auth.requireAPITokenScope("extract")).Post("/compat/tavily/extract", h.tavilyExtract)
+		r.With(h.auth.requireTavilyAPITokenScope("search")).Post("/compat/tavily/search", h.tavilySearch)
+		r.With(h.auth.requireTavilyAPITokenScope("extract")).Post("/compat/tavily/extract", h.tavilyExtract)
 		r.With(h.auth.requireAPITokenScope("search")).Post("/compat/serper/search", h.serperSearch)
 		r.With(h.auth.requireAPITokenScope("search")).Post("/compat/openai/responses-search", h.openAISearch)
 		r.With(h.auth.requireAPIToken).Get("/providers", h.providers)

@@ -156,7 +156,7 @@ func (a *AuthService) requireAPIToken(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		token := bearerToken(r)
+		token := apiTokenCredential(r)
 		if token == "" {
 			writeError(w, http.StatusUnauthorized, "api token required")
 			return
@@ -196,6 +196,13 @@ func (a *AuthService) requireAPITokenScope(scope string) func(http.Handler) http
 			next.ServeHTTP(w, r)
 		})
 		return a.requireAPIToken(scoped)
+	}
+}
+
+func (a *AuthService) requireTavilyAPITokenScope(scope string) func(http.Handler) http.Handler {
+	requireScope := a.requireAPITokenScope(scope)
+	return func(next http.Handler) http.Handler {
+		return tavilyBodyAPIKeyMiddleware(requireScope(next))
 	}
 }
 

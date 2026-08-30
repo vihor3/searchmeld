@@ -197,6 +197,8 @@ curl -X POST http://localhost:5173/v1/extract \
 | `/v1/compat/openai/responses-search` | OpenAI 兼容 |
 | `/mcp` | MCP（默认开启） |
 
+两个 Tavily 兼容接口除 `Authorization: Bearer` 和 `X-API-Key` 外，也接受旧版 Tavily 客户端使用的 JSON `api_key` 字段。请求头与 JSON 同时存在时优先使用请求头；该兼容形式不会应用到 `/v1/search`、`/v1/extract` 或其它接口。
+
 完整接口见 [docs/extract.md](docs/extract.md)、[docs/admin-api-key.md](docs/admin-api-key.md)、[docs/mcp.md](docs/mcp.md)。
 
 ## MCP 配置

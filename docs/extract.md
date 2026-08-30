@@ -129,7 +129,7 @@ Extract 默认不写搜索缓存，确保每次向上游获取当前页面内容
 POST /v1/compat/tavily/extract
 ```
 
-该接口受运行设置 `compat_tavily_enabled` 控制，鉴权方式与原生接口相同。`urls` 同时接受单个字符串和字符串数组：
+该接口受运行设置 `compat_tavily_enabled` 控制。除原生接口支持的 `Authorization: Bearer` 和 `X-API-Key` 外，也接受旧版 Tavily 客户端放在 JSON 请求体中的 `api_key`；请求头存在时优先使用请求头。`urls` 同时接受单个字符串和字符串数组：
 
 ```bash
 curl -X POST http://localhost:5173/v1/compat/tavily/extract \
