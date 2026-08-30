@@ -22,7 +22,7 @@
 
 ### 一键安装
 
-默认安装包含内置 PostgreSQL 的一体化版本，自动生成数据库密码、管理员密码和加密密钥：
+一键安装脚本不需要设置环境变量，也不接受安装参数。直接运行：
 
 ```bash
 git clone https://github.com/CncCbz/one-search.git
@@ -30,39 +30,17 @@ cd one-search
 ./install.sh
 ```
 
-安装完成后脚本会等待健康检查通过，并显示管理台地址和首次管理员密码。配置保存在权限为 `600` 的 `.env` 中；重复运行会沿用现有持久化密码和 `ENCRYPTION_KEY`，不会静默替换。
+向导会依次引导完成：
 
-使用独立的外部 PostgreSQL：
+1. 选择内置 PostgreSQL，或已有的外部 PostgreSQL 15+。
+2. 外部数据库可选择加入另一个 Docker 网络，并填写网络名称。
+3. 外部数据库连接信息可按主机、端口、库名、用户名、密码和 SSL 模式逐项填写，也可直接粘贴完整 `DATABASE_URL`。密码和连接串采用隐藏输入。
+4. 设置管理台端口、管理员账号、管理员密码生成方式，以及是否启用 MCP。
+5. 查看不含密码的配置摘要并确认安装。
 
-```bash
-./install.sh --mode external
-# 根据隐藏提示输入 DATABASE_URL
-```
+内置数据库密码和 `ENCRYPTION_KEY` 由脚本自动安全生成。安装完成后脚本会等待健康检查通过，并显示管理台地址和自动生成的首次管理员密码。
 
-也可以把连接串放入权限受限的文件：
-
-```bash
-./install.sh --mode external --database-url-file ./secrets/one-search-database-url
-```
-
-数据库位于另一个 Compose 项目的共享网络中：
-
-```bash
-./install.sh --mode external --database-network shared-db
-```
-
-非交互式安装示例：
-
-```bash
-export DATABASE_URL='postgres://one_search:URL编码后的密码@shared-postgres:5432/one_search?sslmode=disable'
-./install.sh --mode external --database-network shared-db --yes
-```
-
-查看所有参数：
-
-```bash
-./install.sh --help
-```
+配置保存在权限为 `600` 的 `.env` 中。重复运行 `./install.sh` 时，可以选择沿用现有配置启动/更新，也可以重新进入配置向导；已有持久化密码和 `ENCRYPTION_KEY` 不会被静默替换。
 
 ### 手动安装
 
