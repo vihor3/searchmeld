@@ -150,7 +150,8 @@ curl "$BASE_URL/api/admin/dashboard" \
 | `POST` | `/api/admin/keys/{id}/quota` | 可以 | 查询并保存该 Key 的官方额度/账单信息或本地估算额度。 |
 | `DELETE` | `/api/admin/keys/{id}` | 可以 | 删除 Provider Key。 |
 | `GET` | `/api/admin/tokens` | 可以 | 获取外部 API Token 列表，只返回前缀和配置。 |
-| `POST` | `/api/admin/tokens` | 可以 | 创建外部 API Token，响应中的 `raw_token` 只显示一次。 |
+| `POST` | `/api/admin/tokens` | 可以 | 创建外部 API Token，并在响应中返回 `raw_token`。 |
+| `GET` | `/api/admin/tokens/{id}/secret` | 可以 | 解密并返回完整 Token，供管理台点击复制；响应禁止缓存并记录审计日志。 |
 | `PATCH` | `/api/admin/tokens/{id}` | 可以 | 更新 Token 配置或状态。 |
 | `DELETE` | `/api/admin/tokens/{id}` | 可以 | 删除外部 API Token。 |
 | `GET` | `/api/admin/settings` | 可以 | 获取运行时设置。 |
@@ -392,8 +393,8 @@ curl -X POST "$BASE_URL/api/admin/keys/1/quota" \
 | `jina` | `https://r.jina.ai/` 文本解析 | 解析 `Balance left`，单位 tokens。 |
 | `tavily` | `GET https://api.tavily.com/usage` | 返回当前 Key usage/limit，按 credits 展示剩余额度。 |
 | `firecrawl` | `GET https://api.firecrawl.dev/v2/team/credit-usage` | 返回团队 remainingCredits/planCredits 和账期。 |
-| `serper` | 本地累计用量估算 | Serper 未公开独立余额接口；按默认总额度 2500 credits 减本地累计 credits 估算剩余额度，不额外请求上游。 |
-| `brave` | `GET https://api.search.brave.com/res/v1/web/search` | Brave 通过 `X-RateLimit-*` 响应头返回剩余请求额度；查询本身会消耗一次成功请求。 |
+| `serper` | 本地累计用量估算 | Serper 未公开独立余额接口；按注册赠送的 2500 credits 减本实例全生命周期累计 credits 估算剩余额度，不额外请求上游。 |
+| `brave` | 正常搜索响应头 | 从正常搜索的 `X-RateLimit-*` 响应头被动保存额度快照；点击查询不会额外消耗请求，没有快照时显示本地累计请求数。 |
 
 ### 5.8 创建外部 API Token
 
@@ -433,7 +434,7 @@ curl -X POST "$BASE_URL/api/admin/tokens" \
 }
 ```
 
-`raw_token` 只显示一次。`scopes` 省略或传空数组时默认保存为 `["search"]`。既有 Token 也保持原 scopes，升级不会自动增加 `extract`；需要正文抽取时必须显式加入 `extract`。
+创建响应会直接返回 `raw_token`；之后管理员仍可调用 `GET /api/admin/tokens/{id}/secret` 重新读取，管理台也会在每次点击令牌时读取并复制。令牌列表本身仍只返回前缀，避免批量暴露完整凭据。`scopes` 省略或传空数组时默认保存为 `["search"]`。既有 Token 也保持原 scopes，升级不会自动增加 `extract`；需要正文抽取时必须显式加入 `extract`。
 
 ### 5.9 更新外部 API Token
 

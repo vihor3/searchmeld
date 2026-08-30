@@ -12,7 +12,7 @@
     <el-alert v-if="rawToken" type="success" show-icon :closable="false" class="token-alert">
       <template #title>
         <div class="raw-token-row">
-          <span>只显示一次</span>
+          <span>令牌已创建，可随时在列表中再次复制</span>
           <code>{{ rawToken }}</code>
           <el-button :icon="CopyDocument" circle size="small" title="复制" @click="copyText(rawToken)" />
         </div>
@@ -20,21 +20,31 @@
     </el-alert>
 
     <el-card class="soft-card" shadow="never" v-loading="loading">
-      <el-table :data="tokens" stripe>
-        <el-table-column prop="name" label="名称" min-width="120" />
-        <el-table-column label="权限" min-width="120">
+      <el-table class="token-table" :data="tokens" stripe table-layout="fixed">
+        <el-table-column prop="name" label="名称" min-width="140" show-overflow-tooltip />
+        <el-table-column label="权限" width="150">
           <template #default="scope">
             <div class="provider-tags">
               <el-tag v-for="item in scope.row.scopes" :key="item" size="small" type="info">{{ scopeLabel(item) }}</el-tag>
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="令牌" min-width="160">
+        <el-table-column label="令牌（点击复制）" min-width="220">
           <template #default="scope">
-            <span class="mono">{{ displayToken(scope.row) }}</span>
+            <button
+              type="button"
+              class="token-copy-button"
+              :disabled="copyingTokenId === scope.row.id"
+              title="复制完整令牌"
+              @click="copyToken(scope.row)"
+            >
+              <span class="mono">{{ displayToken(scope.row) }}</span>
+              <el-icon v-if="copyingTokenId === scope.row.id" class="is-loading"><Loading /></el-icon>
+              <el-icon v-else><CopyDocument /></el-icon>
+            </button>
           </template>
         </el-table-column>
-        <el-table-column label="渠道" min-width="140">
+        <el-table-column label="渠道" min-width="170">
           <template #default="scope">
             <div class="provider-tags">
               <el-tag v-if="scope.row.allowed_providers.length === 0" size="small" type="info">全部</el-tag>
@@ -42,15 +52,15 @@
             </div>
           </template>
         </el-table-column>
-        <el-table-column prop="status" label="状态" width="90">
+        <el-table-column prop="status" label="状态" width="82" align="center">
           <template #default="scope">
             <el-tag :type="scope.row.status === 'enabled' ? 'success' : 'info'">
               {{ scope.row.status === 'enabled' ? '启用' : '停用' }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column prop="rate_limit_per_min" label="RPM" width="80" align="right" />
-        <el-table-column label="额度" min-width="120">
+        <el-table-column prop="rate_limit_per_min" label="RPM" width="76" align="right" />
+        <el-table-column label="额度" width="108">
           <template #default="scope">
             <div class="quota-cell">
               <span>日 {{ formatQuota(scope.row.daily_quota) }}</span>
@@ -58,8 +68,8 @@
             </div>
           </template>
         </el-table-column>
-        <el-table-column prop="usage_count" label="使用" width="90" align="right" />
-        <el-table-column label="" width="132" align="right">
+        <el-table-column prop="usage_count" label="使用" width="76" align="right" />
+        <el-table-column label="操作" width="132" align="center" fixed="right">
           <template #default="scope">
             <div class="row-actions">
               <el-button link :icon="Edit" title="编辑" @click="openEdit(scope.row)" />
@@ -82,10 +92,11 @@
       <el-form label-position="top">
         <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
         <el-form-item label="接口权限">
-          <el-checkbox-group v-model="form.scopes">
-            <el-checkbox-button value="search">搜索</el-checkbox-button>
-            <el-checkbox-button value="extract">正文抽取</el-checkbox-button>
+          <el-checkbox-group v-model="form.scopes" class="scope-options">
+            <el-checkbox-button value="search">search</el-checkbox-button>
+            <el-checkbox-button value="extract">extract</el-checkbox-button>
           </el-checkbox-group>
+          <div class="form-hint">可同时选择两个权限。</div>
         </el-form-item>
         <el-form-item label="允许请求渠道">
           <el-select v-model="form.allowed_providers" multiple collapse-tags collapse-tags-tooltip placeholder="不选择表示全部渠道">
@@ -107,7 +118,7 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus/es/components/message/index'
-import { CircleCheck, CopyDocument, Delete, Edit, Plus, Remove } from '@element-plus/icons-vue'
+import { CircleCheck, CopyDocument, Delete, Edit, Loading, Plus, Remove } from '@element-plus/icons-vue'
 import PageSkeleton from '../components/PageSkeleton.vue'
 import { api, ApiToken } from '../api/client'
 import { providerLabel, providerOptions } from '../utils/providers'
@@ -118,6 +129,7 @@ const tokens = ref<ApiToken[]>([])
 const dialog = ref(false)
 const rawToken = ref('')
 const editingToken = ref<ApiToken | null>(null)
+const copyingTokenId = ref<number | null>(null)
 const form = reactive({
   name: '默认客户端',
   scopes: ['search'],
@@ -147,7 +159,7 @@ function formatQuota(value: number) {
 }
 
 function scopeLabel(scope: string) {
-  return ({ search: '搜索', extract: '抽取', '*': '全部' } as Record<string, string>)[scope] || scope
+  return scope.trim().toLowerCase()
 }
 
 function resetForm() {
@@ -161,6 +173,7 @@ function resetForm() {
 
 function openCreate() {
   editingToken.value = null
+  rawToken.value = ''
   resetForm()
   dialog.value = true
 }
@@ -176,10 +189,52 @@ function openEdit(token: ApiToken) {
   dialog.value = true
 }
 
+async function writeClipboard(text: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return
+    } catch {
+      // HTTP 或浏览器权限限制时回退到传统复制方式。
+    }
+  }
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', '')
+  textarea.style.position = 'fixed'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.select()
+  const copied = document.execCommand('copy')
+  textarea.remove()
+  if (!copied) throw new Error('浏览器拒绝复制')
+}
+
 async function copyText(text: string) {
   if (!text) return
-  await navigator.clipboard.writeText(text)
-  ElMessage.success('已复制')
+  try {
+    await writeClipboard(text)
+    ElMessage.success('已复制')
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '复制失败')
+  }
+}
+
+async function copyToken(token: ApiToken) {
+  copyingTokenId.value = token.id
+  try {
+    const secret = await api.revealToken(token.id)
+    if (!secret.token) {
+      ElMessage.warning('未找到可复制的令牌')
+      return
+    }
+    await writeClipboard(secret.token)
+    ElMessage.success('令牌已复制')
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '复制失败')
+  } finally {
+    copyingTokenId.value = null
+  }
 }
 
 async function saveToken() {
@@ -224,7 +279,42 @@ onMounted(load)
   font-family: var(--mono);
   word-break: break-all;
 }
+.token-table :deep(.el-table__cell) {
+  padding: 10px 0;
+}
+.token-copy-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--el-color-primary);
+  cursor: pointer;
+}
+.token-copy-button:hover {
+  background: var(--el-color-primary-light-9);
+}
+.token-copy-button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+.token-copy-button .mono {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .provider-tags { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.scope-options { width: 100%; }
+.form-hint {
+  width: 100%;
+  margin-top: 6px;
+  color: var(--faint);
+  font-size: 12px;
+  line-height: 1.4;
+}
 .quota-cell {
   font-variant-numeric: tabular-nums;
   line-height: 1.3;
@@ -236,8 +326,14 @@ onMounted(load)
   margin-top: 2px;
 }
 .row-actions {
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  gap: 2px;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  white-space: nowrap;
+}
+.row-actions :deep(.el-button + .el-button) {
+  margin-left: 0;
 }
 </style>

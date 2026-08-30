@@ -43,7 +43,7 @@ func TestQueryTavilyQuota(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueryOfficialQuota returned error: %v", err)
 	}
-	if !result.Supported || result.Status != "success" || result.Unit != "credits" || result.Balance == nil || *result.Balance != 850 || result.TotalQuantity == nil || *result.TotalQuantity != 150 {
+	if !result.Supported || result.Status != "success" || result.Source != model.QuotaSourceOfficial || result.Confidence != model.QuotaConfidenceExact || result.Unit != "credits" || result.Balance == nil || *result.Balance != 850 || result.TotalQuantity == nil || *result.TotalQuantity != 150 {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 }
@@ -76,17 +76,45 @@ func TestQueryFirecrawlQuota(t *testing.T) {
 	if err != nil {
 		t.Fatalf("QueryOfficialQuota returned error: %v", err)
 	}
-	if !result.Supported || result.Status != "success" || result.Unit != "credits" || result.Balance == nil || *result.Balance != 1000 || result.TotalQuantity == nil || *result.TotalQuantity != 499000 || result.Period["start"] == "" {
+	if !result.Supported || result.Status != "success" || result.Source != model.QuotaSourceOfficial || result.Confidence != model.QuotaConfidenceExact || result.Unit != "credits" || result.Balance == nil || *result.Balance != 1000 || result.TotalQuantity == nil || *result.TotalQuantity != 499000 || result.Period["start"] == "" {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 }
 
 func TestQuerySerperQuota(t *testing.T) {
-	result, err := QueryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderSerper, Alias: "serper", Value: "serper-key", MonthlyCredits: 100}, model.ProviderKeyQuotaRequest{})
+	result, err := QueryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderSerper, Alias: "serper", Value: "serper-key", MonthlyCredits: 10, UsageCreditsTotal: 100, UsageRequestsTotal: 120}, model.ProviderKeyQuotaRequest{})
 	if err != nil {
 		t.Fatalf("QueryOfficialQuota returned error: %v", err)
 	}
-	if !result.Supported || result.Status != "success" || result.Unit != "credits" || result.Balance == nil || *result.Balance != 2400 || result.TotalQuantity == nil || *result.TotalQuantity != 100 || !strings.Contains(result.Message, "默认总额度 2500") {
+	if !result.Supported || result.Status != "success" || result.Source != model.QuotaSourceLocalMeter || result.Confidence != model.QuotaConfidenceEstimated || result.Unit != "credits" || result.Balance == nil || *result.Balance != 2400 || result.TotalQuantity == nil || *result.TotalQuantity != 100 || !strings.Contains(result.Message, "2500 credits") {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
+func TestQueryExaQuotaFallsBackToLocalMeterWithoutManagementKey(t *testing.T) {
+	result, err := QueryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderExa, Alias: "exa", Value: "exa-key", UsageRequestsTotal: 12, UsageCostUSDTotal: 0.084}, model.ProviderKeyQuotaRequest{})
+	if err != nil {
+		t.Fatalf("QueryOfficialQuota returned error: %v", err)
+	}
+	if !result.Supported || result.Status != "success" || result.Source != model.QuotaSourceLocalMeter || result.Confidence != model.QuotaConfidenceEstimated || result.TotalCostUSD == nil || *result.TotalCostUSD != 0.084 || result.TotalQuantity == nil || *result.TotalQuantity != 12 {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
+func TestQueryJinaQuotaFallsBackToLocalTokensWhenBalanceFormatIsMissing(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("Jina account response without a balance line"))
+	}))
+	defer server.Close()
+	config := defaultQuotaQueryConfig()
+	config.jinaQuotaURL = server.URL
+	result, err := queryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderJina, Alias: "jina", Value: "jina-key", UsageTokensTotal: 321, UsageRequestsTotal: 4}, model.ProviderKeyQuotaRequest{}, config)
+	if err != nil {
+		t.Fatalf("queryOfficialQuota returned error: %v", err)
+	}
+	if result.Source != model.QuotaSourceLocalMeter || result.Unit != "tokens_used" || result.Balance != nil || result.TotalQuantity == nil || *result.TotalQuantity != 321 {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 }
@@ -110,33 +138,24 @@ func TestQueryOfficialQuotaUsesBoundedTimeout(t *testing.T) {
 }
 
 func TestQueryBraveQuota(t *testing.T) {
-	t.Parallel()
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/res/v1/web/search" {
-			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.Path)
-		}
-		if got := r.Header.Get("X-Subscription-Token"); got != "brave-key" {
-			t.Fatalf("X-Subscription-Token = %q", got)
-		}
-		if r.URL.Query().Get("count") != "1" {
-			t.Fatalf("unexpected query: %s", r.URL.RawQuery)
-		}
-		w.Header().Set("X-RateLimit-Limit", "1, 15000")
-		w.Header().Set("X-RateLimit-Policy", "1;w=1, 15000;w=2592000")
-		w.Header().Set("X-RateLimit-Remaining", "0, 14523")
-		w.Header().Set("X-RateLimit-Reset", "1, 1234567")
-		writeQuotaJSON(t, w, map[string]interface{}{"type": "search", "web": map[string]interface{}{"results": []map[string]interface{}{}}})
-	}))
-	defer server.Close()
-	config := defaultQuotaQueryConfig()
-	config.braveWebSearchURL = server.URL + "/res/v1/web/search"
-
-	result, err := queryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderBrave, Alias: "brave", Value: "brave-key"}, model.ProviderKeyQuotaRequest{}, config)
+	balance := 14523.0
+	used := 477.0
+	checkedAt := time.Now().Add(-time.Minute)
+	result, err := QueryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderBrave, Alias: "brave", OfficialQuotaSource: model.QuotaSourceResponseHeader, OfficialQuotaConfidence: model.QuotaConfidenceBestEffort, OfficialQuotaUnit: "requests", OfficialQuotaBalance: &balance, OfficialQuotaTotalQuantity: &used, OfficialQuotaCheckedAt: &checkedAt}, model.ProviderKeyQuotaRequest{})
 	if err != nil {
 		t.Fatalf("QueryOfficialQuota returned error: %v", err)
 	}
-	if !result.Supported || result.Status != "success" || result.Unit != "requests" || result.Balance == nil || *result.Balance != 14523 || result.TotalQuantity == nil || *result.TotalQuantity != 477 || !strings.Contains(result.RawText, "X-RateLimit-Remaining") {
+	if !result.Supported || result.Status != "success" || result.Source != model.QuotaSourceResponseHeader || result.Unit != "requests" || result.Balance == nil || *result.Balance != 14523 || result.TotalQuantity == nil || *result.TotalQuantity != 477 || !result.FetchedAt.Equal(checkedAt) {
+		t.Fatalf("unexpected result: %#v", result)
+	}
+}
+
+func TestQueryBraveQuotaFallsBackToLocalRequests(t *testing.T) {
+	result, err := QueryOfficialQuota(context.Background(), model.APIKey{ProviderName: model.ProviderBrave, Alias: "brave", UsageRequestsTotal: 42}, model.ProviderKeyQuotaRequest{})
+	if err != nil {
+		t.Fatalf("QueryOfficialQuota returned error: %v", err)
+	}
+	if result.Source != model.QuotaSourceLocalMeter || result.Unit != "requests_used" || result.Balance != nil || result.TotalQuantity == nil || *result.TotalQuantity != 42 {
 		t.Fatalf("unexpected result: %#v", result)
 	}
 }

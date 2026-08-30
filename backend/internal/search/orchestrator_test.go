@@ -13,12 +13,13 @@ import (
 )
 
 type orchestratorTestStore struct {
-	mu        sync.Mutex
-	settings  model.RuntimeSettings
-	providers []model.ProviderConfig
-	cache     map[string][]byte
-	lastTTL   int
-	setCount  int
+	mu           sync.Mutex
+	settings     model.RuntimeSettings
+	providers    []model.ProviderConfig
+	cache        map[string][]byte
+	lastTTL      int
+	setCount     int
+	quotaUpdates []model.ProviderKeyQuotaResult
 }
 
 func (s *orchestratorTestStore) GetAPIKeyByID(ctx context.Context, id int64) (model.APIKey, error) {
@@ -30,6 +31,9 @@ func (s *orchestratorTestStore) RecordKeyResult(ctx context.Context, key model.A
 }
 
 func (s *orchestratorTestStore) UpdateProviderKeyOfficialQuota(ctx context.Context, id int64, quota model.ProviderKeyQuotaResult) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.quotaUpdates = append(s.quotaUpdates, quota)
 	return nil
 }
 
@@ -89,6 +93,7 @@ type orchestratorTestProvider struct {
 	resultN    int
 	empty      bool
 	searchHook func()
+	quota      *model.ProviderKeyQuotaResult
 }
 
 func (p orchestratorTestProvider) Name() string {
@@ -125,7 +130,7 @@ func (p orchestratorTestProvider) Search(ctx context.Context, req model.SearchRe
 			Score:    1,
 		})
 	}
-	return model.ProviderResponse{Results: results}, nil
+	return model.ProviderResponse{Results: results, Quota: p.quota}, nil
 }
 
 func (p orchestratorTestProvider) HealthCheck(ctx context.Context, key model.APIKey) error {
@@ -149,6 +154,35 @@ func TestSearchSkipsDisabledDefaultProviders(t *testing.T) {
 	}
 	if len(response.Providers) != 1 || response.Providers[0].Provider != model.ProviderSerper {
 		t.Fatalf("response providers = %+v, want only %s", response.Providers, model.ProviderSerper)
+	}
+}
+
+func TestSearchPersistsProviderQuotaSnapshot(t *testing.T) {
+	balance := 900.0
+	quota := &model.ProviderKeyQuotaResult{
+		Provider:   model.ProviderBrave,
+		Alias:      "brave-key",
+		Supported:  true,
+		Status:     "success",
+		Source:     model.QuotaSourceResponseHeader,
+		Confidence: model.QuotaConfidenceBestEffort,
+		Unit:       "requests",
+		Balance:    &balance,
+		FetchedAt:  time.Now(),
+	}
+	store := &orchestratorTestStore{
+		settings:  model.RuntimeSettings{DefaultMode: model.SearchModeSingle, DefaultProviders: []string{model.ProviderBrave}, DefaultLimit: 10, DefaultDedupe: true, RequestTimeoutMS: 1000},
+		providers: []model.ProviderConfig{{Name: model.ProviderBrave, Enabled: true, Priority: 1, Weight: 1}},
+	}
+	orchestrator := NewOrchestrator(provider.NewRegistry(orchestratorTestProvider{name: model.ProviderBrave, quota: quota}), &orchestratorTestKeyPool{}, store)
+	_, err := orchestrator.Search(context.Background(), model.SearchRequest{Query: "privacy", Providers: []string{model.ProviderBrave}, ProvidersExplicit: true, Mode: model.SearchModeSingle, Cache: model.CachePolicyBypass}, "request-id", 0)
+	if err != nil {
+		t.Fatalf("Search returned error: %v", err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.quotaUpdates) != 1 || store.quotaUpdates[0].Source != model.QuotaSourceResponseHeader || store.quotaUpdates[0].Balance == nil || *store.quotaUpdates[0].Balance != 900 {
+		t.Fatalf("quota updates = %#v", store.quotaUpdates)
 	}
 }
 

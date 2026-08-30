@@ -313,6 +313,16 @@ func (s *Store) GetAPIKeyByID(ctx context.Context, id int64) (model.APIKey, erro
 		       COALESCE((SELECT SUM(u.requests_total) FROM usage_daily u WHERE u.provider_key_id=k.id AND u.usage_date >= date_trunc('month', CURRENT_DATE)::date),0) AS monthly_used,
 		       COALESCE((SELECT SUM(u.requests_total) FROM usage_daily u WHERE u.provider_key_id=k.id),0) AS usage_requests_total,
 		       COALESCE((SELECT SUM(m.quantity_total) FROM usage_meter_daily m WHERE m.provider_key_id=k.id AND m.provider_name=p.name AND m.unit='credits' AND m.usage_date >= date_trunc('month', CURRENT_DATE)::date),0)::float8 AS monthly_credits,
+		       COALESCE((SELECT SUM(m.quantity_total) FROM usage_meter_daily m WHERE m.provider_key_id=k.id AND m.provider_name=p.name AND m.unit='credits'),0)::float8 AS usage_credits_total,
+		       COALESCE((SELECT SUM(m.quantity_total) FROM usage_meter_daily m WHERE m.provider_key_id=k.id AND m.provider_name=p.name AND m.unit='tokens'),0)::float8 AS usage_tokens_total,
+		       COALESCE((SELECT SUM(m.cost_usd_total) FROM usage_meter_daily m WHERE m.provider_key_id=k.id AND m.provider_name=p.name),0)::float8 AS usage_cost_usd_total,
+		       COALESCE(k.official_quota_status, ''), COALESCE(k.official_quota_message, ''),
+		       COALESCE(k.official_quota_source, ''), COALESCE(k.official_quota_confidence, ''), COALESCE(k.official_quota_unit, ''),
+		       COALESCE(k.official_quota_balance, 0)::float8, k.official_quota_balance IS NOT NULL,
+		       COALESCE(k.official_quota_balance_usd, 0)::float8, k.official_quota_balance_usd IS NOT NULL,
+		       COALESCE(k.official_quota_used_usd, 0)::float8, k.official_quota_used_usd IS NOT NULL,
+		       COALESCE(k.official_quota_total_quantity, 0)::float8, k.official_quota_total_quantity IS NOT NULL,
+		       k.official_quota_checked_at,
 		       k.max_concurrency,
 		       k.total_successes, k.total_failures, COALESCE(k.last_used_at, '0001-01-01'::timestamptz), COALESCE(k.cooldown_until, '0001-01-01'::timestamptz)
 		FROM provider_keys k
@@ -321,8 +331,22 @@ func (s *Store) GetAPIKeyByID(ctx context.Context, id int64) (model.APIKey, erro
 	`, id)
 	var item model.APIKey
 	var ciphertext, exaServiceKeyCiphertext string
-	if err := row.Scan(&item.ID, &item.ProviderID, &item.ProviderName, &item.Alias, &ciphertext, &item.KeyHint, &item.ExaAPIKeyID, &exaServiceKeyCiphertext, &item.ExaServiceKeyHint, &item.Status, &item.Weight, &item.RPMLimit, &item.DailyQuota, &item.MonthlyQuota, &item.DailyUsagePeriod, &item.DailyUsed, &item.MonthlyUsagePeriod, &item.MonthlyUsed, &item.UsageRequestsTotal, &item.MonthlyCredits, &item.MaxConcurrency, &item.TotalSuccesses, &item.TotalFailures, &item.LastUsedAt, &item.CooldownUntil); err != nil {
+	var balance, balanceUSD, usedUSD, totalQuantity float64
+	var hasBalance, hasBalanceUSD, hasUsedUSD, hasTotalQuantity bool
+	if err := row.Scan(&item.ID, &item.ProviderID, &item.ProviderName, &item.Alias, &ciphertext, &item.KeyHint, &item.ExaAPIKeyID, &exaServiceKeyCiphertext, &item.ExaServiceKeyHint, &item.Status, &item.Weight, &item.RPMLimit, &item.DailyQuota, &item.MonthlyQuota, &item.DailyUsagePeriod, &item.DailyUsed, &item.MonthlyUsagePeriod, &item.MonthlyUsed, &item.UsageRequestsTotal, &item.MonthlyCredits, &item.UsageCreditsTotal, &item.UsageTokensTotal, &item.UsageCostUSDTotal, &item.OfficialQuotaStatus, &item.OfficialQuotaMessage, &item.OfficialQuotaSource, &item.OfficialQuotaConfidence, &item.OfficialQuotaUnit, &balance, &hasBalance, &balanceUSD, &hasBalanceUSD, &usedUSD, &hasUsedUSD, &totalQuantity, &hasTotalQuantity, &item.OfficialQuotaCheckedAt, &item.MaxConcurrency, &item.TotalSuccesses, &item.TotalFailures, &item.LastUsedAt, &item.CooldownUntil); err != nil {
 		return model.APIKey{}, err
+	}
+	if hasBalance {
+		item.OfficialQuotaBalance = float64Ptr(balance)
+	}
+	if hasBalanceUSD {
+		item.OfficialQuotaBalanceUSD = float64Ptr(balanceUSD)
+	}
+	if hasUsedUSD {
+		item.OfficialQuotaUsedUSD = float64Ptr(usedUSD)
+	}
+	if hasTotalQuantity {
+		item.OfficialQuotaTotalQuantity = float64Ptr(totalQuantity)
 	}
 	plain, err := s.crypto.Decrypt(ciphertext)
 	if err != nil {
@@ -346,7 +370,8 @@ func (s *Store) ListProviderKeys(ctx context.Context) ([]model.ProviderKeyView, 
 		       k.total_failures,
 		       COALESCE((SELECT SUM(u.requests_total) FROM usage_daily u WHERE u.provider_key_id=k.id AND u.usage_date=CURRENT_DATE), 0) AS daily_used,
 		       COALESCE((SELECT SUM(u.requests_total) FROM usage_daily u WHERE u.provider_key_id=k.id AND u.usage_date >= date_trunc('month', CURRENT_DATE)::date), 0) AS monthly_used,
-		       COALESCE(k.official_quota_status, ''), COALESCE(k.official_quota_message, ''), COALESCE(k.official_quota_unit, ''),
+		       COALESCE(k.official_quota_status, ''), COALESCE(k.official_quota_message, ''),
+		       COALESCE(k.official_quota_source, ''), COALESCE(k.official_quota_confidence, ''), COALESCE(k.official_quota_unit, ''),
 		       COALESCE(k.official_quota_balance, 0)::float8, k.official_quota_balance IS NOT NULL,
 		       COALESCE(k.official_quota_balance_usd, 0)::float8, k.official_quota_balance_usd IS NOT NULL,
 		       COALESCE(k.official_quota_used_usd, 0)::float8, k.official_quota_used_usd IS NOT NULL,
@@ -366,7 +391,7 @@ func (s *Store) ListProviderKeys(ctx context.Context) ([]model.ProviderKeyView, 
 		var item model.ProviderKeyView
 		var balance, balanceUSD, usedUSD, totalQuantity float64
 		var hasBalance, hasBalanceUSD, hasUsedUSD, hasTotalQuantity bool
-		if err := rows.Scan(&item.ID, &item.ProviderID, &item.ProviderName, &item.Alias, &item.KeyHint, &item.ExaAPIKeyID, &item.ExaServiceKeyHint, &item.Status, &item.Weight, &item.RPMLimit, &item.DailyQuota, &item.MonthlyQuota, &item.MaxConcurrency, &item.CurrentFailures, &item.TotalSuccesses, &item.TotalFailures, &item.DailyUsed, &item.MonthlyUsed, &item.OfficialQuotaStatus, &item.OfficialQuotaMessage, &item.OfficialQuotaUnit, &balance, &hasBalance, &balanceUSD, &hasBalanceUSD, &usedUSD, &hasUsedUSD, &totalQuantity, &hasTotalQuantity, &item.OfficialQuotaAccountID, &item.OfficialQuotaCheckedAt, &item.CooldownUntil, &item.LastUsedAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.ProviderID, &item.ProviderName, &item.Alias, &item.KeyHint, &item.ExaAPIKeyID, &item.ExaServiceKeyHint, &item.Status, &item.Weight, &item.RPMLimit, &item.DailyQuota, &item.MonthlyQuota, &item.MaxConcurrency, &item.CurrentFailures, &item.TotalSuccesses, &item.TotalFailures, &item.DailyUsed, &item.MonthlyUsed, &item.OfficialQuotaStatus, &item.OfficialQuotaMessage, &item.OfficialQuotaSource, &item.OfficialQuotaConfidence, &item.OfficialQuotaUnit, &balance, &hasBalance, &balanceUSD, &hasBalanceUSD, &usedUSD, &hasUsedUSD, &totalQuantity, &hasTotalQuantity, &item.OfficialQuotaAccountID, &item.OfficialQuotaCheckedAt, &item.CooldownUntil, &item.LastUsedAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if hasBalance {
@@ -507,24 +532,26 @@ func (s *Store) DeleteProviderKey(ctx context.Context, id int64) error {
 func (s *Store) UpdateProviderKeyOfficialQuota(ctx context.Context, id int64, quota model.ProviderKeyQuotaResult) error {
 	message := quota.Message
 	if message == "" && quota.Status == "error" {
-		message = "official quota query failed"
+		message = "quota query failed"
 	}
 	exhausted := quota.Status == "success" && officialQuotaCanExhaustKey(quota.Provider) && quota.Balance != nil && *quota.Balance <= 0
 	_, err := s.pool.Exec(ctx, `
 		UPDATE provider_keys
 		SET official_quota_status=$2,
 		    official_quota_message=$3,
-		    official_quota_unit=$4,
-		    official_quota_balance=$5,
-		    official_quota_balance_usd=$6,
-		    official_quota_used_usd=$7,
-		    official_quota_total_quantity=$8,
-		    official_quota_account_id=$9,
-		    official_quota_checked_at=$10,
-		    status=CASE WHEN $11 THEN 'exhausted' ELSE status END,
+		    official_quota_source=$4,
+		    official_quota_confidence=$5,
+		    official_quota_unit=$6,
+		    official_quota_balance=$7,
+		    official_quota_balance_usd=$8,
+		    official_quota_used_usd=$9,
+		    official_quota_total_quantity=$10,
+		    official_quota_account_id=$11,
+		    official_quota_checked_at=$12,
+		    status=CASE WHEN $13 THEN 'exhausted' ELSE status END,
 		    updated_at=now()
 		WHERE id=$1
-	`, id, quota.Status, message, quota.Unit, floatPtrValue(quota.Balance), floatPtrValue(quota.BalanceUSD), floatPtrValue(quota.TotalCostUSD), floatPtrValue(quota.TotalQuantity), quota.AccountID, quota.FetchedAt, exhausted)
+	`, id, quota.Status, message, quota.Source, quota.Confidence, quota.Unit, floatPtrValue(quota.Balance), floatPtrValue(quota.BalanceUSD), floatPtrValue(quota.TotalCostUSD), floatPtrValue(quota.TotalQuantity), quota.AccountID, quota.FetchedAt, exhausted)
 	return err
 }
 
@@ -618,6 +645,29 @@ func (s *Store) ListAPITokens(ctx context.Context) ([]model.APIToken, error) {
 		items = append(items, item)
 	}
 	return items, rows.Err()
+}
+
+func (s *Store) RevealAPIToken(ctx context.Context, id int64) (model.APIToken, error) {
+	row := s.pool.QueryRow(ctx, `
+		SELECT id, name, COALESCE(token_ciphertext, ''), token_prefix, scopes, allowed_providers, status,
+		       rate_limit_per_min, daily_quota, monthly_quota, last_used_at, usage_count, created_at, updated_at
+		FROM api_tokens
+		WHERE id=$1
+	`, id)
+	var item model.APIToken
+	if err := row.Scan(&item.ID, &item.Name, &item.TokenCiphertext, &item.TokenPrefix, &item.Scopes, &item.AllowedProviders, &item.Status, &item.RateLimitPerMin, &item.DailyQuota, &item.MonthlyQuota, &item.LastUsedAt, &item.UsageCount, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		return model.APIToken{}, err
+	}
+	if item.TokenCiphertext == "" {
+		return model.APIToken{}, fmt.Errorf("api token %d secret is unavailable; recreate the token", id)
+	}
+	plain, err := s.crypto.Decrypt(item.TokenCiphertext)
+	if err != nil {
+		return model.APIToken{}, fmt.Errorf("decrypt api token %d: %w", id, err)
+	}
+	item.Token = plain
+	item.TokenCiphertext = ""
+	return item, nil
 }
 
 func (s *Store) CreateAPIToken(ctx context.Context, name string, scopes []string, allowedProviders []string, rateLimit, dailyQuota, monthlyQuota int) (model.APIToken, string, error) {

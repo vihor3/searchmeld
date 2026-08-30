@@ -32,6 +32,7 @@ type AppStore interface {
 	UpdateProviderKey(ctx context.Context, id int64, patch model.ProviderKeyUpdate) (model.ProviderKeyView, error)
 	DeleteProviderKey(ctx context.Context, id int64) error
 	ListAPITokens(ctx context.Context) ([]model.APIToken, error)
+	RevealAPIToken(ctx context.Context, id int64) (model.APIToken, error)
 	CreateAPIToken(ctx context.Context, name string, scopes []string, allowedProviders []string, rateLimit, dailyQuota, monthlyQuota int) (model.APIToken, string, error)
 	UpdateAPITokenStatus(ctx context.Context, id int64, status string) error
 	UpdateAPIToken(ctx context.Context, id int64, name string, scopes, allowedProviders []string, rateLimit, dailyQuota, monthlyQuota int) error
@@ -134,6 +135,7 @@ func (h *Handler) Mount(r chi.Router) {
 			r.Delete("/keys/{id}", h.deleteKey)
 			r.Get("/tokens", h.listTokens)
 			r.Post("/tokens", h.createToken)
+			r.Get("/tokens/{id}/secret", h.revealToken)
 			r.Patch("/tokens/{id}", h.updateToken)
 			r.Delete("/tokens/{id}", h.deleteToken)
 			r.Get("/settings", h.getSettings)
@@ -788,6 +790,28 @@ func (h *Handler) listTokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"tokens": tokens})
+}
+
+func (h *Handler) revealToken(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	token, err := h.store.RevealAPIToken(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	h.audit(r, "admin", "api_token.reveal", "api_token", strconv.FormatInt(id, 10), map[string]interface{}{"name": token.Name})
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"id":           token.ID,
+		"name":         token.Name,
+		"token":        token.Token,
+		"token_prefix": token.TokenPrefix,
+	})
 }
 
 func (h *Handler) createToken(w http.ResponseWriter, r *http.Request) {

@@ -160,6 +160,10 @@ func TestBraveProviderSearch(t *testing.T) {
 		if query.Get("q") != "privacy" || query.Get("count") != "20" || query.Get("freshness") != "pw" || query.Get("extra_snippets") != "true" {
 			t.Fatalf("unexpected query: %s", r.URL.RawQuery)
 		}
+		w.Header().Set("X-RateLimit-Limit", "1, 15000")
+		w.Header().Set("X-RateLimit-Policy", "1;w=1, 15000;w=2592000")
+		w.Header().Set("X-RateLimit-Remaining", "0, 14523")
+		w.Header().Set("X-RateLimit-Reset", "1, 1234567")
 		writeJSON(t, w, map[string]interface{}{
 			"web": map[string]interface{}{
 				"results": []map[string]interface{}{
@@ -171,7 +175,7 @@ func TestBraveProviderSearch(t *testing.T) {
 	defer server.Close()
 
 	provider := NewBraveProvider(Config{BaseURL: server.URL})
-	response, err := provider.Search(context.Background(), model.SearchRequest{Query: "privacy", Limit: 50, IncludeRaw: true, Freshness: "week"}, model.APIKey{Value: "brave-key"})
+	response, err := provider.Search(context.Background(), model.SearchRequest{Query: "privacy", Limit: 50, IncludeRaw: true, Freshness: "week"}, model.APIKey{ProviderName: model.ProviderBrave, Alias: "brave-key", Value: "brave-key"})
 	if err != nil {
 		t.Fatalf("Search returned error: %v", err)
 	}
@@ -180,6 +184,9 @@ func TestBraveProviderSearch(t *testing.T) {
 	}
 	if len(response.Usage) != 0 {
 		t.Fatalf("unexpected usage: %#v", response.Usage)
+	}
+	if response.Quota == nil || response.Quota.Source != model.QuotaSourceResponseHeader || response.Quota.Balance == nil || *response.Quota.Balance != 14523 || response.Quota.TotalQuantity == nil || *response.Quota.TotalQuantity != 477 || !strings.Contains(response.Quota.RawText, "X-RateLimit-Remaining") {
+		t.Fatalf("unexpected quota snapshot: %#v", response.Quota)
 	}
 }
 

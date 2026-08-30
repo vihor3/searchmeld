@@ -23,7 +23,7 @@ Content-Type: application/json
 
 也可以使用 `X-API-Key: osr_xxx` 或管理员 API Key `oak_xxx`。
 
-普通 `osr_` API Token 必须在 `scopes` 中显式包含 `extract`，否则返回 `403`。创建 Token 时不填写 scopes、只使用默认值，或从旧版本升级而来的既有 Token，都只有 `search`，不会因为升级自动获得正文抽取权限。可在管理台“API 令牌”中编辑 Token 并勾选“正文抽取”。管理员 API Key 不受普通 Token scope 限制，可以直接调用 Extract。
+普通 `osr_` API Token 必须在 `scopes` 中显式包含 `extract`，否则返回 `403`。创建 Token 时不填写 scopes、只使用默认值，或从旧版本升级而来的既有 Token，都只有 `search`，不会因为升级自动获得正文抽取权限。可在管理台“API 令牌”中创建或编辑 Token，并直接选择英文 `search` / `extract` 权限。管理员 API Key 不受普通 Token scope 限制，可以直接调用 Extract。
 
 ### 请求
 

@@ -26,6 +26,52 @@ exit 0
 EOF
 chmod +x "$mock_docker"
 
+mock_git="$tmpdir/bin/git"
+cat > "$mock_git" <<'EOF'
+#!/bin/sh
+project=""
+if [ "${1:-}" = -C ]; then
+  project=$2
+  shift 2
+fi
+[ -f "$project/.mock-git-update" ] || exit 1
+if [ -n "${MOCK_GIT_LOG:-}" ]; then
+  printf '%s\n' "$project $*" >> "$MOCK_GIT_LOG"
+fi
+command_name=${1:-}
+shift || true
+case "$command_name" in
+  rev-parse)
+    case "${1:-}" in
+      --is-inside-work-tree) printf '%s\n' true ;;
+      --show-toplevel) printf '%s\n' "$project" ;;
+      --abbrev-ref) printf '%s\n' origin/main ;;
+      HEAD)
+        if [ -f "$project/.mock-git-updated" ]; then
+          printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+        else
+          printf '%s\n' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+        fi
+        ;;
+      origin/main) printf '%s\n' bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  symbolic-ref) printf '%s\n' main ;;
+  remote) printf '%s\n' https://example.invalid/one-search.git ;;
+  status)
+    if [ -f "$project/.mock-git-dirty" ]; then
+      printf '%s\n' ' M install.sh'
+    fi
+    ;;
+  fetch|merge-base) ;;
+  rev-list) printf '%s\n' 3 ;;
+  merge) : > "$project/.mock-git-updated" ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$mock_git"
+
 make_project() {
   name="$1"
   target="$tmpdir/$name"
@@ -81,6 +127,56 @@ encryption_after=$(grep '^ENCRYPTION_KEY=' "$embedded_env")
   printf '%s\n' 'rerun replaced ENCRYPTION_KEY' >&2
   exit 1
 }
+
+# Git 安装目录可选择从当前分支的 upstream 快进更新；先构建，再切换服务。
+update_project=$(make_project update)
+cp "$embedded_env" "$update_project/.env"
+: > "$update_project/.mock-git-update"
+update_docker_log="$tmpdir/update-docker.log"
+update_git_log="$tmpdir/update-git.log"
+printf '\n\n' | env \
+  PATH="$tmpdir/bin:$PATH" \
+  MOCK_DOCKER_LOG="$update_docker_log" \
+  MOCK_GIT_LOG="$update_git_log" \
+  "$update_project/install.sh" > "$tmpdir/update-output" 2>&1
+grep -q 'fetch --prune origin' "$update_git_log"
+grep -q 'merge --ff-only origin/main' "$update_git_log"
+grep -q 'compose .*docker-compose.yml build --pull' "$update_docker_log"
+grep -q 'compose .*docker-compose.yml up -d --remove-orphans' "$update_docker_log"
+if grep -q 'up --build' "$update_docker_log"; then
+  printf '%s\n' 'update replaced the service before the dedicated build step' >&2
+  exit 1
+fi
+grep -q '代码已更新：aaaaaaaaaaaa -> bbbbbbbbbbbb' "$tmpdir/update-output"
+[ "$encryption_before" = "$(grep '^ENCRYPTION_KEY=' "$update_project/.env")" ] || {
+  printf '%s\n' 'update replaced ENCRYPTION_KEY' >&2
+  exit 1
+}
+
+# 自动更新拒绝覆盖未提交的已跟踪文件修改。
+dirty_project=$(make_project dirty-update)
+cp "$embedded_env" "$dirty_project/.env"
+: > "$dirty_project/.mock-git-update"
+: > "$dirty_project/.mock-git-dirty"
+dirty_docker_log="$tmpdir/dirty-update-docker.log"
+dirty_git_log="$tmpdir/dirty-update-git.log"
+if printf '\n' | env \
+  PATH="$tmpdir/bin:$PATH" \
+  MOCK_DOCKER_LOG="$dirty_docker_log" \
+  MOCK_GIT_LOG="$dirty_git_log" \
+  "$dirty_project/install.sh" > "$tmpdir/dirty-update-output" 2>&1; then
+  printf '%s\n' 'update accepted tracked working tree changes' >&2
+  exit 1
+fi
+grep -q '检测到未提交的已跟踪文件修改' "$tmpdir/dirty-update-output"
+if grep -q 'fetch --prune\|merge --ff-only' "$dirty_git_log"; then
+  printf '%s\n' 'dirty update contacted or merged the remote' >&2
+  exit 1
+fi
+if grep -q ' build --pull\| up -d' "$dirty_docker_log"; then
+  printf '%s\n' 'dirty update started a deployment' >&2
+  exit 1
+fi
 
 # 外部数据库逐项输入：验证 URL 编码、共享网络和敏感信息不泄漏。
 external_project=$(make_project external)

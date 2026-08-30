@@ -425,6 +425,9 @@ func (o *Orchestrator) callProvider(ctx context.Context, req model.SearchRequest
 		cancel()
 		success := err == nil
 		release(success, err)
+		if providerResponse.Quota != nil && key.ID != 0 {
+			_ = o.store.UpdateProviderKeyOfficialQuota(context.Background(), key.ID, *providerResponse.Quota)
+		}
 		o.refreshOfficialQuota(key)
 		attemptLatency := time.Since(attemptStarted).Milliseconds()
 		execution.latencyMS = time.Since(started).Milliseconds()
@@ -483,9 +486,6 @@ func (o *Orchestrator) refreshOfficialQuota(key model.APIKey) {
 	if key.ID == 0 || !autoRefreshOfficialQuota(key.ProviderName) {
 		return
 	}
-	if key.ProviderName == model.ProviderExa && strings.TrimSpace(key.ExaServiceKey) == "" {
-		return
-	}
 	now := time.Now()
 	interval := quotaRefreshInterval(key.ProviderName)
 	o.quotaMu.Lock()
@@ -508,6 +508,9 @@ func (o *Orchestrator) refreshOfficialQuota(key model.APIKey) {
 			o.quotaRefreshes[key.ID] = state
 			o.quotaMu.Unlock()
 		}()
+		if latest, err := o.store.GetAPIKeyByID(context.Background(), key.ID); err == nil && latest.ID != 0 {
+			key = latest
+		}
 		quota, err := QueryOfficialQuota(context.Background(), key, model.ProviderKeyQuotaRequest{})
 		if err != nil {
 			quota = model.ProviderKeyQuotaResult{Provider: key.ProviderName, Alias: key.Alias, Supported: true, Status: "error", Message: err.Error(), FetchedAt: time.Now()}
@@ -1185,5 +1188,8 @@ func (o *Orchestrator) TestProviderKey(ctx context.Context, keyID int64, query s
 	}
 	summary.Status = "success"
 	_ = o.store.RecordKeyResult(context.Background(), key, true, "")
+	if providerResponse.Quota != nil && key.ID != 0 {
+		_ = o.store.UpdateProviderKeyOfficialQuota(context.Background(), key.ID, *providerResponse.Quota)
+	}
 	return summary, providerResponse.Results, nil
 }

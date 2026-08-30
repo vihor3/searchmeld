@@ -2,9 +2,12 @@ package provider
 
 import (
 	"context"
+	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/one-search/one-search/backend/internal/model"
 )
@@ -56,12 +59,161 @@ func (p *BraveProvider) Search(ctx context.Context, req model.SearchRequest, key
 	if err != nil {
 		return model.ProviderResponse{}, err
 	}
+	responseHeader := response.Header.Clone()
 	payload, err := p.decodeResponse(response)
 	if err != nil {
 		return model.ProviderResponse{}, err
 	}
 	results := normalizeBraveResults(payload, req.IncludeRaw)
-	return model.ProviderResponse{Results: results, Usage: usageMeasurements(model.ProviderBrave, payload), Raw: payload}, nil
+	quota, _ := BraveQuotaFromHeaders(responseHeader, key)
+	return model.ProviderResponse{Results: results, Usage: usageMeasurements(model.ProviderBrave, payload), Raw: payload, Quota: quota}, nil
+}
+
+type braveRateLimitWindow struct {
+	Limit     float64
+	Remaining float64
+	Reset     float64
+	Duration  int
+}
+
+// BraveQuotaFromHeaders extracts the longest rate-limit window from a normal
+// Brave Search response. It never issues an additional upstream request.
+func BraveQuotaFromHeaders(header http.Header, key model.APIKey) (*model.ProviderKeyQuotaResult, bool) {
+	windows := parseBraveRateLimitWindows(header)
+	if len(windows) == 0 {
+		return nil, false
+	}
+	window := braveQuotaWindowByLargestDuration(windows)
+	used := window.Limit - window.Remaining
+	if used < 0 {
+		used = 0
+	}
+	providerName := key.ProviderName
+	if providerName == "" {
+		providerName = model.ProviderBrave
+	}
+	return &model.ProviderKeyQuotaResult{
+		Provider:      providerName,
+		Alias:         key.Alias,
+		Supported:     true,
+		Status:        "success",
+		Source:        model.QuotaSourceResponseHeader,
+		Confidence:    model.QuotaConfidenceBestEffort,
+		Unit:          "requests",
+		Balance:       float64Pointer(window.Remaining),
+		TotalQuantity: float64Pointer(used),
+		Message:       "从正常 Brave 搜索响应的 X-RateLimit-* headers 更新，不额外消耗请求",
+		Breakdown:     braveRateLimitBreakdown(windows),
+		RawText:       braveRateLimitRawText(header),
+		FetchedAt:     time.Now(),
+	}, true
+}
+
+func parseBraveRateLimitWindows(header http.Header) []braveRateLimitWindow {
+	limits := splitBraveHeaderNumbers(header.Get("X-RateLimit-Limit"))
+	remaining := splitBraveHeaderNumbers(header.Get("X-RateLimit-Remaining"))
+	resets := splitBraveHeaderNumbers(header.Get("X-RateLimit-Reset"))
+	durations := parseBraveRateLimitDurations(header.Get("X-RateLimit-Policy"))
+	count := maxBraveInt(len(limits), len(remaining), len(resets), len(durations))
+	if count == 0 {
+		return nil
+	}
+	windows := make([]braveRateLimitWindow, 0, count)
+	for i := 0; i < count; i++ {
+		windows = append(windows, braveRateLimitWindow{
+			Limit:     braveValueAt(limits, i),
+			Remaining: braveValueAt(remaining, i),
+			Reset:     braveValueAt(resets, i),
+			Duration:  int(braveValueAt(durations, i)),
+		})
+	}
+	return windows
+}
+
+func splitBraveHeaderNumbers(value string) []float64 {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	numbers := make([]float64, 0, len(parts))
+	for _, part := range parts {
+		number, _ := strconv.ParseFloat(strings.TrimSpace(part), 64)
+		numbers = append(numbers, number)
+	}
+	return numbers
+}
+
+func parseBraveRateLimitDurations(policy string) []float64 {
+	if strings.TrimSpace(policy) == "" {
+		return nil
+	}
+	parts := strings.Split(policy, ",")
+	durations := make([]float64, 0, len(parts))
+	for _, part := range parts {
+		duration := 0.0
+		sections := strings.Split(strings.TrimSpace(part), ";")
+		for _, section := range sections[1:] {
+			section = strings.TrimSpace(section)
+			if strings.HasPrefix(section, "w=") {
+				duration, _ = strconv.ParseFloat(strings.TrimPrefix(section, "w="), 64)
+				break
+			}
+		}
+		durations = append(durations, duration)
+	}
+	return durations
+}
+
+func braveQuotaWindowByLargestDuration(windows []braveRateLimitWindow) braveRateLimitWindow {
+	sorted := append([]braveRateLimitWindow(nil), windows...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		if sorted[i].Duration == sorted[j].Duration {
+			return sorted[i].Limit > sorted[j].Limit
+		}
+		return sorted[i].Duration > sorted[j].Duration
+	})
+	return sorted[0]
+}
+
+func braveRateLimitBreakdown(windows []braveRateLimitWindow) []map[string]interface{} {
+	breakdown := make([]map[string]interface{}, 0, len(windows))
+	for _, window := range windows {
+		breakdown = append(breakdown, map[string]interface{}{
+			"limit":     window.Limit,
+			"remaining": window.Remaining,
+			"reset":     window.Reset,
+			"window":    window.Duration,
+		})
+	}
+	return breakdown
+}
+
+func braveRateLimitRawText(header http.Header) string {
+	keys := []string{"X-RateLimit-Limit", "X-RateLimit-Policy", "X-RateLimit-Remaining", "X-RateLimit-Reset"}
+	lines := make([]string, 0, len(keys))
+	for _, key := range keys {
+		if value := header.Get(key); value != "" {
+			lines = append(lines, key+": "+value)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func braveValueAt(values []float64, index int) float64 {
+	if index < 0 || index >= len(values) {
+		return 0
+	}
+	return values[index]
+}
+
+func maxBraveInt(values ...int) int {
+	max := 0
+	for _, value := range values {
+		if value > max {
+			max = value
+		}
+	}
+	return max
 }
 
 func braveFreshness(req model.SearchRequest) string {

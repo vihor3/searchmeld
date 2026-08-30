@@ -496,7 +496,13 @@ load_existing_configuration() {
 
 show_summary() {
   log ""
-  log "安装配置摘要"
+  log "执行摘要"
+  case "$install_action" in
+    update) log "  操作：从 $update_upstream 更新并重新构建" ;;
+    rebuild) log "  操作：使用当前版本重新构建并启动" ;;
+    reconfigure) log "  操作：重新配置并构建" ;;
+    *) log "  操作：首次安装" ;;
+  esac
   if [ "$install_mode" = embedded ]; then
     log "  数据库：内置 PostgreSQL"
   else
@@ -516,6 +522,69 @@ show_summary() {
   log ""
   prompt_yes_no "确认以上配置并开始安装" true
   [ "$prompted_bool" = true ] || die "安装已取消，未修改配置"
+}
+
+source_update_available() {
+  command -v git >/dev/null 2>&1 || return 1
+  git -C "$project_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
+  git_root=$(git -C "$project_dir" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [ "$git_root" = "$project_dir" ] || return 1
+  update_check_branch=$(git -C "$project_dir" symbolic-ref --quiet --short HEAD 2>/dev/null) || return 1
+  update_check_upstream=$(git -C "$project_dir" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) || return 1
+  case "$update_check_upstream" in
+    */*) update_check_remote=${update_check_upstream%%/*} ;;
+    *) return 1 ;;
+  esac
+  git -C "$project_dir" remote get-url "$update_check_remote" >/dev/null 2>&1
+}
+
+prepare_source_update() {
+  source_update_available || die "当前安装目录不是可更新的 Git 仓库"
+  current_branch=$(git -C "$project_dir" symbolic-ref --quiet --short HEAD 2>/dev/null) || \
+    die "当前 Git 仓库处于 detached HEAD，无法确定要更新的分支"
+  update_upstream=$(git -C "$project_dir" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) || \
+    die "当前分支 $current_branch 没有配置上游分支，请先设置 Git upstream"
+  case "$update_upstream" in
+    */*) ;;
+    *) die "无法从上游分支 $update_upstream 确定 Git remote" ;;
+  esac
+  update_remote=${update_upstream%%/*}
+  git -C "$project_dir" remote get-url "$update_remote" >/dev/null 2>&1 || \
+    die "找不到 Git remote：$update_remote"
+
+  tracked_changes=$(git -C "$project_dir" status --porcelain --untracked-files=no) || \
+    die "无法检查 Git 工作区状态"
+  [ -z "$tracked_changes" ] || \
+    die "检测到未提交的已跟踪文件修改。为避免覆盖本地改动，请先提交、暂存到其它位置或还原后再更新"
+  previous_revision=$(git -C "$project_dir" rev-parse HEAD) || die "无法读取当前 Git 版本"
+  updated_revision=$previous_revision
+}
+
+perform_source_update() {
+  log "从 $update_remote 获取远端更新……"
+  git -C "$project_dir" fetch --prune "$update_remote"
+  target_revision=$(git -C "$project_dir" rev-parse "$update_upstream") || \
+    die "无法读取远端版本 $update_upstream"
+  if [ "$target_revision" = "$previous_revision" ]; then
+    log "当前代码已经是 $update_upstream 的最新版本"
+    return
+  fi
+  if ! git -C "$project_dir" merge-base --is-ancestor "$previous_revision" "$target_revision"; then
+    die "本地分支与 $update_upstream 已分叉，自动更新只支持 fast-forward；请手动处理 Git 历史"
+  fi
+
+  update_count=$(git -C "$project_dir" rev-list --count "$previous_revision..$target_revision") || \
+    die "无法计算待更新提交数量"
+  log "发现 $update_count 个新提交，正在快进更新……"
+  git -C "$project_dir" merge --ff-only "$update_upstream"
+  updated_revision=$(git -C "$project_dir" rev-parse HEAD) || die "无法确认更新后的 Git 版本"
+
+  for required_file in install.sh .env.example docker-compose.yml docker-compose.external-db.yml; do
+    [ -f "$project_dir/$required_file" ] || die "更新后的项目缺少 $required_file"
+  done
+  previous_short=$(printf '%s' "$previous_revision" | cut -c1-12)
+  updated_short=$(printf '%s' "$updated_revision" | cut -c1-12)
+  log "代码已更新：$previous_short -> $updated_short"
 }
 
 run_compose() {
@@ -599,16 +668,48 @@ main() {
   log "无需设置环境变量，也无需传入参数。"
 
   reuse_existing=false
+  install_action=install
+  previous_revision=""
+  updated_revision=""
+  update_upstream=""
+  update_remote=""
   existing_mode=$(get_env_value ONE_SEARCH_INSTALL_MODE)
   if [ "$existing_mode" = embedded ] || [ "$existing_mode" = external ]; then
     log ""
     log "检测到现有安装配置：$existing_mode"
-    log "  1) 沿用现有配置启动或更新（推荐）"
-    log "  2) 重新运行配置向导"
-    prompt_choice "请选择操作" 1 "1 2"
-    if [ "$prompted_value" = 1 ]; then
-      reuse_existing=true
-      load_existing_configuration
+    if source_update_available; then
+      log "  1) 从远端更新到最新版本并重新构建（推荐）"
+      log "  2) 使用当前版本重新构建并启动"
+      log "  3) 重新运行配置向导"
+      prompt_choice "请选择操作" 1 "1 2 3"
+      case "$prompted_value" in
+        1)
+          reuse_existing=true
+          install_action=update
+          load_existing_configuration
+          prepare_source_update
+          ;;
+        2)
+          reuse_existing=true
+          install_action=rebuild
+          load_existing_configuration
+          ;;
+        3)
+          install_action=reconfigure
+          ;;
+      esac
+    else
+      log "未检测到带上游分支的 Git 安装目录，无法自动拉取新版本。"
+      log "  1) 使用当前版本重新构建并启动（推荐）"
+      log "  2) 重新运行配置向导"
+      prompt_choice "请选择操作" 1 "1 2"
+      if [ "$prompted_value" = 1 ]; then
+        reuse_existing=true
+        install_action=rebuild
+        load_existing_configuration
+      else
+        install_action=reconfigure
+      fi
     fi
   fi
 
@@ -621,6 +722,10 @@ main() {
     write_configuration
   fi
 
+  if [ "$install_action" = update ]; then
+    perform_source_update
+  fi
+
   if [ "$install_mode" = external ] && [ "$use_database_network" = true ]; then
     if ! docker network inspect "$database_network" >/dev/null 2>&1; then
       log "创建 Docker 网络：$database_network"
@@ -631,12 +736,23 @@ main() {
 
   log "验证 Docker Compose 配置……"
   run_compose config --quiet
-  log "构建并启动 One Search……"
-  run_compose up --build -d
+  if [ "$install_action" = update ]; then
+    log "拉取基础镜像并构建新版本（旧服务会继续运行到构建完成）……"
+    run_compose build --pull
+    log "切换到新版本……"
+    run_compose up -d --remove-orphans
+  else
+    log "构建并启动 One Search……"
+    run_compose up --build -d --remove-orphans
+  fi
   wait_until_healthy
 
   log ""
   log "One Search 安装完成"
+  if [ "$install_action" = update ]; then
+    updated_short=$(printf '%s' "$updated_revision" | cut -c1-12)
+    log "当前版本：$updated_short（$update_upstream）"
+  fi
   log "访问地址：http://localhost:$host_port"
   log "管理员账号：$admin_username"
   if [ "$generated_admin_password" = true ]; then

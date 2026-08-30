@@ -147,6 +147,8 @@ export interface ProviderKey {
   monthly_used: number
   official_quota_status: string
   official_quota_message: string
+  official_quota_source: string
+  official_quota_confidence: string
   official_quota_unit: string
   official_quota_balance?: number
   official_quota_balance_usd?: number
@@ -166,6 +168,8 @@ export interface OfficialQuotaResult {
   supported: boolean
   status: string
   message?: string
+  source?: string
+  confidence?: string
   unit?: string
   balance?: number
   balance_cents?: number
@@ -298,6 +302,7 @@ export const api = {
   queryKeyQuota: (id: number, payload: Record<string, unknown> = {}) => apiFetch<OfficialQuotaResult>('/api/admin/keys/' + id + '/quota', { method: 'POST', body: JSON.stringify(payload) }),
   tokens: () => apiFetch<{ tokens: ApiToken[] }>('/api/admin/tokens'),
   createToken: (payload: Record<string, unknown>) => apiFetch<{ token: ApiToken; raw_token: string }>('/api/admin/tokens', { method: 'POST', body: JSON.stringify(payload) }),
+  revealToken: (id: number) => apiFetch<{ id: number; name: string; token: string; token_prefix: string }>('/api/admin/tokens/' + id + '/secret'),
   updateToken: (id: number, payload: Record<string, unknown>) => apiFetch('/api/admin/tokens/' + id, { method: 'PATCH', body: JSON.stringify(payload) }),
   deleteToken: (id: number) => apiFetch('/api/admin/tokens/' + id, { method: 'DELETE' }),
   settings: () => apiFetch<RuntimeSettings>('/api/admin/settings'),

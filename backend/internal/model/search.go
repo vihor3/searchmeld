@@ -97,9 +97,10 @@ type SearchMeta struct {
 }
 
 type ProviderResponse struct {
-	Results []SearchResult         `json:"results"`
-	Usage   []UsageMeasurement     `json:"usage,omitempty"`
-	Raw     map[string]interface{} `json:"raw,omitempty"`
+	Results []SearchResult          `json:"results"`
+	Usage   []UsageMeasurement      `json:"usage,omitempty"`
+	Raw     map[string]interface{}  `json:"raw,omitempty"`
+	Quota   *ProviderKeyQuotaResult `json:"-"`
 }
 
 type ProviderConfig struct {
@@ -116,31 +117,44 @@ type ProviderConfig struct {
 }
 
 type APIKey struct {
-	ID                 int64     `json:"id"`
-	ProviderID         int64     `json:"provider_id"`
-	ProviderName       string    `json:"provider_name"`
-	Alias              string    `json:"alias"`
-	Value              string    `json:"-"`
-	KeyHint            string    `json:"key_hint"`
-	ExaAPIKeyID        string    `json:"exa_api_key_id,omitempty"`
-	ExaServiceKey      string    `json:"-"`
-	ExaServiceKeyHint  string    `json:"exa_service_key_hint,omitempty"`
-	Status             string    `json:"status"`
-	Weight             int       `json:"weight"`
-	RPMLimit           int       `json:"rpm_limit"`
-	DailyQuota         int       `json:"daily_quota"`
-	MonthlyQuota       int       `json:"monthly_quota"`
-	DailyUsagePeriod   string    `json:"-"`
-	DailyUsed          int64     `json:"daily_used,omitempty"`
-	MonthlyUsagePeriod string    `json:"-"`
-	MonthlyUsed        int64     `json:"monthly_used,omitempty"`
-	UsageRequestsTotal int64     `json:"-"`
-	MonthlyCredits     float64   `json:"monthly_credits,omitempty"`
-	MaxConcurrency     int       `json:"max_concurrency"`
-	TotalSuccesses     int64     `json:"total_successes"`
-	TotalFailures      int64     `json:"total_failures"`
-	LastUsedAt         time.Time `json:"last_used_at,omitempty"`
-	CooldownUntil      time.Time `json:"cooldown_until,omitempty"`
+	ID                         int64      `json:"id"`
+	ProviderID                 int64      `json:"provider_id"`
+	ProviderName               string     `json:"provider_name"`
+	Alias                      string     `json:"alias"`
+	Value                      string     `json:"-"`
+	KeyHint                    string     `json:"key_hint"`
+	ExaAPIKeyID                string     `json:"exa_api_key_id,omitempty"`
+	ExaServiceKey              string     `json:"-"`
+	ExaServiceKeyHint          string     `json:"exa_service_key_hint,omitempty"`
+	Status                     string     `json:"status"`
+	Weight                     int        `json:"weight"`
+	RPMLimit                   int        `json:"rpm_limit"`
+	DailyQuota                 int        `json:"daily_quota"`
+	MonthlyQuota               int        `json:"monthly_quota"`
+	DailyUsagePeriod           string     `json:"-"`
+	DailyUsed                  int64      `json:"daily_used,omitempty"`
+	MonthlyUsagePeriod         string     `json:"-"`
+	MonthlyUsed                int64      `json:"monthly_used,omitempty"`
+	UsageRequestsTotal         int64      `json:"-"`
+	MonthlyCredits             float64    `json:"monthly_credits,omitempty"`
+	UsageCreditsTotal          float64    `json:"-"`
+	UsageTokensTotal           float64    `json:"-"`
+	UsageCostUSDTotal          float64    `json:"-"`
+	OfficialQuotaStatus        string     `json:"-"`
+	OfficialQuotaMessage       string     `json:"-"`
+	OfficialQuotaSource        string     `json:"-"`
+	OfficialQuotaConfidence    string     `json:"-"`
+	OfficialQuotaUnit          string     `json:"-"`
+	OfficialQuotaBalance       *float64   `json:"-"`
+	OfficialQuotaBalanceUSD    *float64   `json:"-"`
+	OfficialQuotaUsedUSD       *float64   `json:"-"`
+	OfficialQuotaTotalQuantity *float64   `json:"-"`
+	OfficialQuotaCheckedAt     *time.Time `json:"-"`
+	MaxConcurrency             int        `json:"max_concurrency"`
+	TotalSuccesses             int64      `json:"total_successes"`
+	TotalFailures              int64      `json:"total_failures"`
+	LastUsedAt                 time.Time  `json:"last_used_at,omitempty"`
+	CooldownUntil              time.Time  `json:"cooldown_until,omitempty"`
 }
 
 type RuntimeSettings struct {

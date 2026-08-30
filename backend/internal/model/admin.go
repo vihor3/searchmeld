@@ -60,6 +60,8 @@ type ProviderKeyView struct {
 	MonthlyUsed                int64      `json:"monthly_used"`
 	OfficialQuotaStatus        string     `json:"official_quota_status"`
 	OfficialQuotaMessage       string     `json:"official_quota_message"`
+	OfficialQuotaSource        string     `json:"official_quota_source"`
+	OfficialQuotaConfidence    string     `json:"official_quota_confidence"`
 	OfficialQuotaUnit          string     `json:"official_quota_unit"`
 	OfficialQuotaBalance       *float64   `json:"official_quota_balance,omitempty"`
 	OfficialQuotaBalanceUSD    *float64   `json:"official_quota_balance_usd,omitempty"`
@@ -147,13 +149,28 @@ type ProviderKeyUpdate struct {
 	MaxConcurrency *int    `json:"max_concurrency,omitempty"`
 }
 
-// ProviderKeyQuotaResult is the normalized result of a provider's official billing/quota endpoint.
+const (
+	QuotaSourceOfficial         = "official"
+	QuotaSourceOfficialUsage    = "official_usage"
+	QuotaSourceProviderResponse = "provider_response"
+	QuotaSourceResponseHeader   = "response_header"
+	QuotaSourceLocalMeter       = "local_meter"
+
+	QuotaConfidenceExact      = "exact"
+	QuotaConfidenceBestEffort = "best_effort"
+	QuotaConfidenceEstimated  = "estimated"
+)
+
+// ProviderKeyQuotaResult is the normalized result of official quota data,
+// provider response metadata, or the gateway's local usage meter.
 type ProviderKeyQuotaResult struct {
 	Provider      string                   `json:"provider"`
 	Alias         string                   `json:"alias"`
 	Supported     bool                     `json:"supported"`
 	Status        string                   `json:"status"`
 	Message       string                   `json:"message,omitempty"`
+	Source        string                   `json:"source,omitempty"`
+	Confidence    string                   `json:"confidence,omitempty"`
 	Unit          string                   `json:"unit,omitempty"`
 	Balance       *float64                 `json:"balance,omitempty"`
 	BalanceCents  *float64                 `json:"balance_cents,omitempty"`

@@ -156,8 +156,8 @@
                       <el-tooltip content="测试密钥" placement="top">
                         <el-button link class="row-icon-button" type="primary" :icon="Refresh" :loading="testingKeyId === row.id" aria-label="测试密钥" @click="testKey(row)" />
                       </el-tooltip>
-                      <el-tooltip content="查询官方额度" placement="top">
-                        <el-button link class="row-icon-button" :icon="Clock" :loading="quotaLoadingKeyId === row.id" aria-label="查询官方额度" @click="queryQuota(row)" />
+                      <el-tooltip content="查询额度或本地统计" placement="top">
+                        <el-button link class="row-icon-button" :icon="Clock" :loading="quotaLoadingKeyId === row.id" aria-label="查询额度或本地统计" @click="queryQuota(row)" />
                       </el-tooltip>
                       <el-tooltip :content="row.status === 'enabled' ? '停用密钥' : '启用密钥'" placement="top">
                         <el-button
@@ -345,7 +345,7 @@ const providerCards = computed<ProviderCard[]>(() => providers.value.map((provid
   return { ...provider, keyCount: ownedKeys.length, enabledKeyCount: ownedKeys.filter((item) => item.status === 'enabled').length, totalSuccess, totalFailure, totalCalls: totalSuccess + totalFailure }
 }))
 const selectedKeys = computed(() => providerForm.value ? keys.value.filter((item) => item.provider_name === providerForm.value?.name) : [])
-const tableKeys = computed<EditableKey[]>(() => creatingRow.value ? [{ id: 0, provider_id: 0, provider_name: providerForm.value?.name || '', alias: '', key_hint: '', exa_service_key_hint: '', status: 'enabled', weight: 1, rpm_limit: 0, daily_quota: 0, monthly_quota: 0, max_concurrency: 0, current_failures: 0, total_successes: 0, total_failures: 0, daily_used: 0, monthly_used: 0, official_quota_status: '', official_quota_message: '', official_quota_unit: '', created_at: '', updated_at: '', isNew: true }, ...selectedKeys.value] : selectedKeys.value)
+const tableKeys = computed<EditableKey[]>(() => creatingRow.value ? [{ id: 0, provider_id: 0, provider_name: providerForm.value?.name || '', alias: '', key_hint: '', exa_service_key_hint: '', status: 'enabled', weight: 1, rpm_limit: 0, daily_quota: 0, monthly_quota: 0, max_concurrency: 0, current_failures: 0, total_successes: 0, total_failures: 0, daily_used: 0, monthly_used: 0, official_quota_status: '', official_quota_message: '', official_quota_source: '', official_quota_confidence: '', official_quota_unit: '', created_at: '', updated_at: '', isNew: true }, ...selectedKeys.value] : selectedKeys.value)
 const dialogTitle = computed(() => providerForm.value ? `编辑 ${providerForm.value.display_name}` : '编辑平台')
 const providerRequestLimit = computed({
   get() {
@@ -531,12 +531,31 @@ function normalizeMaxConcurrency(value: unknown) {
 function quotaMetaText(row: EditableKey) {
   if (!row.official_quota_checked_at) return '额度 未同步'
   if (row.official_quota_status !== 'success') return `额度 ${row.official_quota_message || '同步失败'}`
-  if (row.provider_name === 'you') return `额度 ${formatCurrency(row.official_quota_balance_usd)}`
-  if (row.provider_name === 'jina') return `额度 ${formatNumber(row.official_quota_balance)} tokens`
-  if (row.provider_name === 'exa') return `用量 ${formatCurrency(row.official_quota_used_usd)}`
-  if (row.provider_name === 'tavily' || row.provider_name === 'firecrawl' || row.provider_name === 'serper') return `额度 ${formatNumber(row.official_quota_balance)} credits`
-  if (row.provider_name === 'brave') return `额度 ${formatNumber(row.official_quota_balance)} requests`
-  return `额度 ${formatNumber(row.official_quota_balance)}`
+  const source = quotaSourceText(row)
+  if (row.provider_name === 'you') return `${source}余额 ${formatCurrency(row.official_quota_balance_usd)}`
+  if (row.provider_name === 'jina') {
+    if (row.official_quota_balance !== undefined) return `${source}余额 ${formatNumber(row.official_quota_balance)} tokens`
+    return `${source}用量 ${formatNumber(row.official_quota_total_quantity)} tokens`
+  }
+  if (row.provider_name === 'exa') return `${source}用量 ${formatCurrency(row.official_quota_used_usd)}`
+  if (row.provider_name === 'tavily' || row.provider_name === 'firecrawl' || row.provider_name === 'serper') return `${source}余额 ${formatNumber(row.official_quota_balance)} credits`
+  if (row.provider_name === 'brave') {
+    if (row.official_quota_balance !== undefined) return `${source}额度 ${formatNumber(row.official_quota_balance)} requests`
+    return `${source}用量 ${formatNumber(row.official_quota_total_quantity)} requests`
+  }
+  return `${source}额度 ${formatNumber(row.official_quota_balance)}`
+}
+
+function quotaSourceText(row: EditableKey) {
+  const label = ({
+    official: '官方',
+    official_usage: '官方',
+    provider_response: '上游',
+    response_header: '响应头',
+    local_meter: '本地'
+  } as Record<string, string>)[row.official_quota_source] || ''
+  if (row.official_quota_confidence === 'estimated') return `${label || '本地'}估算`
+  return label
 }
 
 function quotaMetaClass(row: EditableKey) {
@@ -695,16 +714,12 @@ async function testKey(row: EditableKey) {
 }
 
 async function queryQuota(row: EditableKey) {
-  if (row.provider_name === 'exa' && !row.exa_service_key_hint) {
-    ElMessage.info('未配置 Exa 管理密钥，当前使用本地计算费用模式')
-    return
-  }
   quotaLoadingKeyId.value = row.id
   try {
     const quota = await api.queryKeyQuota(row.id)
     applyQuotaResult(row.id, quota)
     if (quota.supported && quota.status === 'success') {
-      ElMessage.success('官方额度已更新')
+      ElMessage.success(quota.source === 'local_meter' ? '本地统计已更新' : '额度数据已更新')
     } else {
       ElMessage.warning(quota.message || '该渠道暂不支持官方额度查询')
     }
@@ -721,6 +736,8 @@ function applyQuotaResult(id: number, quota: OfficialQuotaResult) {
     ...item,
     official_quota_status: quota.status,
     official_quota_message: quota.message || '',
+    official_quota_source: quota.source || '',
+    official_quota_confidence: quota.confidence || '',
     official_quota_unit: quota.unit || '',
     official_quota_balance: quota.balance,
     official_quota_balance_usd: quota.balance_usd,

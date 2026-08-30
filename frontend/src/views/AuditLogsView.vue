@@ -150,6 +150,7 @@ const actionChips = [
 
 const HOT_ACTIONS = new Set([
   'provider_key.reveal',
+  'api_token.reveal',
   'settings.admin_api_key.rotate',
 ])
 
@@ -180,6 +181,7 @@ const ACTION_TITLES: Record<string, string> = {
   'provider_key.test': '测试渠道密钥',
   'provider_key.quota': '查询密钥配额',
   'api_token.create': '创建 API 令牌',
+  'api_token.reveal': '读取 API 令牌',
   'api_token.update': '更新 API 令牌',
   'api_token.status': '变更令牌状态',
   'api_token.delete': '删除 API 令牌',
