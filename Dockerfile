@@ -15,6 +15,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /out/searchmeld ./cmd/server
 
 FROM alpine:3.20 AS runtime-base
 RUN apk add --no-cache ca-certificates curl nginx tzdata
+ENV TZ=Asia/Shanghai
 WORKDIR /app
 COPY --from=frontend-builder /app/frontend/dist /usr/share/nginx/html
 COPY --from=backend-builder /out/searchmeld /usr/local/bin/searchmeld

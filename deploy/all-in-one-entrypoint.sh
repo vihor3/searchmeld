@@ -170,6 +170,8 @@ start_postgres() {
     -c logging_collector=off \
     -c log_destination=stderr \
     -c client_min_messages=warning \
+    -c timezone="$TZ" \
+    -c log_timezone="$TZ" \
     >/proc/1/fd/1 2>&1 &
   postgres_pid=$!
 
@@ -239,6 +241,8 @@ main() {
   trap 'cleanup; exit 0' INT TERM
   trap cleanup EXIT
 
+  TZ=${TZ:-Asia/Shanghai}
+  export TZ
   normalize_container_proxy_env
   select_database_mode
 

@@ -19,8 +19,9 @@ unset \
   APP_ENV POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD DATABASE_URL \
   DATABASE_URL_FILE DATABASE_MODE DATABASE_DOCKER_NETWORK RUN_MIGRATIONS \
   ADMIN_USERNAME ADMIN_PASSWORD ENCRYPTION_KEY API_AUTH_REQUIRED MCP_ENABLED \
-  MCP_PATH CORS_ALLOWED_ORIGINS HOST_PORT SEARCHMELD_INSTALL_MODE \
-  SEARCHMELD_USE_SHARED_DB_NETWORK SEARCHMELD_HTTP_PROXY \
+  MCP_PATH CORS_ALLOWED_ORIGINS HOST_PORT TZ SEARCHMELD_INSTALL_MODE \
+  SEARCHMELD_USE_SHARED_DB_NETWORK SEARCHMELD_USE_CUSTOM_DNS \
+  SEARCHMELD_DNS_PRIMARY SEARCHMELD_DNS_SECONDARY SEARCHMELD_HTTP_PROXY \
   SEARCHMELD_HTTPS_PROXY SEARCHMELD_ALL_PROXY SEARCHMELD_NO_PROXY \
   SEARCHMELD_PROJECT_DIR SEARCHMELD_ENV_FILE SEARCHMELD_DATABASE_URL_FILE \
   SEARCHMELD_INSTALL_HEALTH_TIMEOUT ONE_SEARCH_INSTALL_MODE \
@@ -102,7 +103,7 @@ write_configuration() {
   fi
   awk '
     BEGIN {
-      split("SEARCHMELD_INSTALL_MODE SEARCHMELD_USE_SHARED_DB_NETWORK ONE_SEARCH_INSTALL_MODE ONE_SEARCH_USE_SHARED_DB_NETWORK HOST_PORT POSTGRES_PASSWORD DATABASE_URL DATABASE_DOCKER_NETWORK ADMIN_USERNAME ADMIN_PASSWORD ENCRYPTION_KEY API_AUTH_REQUIRED MCP_ENABLED", items, " ")
+      split("SEARCHMELD_INSTALL_MODE SEARCHMELD_USE_SHARED_DB_NETWORK SEARCHMELD_USE_CUSTOM_DNS SEARCHMELD_DNS_PRIMARY SEARCHMELD_DNS_SECONDARY ONE_SEARCH_INSTALL_MODE ONE_SEARCH_USE_SHARED_DB_NETWORK HOST_PORT POSTGRES_PASSWORD DATABASE_URL DATABASE_DOCKER_NETWORK ADMIN_USERNAME ADMIN_PASSWORD ENCRYPTION_KEY API_AUTH_REQUIRED MCP_ENABLED", items, " ")
       for (item_index in items) managed[items[item_index]] = 1
     }
     $0 == "# --- install.sh managed values ---" { next }
@@ -116,6 +117,9 @@ write_configuration() {
   printf '\n%s\n' '# --- install.sh managed values ---' >> "$active_tmp_file"
   write_env_line SEARCHMELD_INSTALL_MODE "$install_mode"
   write_env_line SEARCHMELD_USE_SHARED_DB_NETWORK "$use_database_network"
+  write_env_line SEARCHMELD_USE_CUSTOM_DNS "$use_custom_dns"
+  write_env_line SEARCHMELD_DNS_PRIMARY "$dns_primary"
+  write_env_line SEARCHMELD_DNS_SECONDARY "$dns_secondary"
   write_env_line HOST_PORT "$host_port"
   write_env_line POSTGRES_PASSWORD "$postgres_password"
   write_env_line DATABASE_URL "$database_url"
@@ -134,6 +138,7 @@ write_configuration() {
 validate_env_file() {
   for key in \
     SEARCHMELD_INSTALL_MODE SEARCHMELD_USE_SHARED_DB_NETWORK \
+    SEARCHMELD_USE_CUSTOM_DNS SEARCHMELD_DNS_PRIMARY SEARCHMELD_DNS_SECONDARY \
     ONE_SEARCH_INSTALL_MODE ONE_SEARCH_USE_SHARED_DB_NETWORK HOST_PORT \
     POSTGRES_PASSWORD DATABASE_URL DATABASE_DOCKER_NETWORK ADMIN_USERNAME \
     ADMIN_PASSWORD ENCRYPTION_KEY API_AUTH_REQUIRED MCP_ENABLED
@@ -278,7 +283,9 @@ validate_port() {
   case "$value" in
     ''|*[!0-9]*) die "$label 必须是 1 到 65535 的整数" ;;
   esac
-  [ "$value" -ge 1 ] && [ "$value" -le 65535 ] || die "$label 必须是 1 到 65535 的整数"
+  if [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
+    die "$label 必须是 1 到 65535 的整数"
+  fi
 }
 
 validate_network_name() {
@@ -289,13 +296,208 @@ validate_network_name() {
   esac
 }
 
+is_ipv4_literal() {
+  printf '%s\n' "$1" | awk -F. '
+    NF != 4 { exit 1 }
+    {
+      for (field_index = 1; field_index <= 4; field_index++) {
+        if ($field_index !~ /^[0-9]+$/ || $field_index < 0 || $field_index > 255) exit 1
+        if (length($field_index) > 1 && substr($field_index, 1, 1) == "0") exit 1
+      }
+    }
+  '
+}
+
+is_ipv6_literal() {
+  printf '%s\n' "$1" | awk '
+    function valid_group(group) {
+      return length(group) >= 1 && length(group) <= 4 && group ~ /^[0-9A-Fa-f]+$/
+    }
+    function count_groups(part, groups, count, group_index) {
+      if (part == "") return 0
+      count = split(part, groups, ":")
+      for (group_index = 1; group_index <= count; group_index++) {
+        if (!valid_group(groups[group_index])) return -1
+      }
+      return count
+    }
+    function valid_ipv4(value, octets, count, octet_index) {
+      count = split(value, octets, ".")
+      if (count != 4) return 0
+      for (octet_index = 1; octet_index <= count; octet_index++) {
+        if (octets[octet_index] !~ /^[0-9]+$/ || octets[octet_index] < 0 || octets[octet_index] > 255) return 0
+        if (length(octets[octet_index]) > 1 && substr(octets[octet_index], 1, 1) == "0") return 0
+      }
+      return 1
+    }
+    {
+      value = $0
+      if (value == "" || value !~ /^[0-9A-Fa-f:.]+$/) exit 1
+      if (index(value, ".") > 0) {
+        last_colon = 0
+        for (character_index = 1; character_index <= length(value); character_index++) {
+          if (substr(value, character_index, 1) == ":") last_colon = character_index
+        }
+        if (last_colon == 0) exit 1
+        ipv4_suffix = substr(value, last_colon + 1)
+        if (!valid_ipv4(ipv4_suffix)) exit 1
+        value = substr(value, 1, last_colon) "0:0"
+      }
+      if (value ~ /:::/) exit 1
+      compressed_at = index(value, "::")
+      if (compressed_at > 0) {
+        left = substr(value, 1, compressed_at - 1)
+        right = substr(value, compressed_at + 2)
+        if (index(right, "::") > 0) exit 1
+        left_count = count_groups(left)
+        right_count = count_groups(right)
+        if (left_count < 0 || right_count < 0 || left_count + right_count >= 8) exit 1
+        exit 0
+      }
+      if (substr(value, 1, 1) == ":" || substr(value, length(value), 1) == ":") exit 1
+      if (count_groups(value) != 8) exit 1
+    }
+  '
+}
+
+is_dns_ip_literal() {
+  value="$1"
+  case "$value" in
+    *:*) is_ipv6_literal "$value" ;;
+    *) is_ipv4_literal "$value" ;;
+  esac
+}
+
+canonicalize_dns_ip_literal() {
+  canonical_dns_value="$1"
+  case "$canonical_dns_value" in
+    *:*)
+      printf '%s\n' "$canonical_dns_value" | awk '
+        function hex_to_decimal(group, result, character_index, digit) {
+          group = tolower(group)
+          result = 0
+          for (character_index = 1; character_index <= length(group); character_index++) {
+            digit = index("0123456789abcdef", substr(group, character_index, 1)) - 1
+            result = result * 16 + digit
+          }
+          return result
+        }
+        function append_group(group_value) {
+          if (canonical != "") canonical = canonical ":"
+          canonical = canonical sprintf("%x", group_value)
+        }
+        {
+          value = $0
+          if (index(value, ".") > 0) {
+            last_colon = 0
+            for (character_index = 1; character_index <= length(value); character_index++) {
+              if (substr(value, character_index, 1) == ":") last_colon = character_index
+            }
+            ipv4_suffix = substr(value, last_colon + 1)
+            split(ipv4_suffix, octets, ".")
+            first_ipv4_group = octets[1] * 256 + octets[2]
+            second_ipv4_group = octets[3] * 256 + octets[4]
+            value = substr(value, 1, last_colon) sprintf("%x:%x", first_ipv4_group, second_ipv4_group)
+          }
+
+          compressed_at = index(value, "::")
+          if (compressed_at > 0) {
+            left = substr(value, 1, compressed_at - 1)
+            right = substr(value, compressed_at + 2)
+            left_count = left == "" ? 0 : split(left, left_groups, ":")
+            right_count = right == "" ? 0 : split(right, right_groups, ":")
+            for (group_index = 1; group_index <= left_count; group_index++) {
+              append_group(hex_to_decimal(left_groups[group_index]))
+            }
+            for (group_index = 1; group_index <= 8 - left_count - right_count; group_index++) {
+              append_group(0)
+            }
+            for (group_index = 1; group_index <= right_count; group_index++) {
+              append_group(hex_to_decimal(right_groups[group_index]))
+            }
+          } else {
+            group_count = split(value, groups, ":")
+            for (group_index = 1; group_index <= group_count; group_index++) {
+              append_group(hex_to_decimal(groups[group_index]))
+            }
+          }
+          print canonical
+        }
+      '
+      ;;
+    *)
+      printf '%s\n' "$canonical_dns_value" | awk -F. '{
+        printf "%d.%d.%d.%d\n", $1, $2, $3, $4
+      }'
+      ;;
+  esac
+}
+
+dns_ip_literals_equal() {
+  first_dns_canonical=$(canonicalize_dns_ip_literal "$1")
+  second_dns_canonical=$(canonicalize_dns_ip_literal "$2")
+  [ "$first_dns_canonical" = "$second_dns_canonical" ]
+}
+
+validate_custom_dns_configuration() {
+  is_dns_ip_literal "$dns_primary" || die "首选 DNS 必须是有效的 IPv4 或 IPv6 地址"
+  is_dns_ip_literal "$dns_secondary" || die "备用 DNS 必须是有效的 IPv4 或 IPv6 地址"
+  if dns_ip_literals_equal "$dns_primary" "$dns_secondary"; then
+    die "首选 DNS 和备用 DNS 不能相同"
+  fi
+}
+
+configure_custom_dns() {
+  existing_custom_dns=$(get_env_value SEARCHMELD_USE_CUSTOM_DNS)
+  default_custom_dns=$(normalize_bool "${existing_custom_dns:-false}") || default_custom_dns=false
+  existing_dns_primary=$(get_env_value SEARCHMELD_DNS_PRIMARY)
+  existing_dns_secondary=$(get_env_value SEARCHMELD_DNS_SECONDARY)
+
+  log ""
+  log "容器 DNS："
+  log "  - 默认使用 Docker/宿主机 DNS"
+  log "  - Mihomo Fake-IP、企业内网或域名分流环境通常应保持默认"
+  log "  - 仅在 Docker DNS 间歇解析失败时启用自定义 DNS"
+  prompt_yes_no "是否为 SearchMeld 容器配置两台自定义 DNS" "$default_custom_dns"
+  use_custom_dns=$prompted_bool
+
+  if [ "$use_custom_dns" = false ]; then
+    dns_primary=""
+    dns_secondary=""
+    return
+  fi
+
+  while :; do
+    prompt_line "首选 DNS IP" "$existing_dns_primary"
+    dns_primary=$prompted_value
+    if is_dns_ip_literal "$dns_primary"; then
+      break
+    fi
+    log "首选 DNS 必须是有效的 IPv4 或 IPv6 地址"
+  done
+
+  while :; do
+    prompt_line "备用 DNS IP" "$existing_dns_secondary"
+    dns_secondary=$prompted_value
+    if ! is_dns_ip_literal "$dns_secondary"; then
+      log "备用 DNS 必须是有效的 IPv4 或 IPv6 地址"
+      continue
+    fi
+    if dns_ip_literals_equal "$dns_primary" "$dns_secondary"; then
+      log "备用 DNS 不能与首选 DNS 相同"
+      continue
+    fi
+    break
+  done
+}
+
 url_encode() {
   encoded_value=""
   for hex_byte in $(LC_ALL=C printf '%s' "$1" | od -An -tx1); do
     case "$hex_byte" in
       2d|2e|5f|7e|3[0-9]|4[1-9a-f]|5[0-9a]|6[1-9a-f]|7[0-9a])
         octal_byte=$(printf '%03o' "$((0x$hex_byte))")
-        encoded_value="$encoded_value$(printf "\\$octal_byte")"
+        encoded_value="$encoded_value$(printf '%b' "\\$octal_byte")"
         ;;
       *)
         upper_hex=$(printf '%s' "$hex_byte" | tr '[:lower:]' '[:upper:]')
@@ -484,6 +686,8 @@ configure_installation() {
   fi
   prompt_yes_no "是否启用 MCP search/extract 工具" "$default_mcp"
   mcp_enabled=$prompted_bool
+
+  configure_custom_dns
 }
 
 load_existing_configuration() {
@@ -508,6 +712,16 @@ load_existing_configuration() {
   existing_network_choice=$(get_compat_env_value SEARCHMELD_USE_SHARED_DB_NETWORK ONE_SEARCH_USE_SHARED_DB_NETWORK)
   use_database_network=$(normalize_bool "${existing_network_choice:-false}") || die "现有 SEARCHMELD_USE_SHARED_DB_NETWORK（或旧版 ONE_SEARCH_USE_SHARED_DB_NETWORK）无效"
   mcp_enabled=$(normalize_bool "$(get_env_value MCP_ENABLED)") || die "现有 MCP_ENABLED 无效"
+  existing_custom_dns=$(get_env_value SEARCHMELD_USE_CUSTOM_DNS)
+  use_custom_dns=$(normalize_bool "${existing_custom_dns:-false}") || die "现有 SEARCHMELD_USE_CUSTOM_DNS 无效"
+  dns_primary=$(get_env_value SEARCHMELD_DNS_PRIMARY)
+  dns_secondary=$(get_env_value SEARCHMELD_DNS_SECONDARY)
+  if [ "$use_custom_dns" = true ]; then
+    validate_custom_dns_configuration
+  else
+    dns_primary=""
+    dns_secondary=""
+  fi
   generated_admin_password=false
 
   if [ "$install_mode" = embedded ]; then
@@ -545,6 +759,14 @@ show_summary() {
   log "  管理员：$admin_username"
   log "  API Token 认证：启用"
   log "  MCP：$mcp_enabled"
+  if [ "$use_custom_dns" = true ]; then
+    log "  自定义 DNS：启用（$dns_primary、$dns_secondary）"
+  else
+    log "  自定义 DNS：关闭（使用 Docker/宿主机 DNS）"
+  fi
+  configured_timezone=$(get_env_value TZ)
+  configured_timezone=${configured_timezone:-Asia/Shanghai}
+  log "  容器时区：$configured_timezone"
   log "  配置文件：$env_file（权限 600）"
   log ""
   prompt_yes_no "确认以上配置并开始安装" true
@@ -556,7 +778,7 @@ source_update_available() {
   git -C "$project_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
   git_root=$(git -C "$project_dir" rev-parse --show-toplevel 2>/dev/null) || return 1
   [ "$git_root" = "$project_dir" ] || return 1
-  update_check_branch=$(git -C "$project_dir" symbolic-ref --quiet --short HEAD 2>/dev/null) || return 1
+  git -C "$project_dir" symbolic-ref --quiet --short HEAD >/dev/null 2>&1 || return 1
   update_check_upstream=$(git -C "$project_dir" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) || return 1
   case "$update_check_upstream" in
     */*) update_check_remote=${update_check_upstream%%/*} ;;
@@ -606,7 +828,10 @@ perform_source_update() {
   git -C "$project_dir" merge --ff-only "$update_upstream"
   updated_revision=$(git -C "$project_dir" rev-parse HEAD) || die "无法确认更新后的 Git 版本"
 
-  for required_file in install.sh .env.example docker-compose.yml docker-compose.external-db.yml; do
+  for required_file in \
+    install.sh .env.example docker-compose.yml docker-compose.external-db.yml \
+    docker-compose.shared-db.yml docker-compose.dns.yml
+  do
     [ -f "$project_dir/$required_file" ] || die "更新后的项目缺少 $required_file"
   done
   previous_short=$(printf '%s' "$previous_revision" | cut -c1-12)
@@ -616,14 +841,36 @@ perform_source_update() {
 
 run_compose() {
   if [ "$install_mode" = embedded ]; then
-    docker compose --env-file "$env_file" -f "$project_dir/docker-compose.yml" "$@"
+    if [ "$use_custom_dns" = true ]; then
+      docker compose --env-file "$env_file" \
+        -f "$project_dir/docker-compose.yml" \
+        -f "$project_dir/docker-compose.dns.yml" \
+        "$@"
+    else
+      docker compose --env-file "$env_file" -f "$project_dir/docker-compose.yml" "$@"
+    fi
   elif [ "$use_database_network" = true ]; then
-    docker compose --env-file "$env_file" \
-      -f "$project_dir/docker-compose.external-db.yml" \
-      -f "$project_dir/docker-compose.shared-db.yml" \
-      "$@"
+    if [ "$use_custom_dns" = true ]; then
+      docker compose --env-file "$env_file" \
+        -f "$project_dir/docker-compose.external-db.yml" \
+        -f "$project_dir/docker-compose.shared-db.yml" \
+        -f "$project_dir/docker-compose.dns.yml" \
+        "$@"
+    else
+      docker compose --env-file "$env_file" \
+        -f "$project_dir/docker-compose.external-db.yml" \
+        -f "$project_dir/docker-compose.shared-db.yml" \
+        "$@"
+    fi
   else
-    docker compose --env-file "$env_file" -f "$project_dir/docker-compose.external-db.yml" "$@"
+    if [ "$use_custom_dns" = true ]; then
+      docker compose --env-file "$env_file" \
+        -f "$project_dir/docker-compose.external-db.yml" \
+        -f "$project_dir/docker-compose.dns.yml" \
+        "$@"
+    else
+      docker compose --env-file "$env_file" -f "$project_dir/docker-compose.external-db.yml" "$@"
+    fi
   fi
 }
 
@@ -667,6 +914,8 @@ main() {
   [ -f "$env_example" ] || die "找不到 $env_example"
   [ -f "$project_dir/docker-compose.yml" ] || die "当前目录不是 SearchMeld 项目"
   [ -f "$project_dir/docker-compose.external-db.yml" ] || die "缺少外部数据库 Compose 配置"
+  [ -f "$project_dir/docker-compose.shared-db.yml" ] || die "缺少共享数据库网络 Compose 配置"
+  [ -f "$project_dir/docker-compose.dns.yml" ] || die "缺少自定义 DNS Compose 配置"
 
   if [ -L "$env_file" ]; then
     die "拒绝写入符号链接形式的配置文件：$env_file"

@@ -7,6 +7,7 @@ services:
       target: external
     environment:
       APP_ENV: ${APP_ENV:-production}
+      TZ: ${TZ:-Asia/Shanghai}
       DATABASE_MODE: external
       DATABASE_URL: ${DATABASE_URL:?set the external PostgreSQL DATABASE_URL}
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}

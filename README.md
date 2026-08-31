@@ -38,7 +38,8 @@ cd searchmeld
 2. 外部数据库可选择加入另一个 Docker 网络，并填写网络名称。
 3. 外部数据库连接信息可按主机、端口、库名、用户名、密码和 SSL 模式逐项填写，也可直接粘贴完整 `DATABASE_URL`。密码和连接串采用隐藏输入。
 4. 设置管理台端口、管理员账号、管理员密码生成方式，以及是否启用 MCP。
-5. 查看不含密码的配置摘要并确认安装。
+5. 选择是否为应用容器设置两台自定义 DNS；默认关闭，继续使用 Docker/宿主机 DNS。
+6. 查看不含密码的配置摘要并确认安装。
 
 内置数据库密码和 `ENCRYPTION_KEY` 由脚本自动安全生成。安装完成后脚本会等待健康检查通过，并显示管理台地址和自动生成的首次管理员密码。
 
@@ -50,6 +51,8 @@ cd searchmeld
 - 使用源码压缩包等非 Git 方式安装时，仍可使用当前版本重建和重新配置，但不会显示远端更新选项。
 
 已有持久化密码、`ENCRYPTION_KEY`、内置 PostgreSQL Volume 和外部数据库连接不会在更新时被静默替换。
+
+自定义 DNS 只建议在 Docker DNS 间歇出现 `server misbehaving`、SERVFAIL 或超时时启用。Mihomo Fake-IP、企业内网和域名分流环境通常依赖宿主机 DNS，应保留默认关闭状态。启用后向导会要求填写两台不同的 IPv4/IPv6 DNS 地址，并为所有数据库部署方式叠加 `docker-compose.dns.yml`。
 
 ### 从 One Search 迁移
 
@@ -129,6 +132,24 @@ curl http://localhost:5173/healthz
 ```bash
 docker compose -f docker-compose.external-db.yml up --build -d
 ```
+
+手动部署需要自定义容器 DNS 时，在 `.env` 填写两台地址，并把 DNS 配置作为最后一个 Compose 文件叠加：
+
+```dotenv
+SEARCHMELD_USE_CUSTOM_DNS=true
+SEARCHMELD_DNS_PRIMARY=223.5.5.5
+SEARCHMELD_DNS_SECONDARY=1.12.12.12
+```
+
+```bash
+docker compose \
+  -f docker-compose.external-db.yml \
+  -f docker-compose.shared-db.yml \
+  -f docker-compose.dns.yml \
+  up --build -d
+```
+
+不使用共享数据库网络时去掉 `docker-compose.shared-db.yml`；使用内置数据库时把前两个文件替换为 `docker-compose.yml`。禁用自定义 DNS 时不要加载 `docker-compose.dns.yml`。
 
 也可以直接构建镜像：
 
@@ -277,6 +298,9 @@ enabled_tools = ["search", "extract"]
 | `HOST_PORT` | `5173` | 宿主机端口 |
 | `SEARCHMELD_INSTALL_MODE` | `embedded` | 安装脚本记录的数据库模式；通常由向导维护 |
 | `SEARCHMELD_USE_SHARED_DB_NETWORK` | `false` | 安装脚本是否组合共享数据库网络配置 |
+| `SEARCHMELD_USE_CUSTOM_DNS` | `false` | 是否由安装脚本叠加自定义容器 DNS；Mihomo Fake-IP/内网分流场景通常保持关闭 |
+| `SEARCHMELD_DNS_PRIMARY` / `SEARCHMELD_DNS_SECONDARY` | 空 | 启用自定义 DNS 时使用的两台不同 IPv4/IPv6 地址 |
+| `TZ` | `Asia/Shanghai` | 应用、Nginx 和内置 PostgreSQL 的容器时区；可改为 `UTC` 或其它有效 IANA 时区 |
 | `POSTGRES_PASSWORD` | — | 使用内置 PostgreSQL 时**必填**；外部数据库模式不需要 |
 | `DATABASE_URL` | 空 | 外部 Compose 或容器直接运行时使用的 PostgreSQL 连接串 |
 | `DATABASE_MODE` | 取决于镜像 | `all-in-one` 默认 `embedded`，`external` 默认 `external`；一体化镜像切外部库时须显式设为 `external` |

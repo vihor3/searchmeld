@@ -81,6 +81,7 @@ make_project() {
   cp "$project_dir/docker-compose.yml" "$target/docker-compose.yml"
   cp "$project_dir/docker-compose.external-db.yml" "$target/docker-compose.external-db.yml"
   cp "$project_dir/docker-compose.shared-db.yml" "$target/docker-compose.shared-db.yml"
+  cp "$project_dir/docker-compose.dns.yml" "$target/docker-compose.dns.yml"
   printf '%s' "$target"
 }
 
@@ -96,12 +97,16 @@ assert_env_nonempty() {
 # 首次运行：即使调用者设置了同名环境变量，也只能由向导决定配置。
 embedded_project=$(make_project embedded)
 embedded_log="$tmpdir/embedded-docker.log"
-printf '\n\n\n\n\n\n' | env \
+printf '\n\n\n\n\n\n\n' | env \
   PATH="$tmpdir/bin:$PATH" \
   MOCK_DOCKER_LOG="$embedded_log" \
   SEARCHMELD_INSTALL_MODE=external \
   ONE_SEARCH_INSTALL_MODE=external \
   ONE_SEARCH_USE_SHARED_DB_NETWORK=true \
+  SEARCHMELD_USE_CUSTOM_DNS=true \
+  SEARCHMELD_DNS_PRIMARY=8.8.8.8 \
+  SEARCHMELD_DNS_SECONDARY=1.1.1.1 \
+  TZ=UTC \
   DATABASE_URL='postgresql://ignored:ignored@ignored:5432/ignored' \
   HOST_PORT=65500 \
   "$embedded_project/install.sh" > "$tmpdir/embedded-output" 2>&1
@@ -112,8 +117,12 @@ assert_env_nonempty "$embedded_env" ADMIN_PASSWORD
 assert_env_nonempty "$embedded_env" ENCRYPTION_KEY
 grep -q "^SEARCHMELD_INSTALL_MODE='embedded'$" "$embedded_env"
 grep -q "^HOST_PORT='5173'$" "$embedded_env"
+grep -q "^SEARCHMELD_USE_CUSTOM_DNS='false'$" "$embedded_env"
+grep -q "^SEARCHMELD_DNS_PRIMARY=''$" "$embedded_env"
+grep -q "^SEARCHMELD_DNS_SECONDARY=''$" "$embedded_env"
+grep -q '^TZ=Asia/Shanghai$' "$embedded_env"
 grep -q 'compose .*docker-compose.yml up --build -d' "$embedded_log"
-if grep -q 'docker-compose.external-db.yml' "$embedded_log"; then
+if grep -q 'docker-compose.external-db.yml\|docker-compose.dns.yml' "$embedded_log"; then
   printf '%s\n' 'embedded install used external compose' >&2
   exit 1
 fi
@@ -136,6 +145,10 @@ cp "$embedded_env" "$legacy_project/.env"
 sed -i \
   -e 's/^SEARCHMELD_INSTALL_MODE=/ONE_SEARCH_INSTALL_MODE=/' \
   -e 's/^SEARCHMELD_USE_SHARED_DB_NETWORK=/ONE_SEARCH_USE_SHARED_DB_NETWORK=/' \
+  -e '/^SEARCHMELD_USE_CUSTOM_DNS=/d' \
+  -e '/^SEARCHMELD_DNS_PRIMARY=/d' \
+  -e '/^SEARCHMELD_DNS_SECONDARY=/d' \
+  -e '/^TZ=/d' \
   "$legacy_project/.env"
 legacy_log="$tmpdir/legacy-docker.log"
 printf '\n\n' | env \
@@ -144,6 +157,11 @@ printf '\n\n' | env \
   "$legacy_project/install.sh" > "$tmpdir/legacy-output" 2>&1
 grep -q 'compose .*docker-compose.yml up --build -d' "$legacy_log"
 grep -q "^ONE_SEARCH_INSTALL_MODE='embedded'$" "$legacy_project/.env"
+grep -q '容器时区：Asia/Shanghai' "$tmpdir/legacy-output"
+if grep -q 'docker-compose.dns.yml' "$legacy_log"; then
+  printf '%s\n' 'legacy config unexpectedly enabled custom DNS' >&2
+  exit 1
+fi
 
 # Git 安装目录可选择从当前分支的 upstream 快进更新；先构建，再切换服务。
 update_project=$(make_project update)
@@ -216,6 +234,12 @@ expected_database_url='postgresql://one_search:s%40cr%20et%2F%23%3F@shared-postg
   printf '\n'
   printf '\n'
   printf '\n'
+  printf '%s\n' y
+  printf '%s\n' 001.002.003.004
+  printf '%s\n' not-an-ip
+  printf '%s\n' 223.5.5.5
+  printf '%s\n' 223.5.5.5
+  printf '%s\n' 1.12.12.12
   printf '\n'
 } | env \
   PATH="$tmpdir/bin:$PATH" \
@@ -226,10 +250,15 @@ external_env="$external_project/.env"
 grep -q "^DATABASE_URL='$expected_database_url'$" "$external_env"
 grep -q "^SEARCHMELD_INSTALL_MODE='external'$" "$external_env"
 grep -q "^SEARCHMELD_USE_SHARED_DB_NETWORK='true'$" "$external_env"
+grep -q "^SEARCHMELD_USE_CUSTOM_DNS='true'$" "$external_env"
+grep -q "^SEARCHMELD_DNS_PRIMARY='223.5.5.5'$" "$external_env"
+grep -q "^SEARCHMELD_DNS_SECONDARY='1.12.12.12'$" "$external_env"
 grep -q "^HOST_PORT='5180'$" "$external_env"
+[ "$(grep -c '首选 DNS 必须是有效的 IPv4 或 IPv6 地址' "$tmpdir/external-output")" -eq 2 ]
+grep -q '备用 DNS 不能与首选 DNS 相同' "$tmpdir/external-output"
 grep -q '^network create --internal shared-db$' "$external_log"
-grep -q 'docker-compose.external-db.yml .*docker-compose.shared-db.yml config --quiet' "$external_log"
-grep -q 'docker-compose.external-db.yml .*docker-compose.shared-db.yml up --build -d' "$external_log"
+grep -q 'docker-compose.external-db.yml .*docker-compose.shared-db.yml .*docker-compose.dns.yml config --quiet' "$external_log"
+grep -q 'docker-compose.external-db.yml .*docker-compose.shared-db.yml .*docker-compose.dns.yml up --build -d' "$external_log"
 if grep -q "$database_password\|$expected_database_url" "$tmpdir/external-output" "$external_log"; then
   printf '%s\n' 'installer leaked external database credentials' >&2
   exit 1
@@ -241,7 +270,26 @@ printf '\n\n' | env \
   PATH="$tmpdir/bin:$PATH" \
   MOCK_DOCKER_LOG="$external_rerun_log" \
   "$external_project/install.sh" > "$tmpdir/external-rerun-output" 2>&1
-grep -q 'docker-compose.external-db.yml .*docker-compose.shared-db.yml up --build -d' "$external_rerun_log"
+grep -q 'docker-compose.external-db.yml .*docker-compose.shared-db.yml .*docker-compose.dns.yml up --build -d' "$external_rerun_log"
+
+# 共享数据库网络也可继续使用 Docker/宿主机默认 DNS。
+external_default_dns_project=$(make_project external-shared-default-dns)
+cp "$external_env" "$external_default_dns_project/.env"
+sed -i \
+  -e 's/^SEARCHMELD_USE_CUSTOM_DNS=.*/SEARCHMELD_USE_CUSTOM_DNS=''false''/' \
+  -e 's/^SEARCHMELD_DNS_PRIMARY=.*/SEARCHMELD_DNS_PRIMARY=''''/' \
+  -e 's/^SEARCHMELD_DNS_SECONDARY=.*/SEARCHMELD_DNS_SECONDARY=''''/' \
+  "$external_default_dns_project/.env"
+external_default_dns_log="$tmpdir/external-default-dns-docker.log"
+printf '\n\n' | env \
+  PATH="$tmpdir/bin:$PATH" \
+  MOCK_DOCKER_LOG="$external_default_dns_log" \
+  "$external_default_dns_project/install.sh" > "$tmpdir/external-default-dns-output" 2>&1
+grep -q 'docker-compose.external-db.yml .*docker-compose.shared-db.yml up --build -d' "$external_default_dns_log"
+if grep -q 'docker-compose.dns.yml' "$external_default_dns_log"; then
+  printf '%s\n' 'shared database install unexpectedly enabled custom DNS' >&2
+  exit 1
+fi
 
 # 重新配置可从外部数据库切回内置数据库。
 switch_log="$tmpdir/switch-docker.log"
@@ -251,6 +299,7 @@ switch_log="$tmpdir/switch-docker.log"
   printf '\n'
   printf '\n'
   printf '\n'
+  printf '%s\n' n
   printf '\n'
 } | env \
   PATH="$tmpdir/bin:$PATH" \
@@ -259,6 +308,13 @@ switch_log="$tmpdir/switch-docker.log"
 grep -q "^SEARCHMELD_INSTALL_MODE='embedded'$" "$external_env"
 grep -q "^SEARCHMELD_USE_SHARED_DB_NETWORK='false'$" "$external_env"
 grep -q "^DATABASE_URL=''$" "$external_env"
+grep -q "^SEARCHMELD_USE_CUSTOM_DNS='false'$" "$external_env"
+grep -q "^SEARCHMELD_DNS_PRIMARY=''$" "$external_env"
+grep -q "^SEARCHMELD_DNS_SECONDARY=''$" "$external_env"
+if grep -q 'docker-compose.dns.yml' "$switch_log"; then
+  printf '%s\n' 'reconfigured embedded install kept custom DNS override' >&2
+  exit 1
+fi
 assert_env_nonempty "$external_env" POSTGRES_PASSWORD
 
 # 高级用户仍可在向导中粘贴完整 URL，但不能通过参数或环境变量注入。
@@ -275,14 +331,79 @@ database_url='postgres://one_search:secret@db.example.com:5432/one_search?sslmod
   printf '\n'
   printf '%s\n' n
   printf '\n'
+  printf '\n'
 } | env \
   PATH="$tmpdir/bin:$PATH" \
   MOCK_DOCKER_LOG="$url_log" \
   "$url_project/install.sh" > "$tmpdir/external-url-output" 2>&1
 grep -q "^DATABASE_URL='$database_url'$" "$url_project/.env"
 grep -q "^MCP_ENABLED='false'$" "$url_project/.env"
+grep -q "^SEARCHMELD_USE_CUSTOM_DNS='false'$" "$url_project/.env"
+if grep -q 'docker-compose.shared-db.yml\|docker-compose.dns.yml' "$url_log"; then
+  printf '%s\n' 'direct external install used an unexpected compose override' >&2
+  exit 1
+fi
 if grep -q "$database_url" "$tmpdir/external-url-output" "$url_log"; then
   printf '%s\n' 'installer leaked pasted DATABASE_URL' >&2
+  exit 1
+fi
+
+# 内置数据库模式启用自定义 DNS 时，只叠加 DNS Compose 文件。
+embedded_dns_project=$(make_project embedded-custom-dns)
+embedded_dns_log="$tmpdir/embedded-custom-dns-docker.log"
+{
+  printf '\n'
+  printf '\n'
+  printf '\n'
+  printf '\n'
+  printf '\n'
+  printf '%s\n' y
+  printf '%s\n' ::ffff:223.5.5.5
+  printf '%s\n' 0:0:0:0:0:ffff:df05:505
+  printf '%s\n' 2400:3200:baba::1
+  printf '\n'
+} | env \
+  PATH="$tmpdir/bin:$PATH" \
+  MOCK_DOCKER_LOG="$embedded_dns_log" \
+  "$embedded_dns_project/install.sh" > "$tmpdir/embedded-custom-dns-output" 2>&1
+grep -q "^SEARCHMELD_USE_CUSTOM_DNS='true'$" "$embedded_dns_project/.env"
+grep -q "^SEARCHMELD_DNS_PRIMARY='::ffff:223.5.5.5'$" "$embedded_dns_project/.env"
+grep -q '备用 DNS 不能与首选 DNS 相同' "$tmpdir/embedded-custom-dns-output"
+grep -q 'docker-compose.yml .*docker-compose.dns.yml config --quiet' "$embedded_dns_log"
+grep -q 'docker-compose.yml .*docker-compose.dns.yml up --build -d' "$embedded_dns_log"
+if grep -q 'docker-compose.external-db.yml\|docker-compose.shared-db.yml' "$embedded_dns_log"; then
+  printf '%s\n' 'embedded custom DNS install used external compose files' >&2
+  exit 1
+fi
+
+# 不加入共享网络的外部数据库模式也可单独叠加自定义 DNS。
+external_direct_dns_project=$(make_project external-direct-custom-dns)
+external_direct_dns_log="$tmpdir/external-direct-custom-dns-docker.log"
+external_direct_database_url='postgresql://one_search:secret@db.example.com:5432/one_search?sslmode=require'
+{
+  printf '%s\n' 2
+  printf '%s\n' n
+  printf '%s\n' 2
+  printf '%s\n' "$external_direct_database_url"
+  printf '\n'
+  printf '\n'
+  printf '\n'
+  printf '\n'
+  printf '%s\n' y
+  printf '%s\n' 223.5.5.5
+  printf '%s\n' 1.12.12.12
+  printf '\n'
+} | env \
+  PATH="$tmpdir/bin:$PATH" \
+  MOCK_DOCKER_LOG="$external_direct_dns_log" \
+  "$external_direct_dns_project/install.sh" > "$tmpdir/external-direct-custom-dns-output" 2>&1
+grep -q "^SEARCHMELD_INSTALL_MODE='external'$" "$external_direct_dns_project/.env"
+grep -q "^SEARCHMELD_USE_SHARED_DB_NETWORK='false'$" "$external_direct_dns_project/.env"
+grep -q "^SEARCHMELD_USE_CUSTOM_DNS='true'$" "$external_direct_dns_project/.env"
+grep -q 'docker-compose.external-db.yml .*docker-compose.dns.yml config --quiet' "$external_direct_dns_log"
+grep -q 'docker-compose.external-db.yml .*docker-compose.dns.yml up --build -d' "$external_direct_dns_log"
+if grep -q 'docker-compose.shared-db.yml' "$external_direct_dns_log"; then
+  printf '%s\n' 'direct external custom DNS install used shared database compose' >&2
   exit 1
 fi
 
@@ -296,7 +417,7 @@ fi
 
 # 用户在最终确认时取消，不应创建 .env。
 cancel_project=$(make_project cancel)
-if printf '\n\n\n\n\nn\n' | env \
+if printf '\n\n\n\n\n\nn\n' | env \
   PATH="$tmpdir/bin:$PATH" MOCK_DOCKER_LOG="$tmpdir/cancel-docker.log" \
   "$cancel_project/install.sh" >/dev/null 2>&1; then
   printf '%s\n' 'installer returned success after cancellation' >&2

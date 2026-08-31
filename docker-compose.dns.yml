@@ -1,0 +1,5 @@
+services:
+  app:
+    dns:
+      - ${SEARCHMELD_DNS_PRIMARY:?custom DNS primary is required}
+      - ${SEARCHMELD_DNS_SECONDARY:?custom DNS secondary is required}
