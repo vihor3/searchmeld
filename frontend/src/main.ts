@@ -3,6 +3,7 @@ import { createPinia } from 'pinia'
 import { ElAlert } from 'element-plus/es/components/alert/index'
 import { ElButton } from 'element-plus/es/components/button/index'
 import { ElCard } from 'element-plus/es/components/card/index'
+import { ElCheckboxButton, ElCheckboxGroup } from 'element-plus/es/components/checkbox/index'
 import { ElCol } from 'element-plus/es/components/col/index'
 import { ElCollapse, ElCollapseItem } from 'element-plus/es/components/collapse/index'
 import { ElAside, ElContainer, ElMain } from 'element-plus/es/components/container/index'
@@ -35,6 +36,8 @@ const app = createApp(App)
   ElAside,
   ElButton,
   ElCard,
+  ElCheckboxButton,
+  ElCheckboxGroup,
   ElCol,
   ElCollapse,
   ElCollapseItem,
