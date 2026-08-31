@@ -23,3 +23,11 @@ coverage/
 .pi-subagents/
 docs/*
 !docs/extract.md
+
+# local Trellis / AI-agent workspace (never commit)
+/.trellis/
+/.agents/
+/.codex/
+/.claude/
+/AGENTS.md
+/.gitattributes
