@@ -1,6 +1,8 @@
-# One Search
+# SearchMeld
 
 自托管 Web Search / Extract API 中转与聚合网关。
+
+SearchMeld 是基于 One Search 演进的独立项目，不属于 GitHub fork network，也不会自动合并上游代码；后续更新会先审查，再按需选择性引入。具体流程见 [UPSTREAM.md](UPSTREAM.md)。
 
 统一接入 Exa、You.com、Jina、Tavily、Firecrawl、Serper、Brave，提供：
 
@@ -25,8 +27,8 @@
 一键安装脚本不需要设置环境变量，也不接受安装参数。直接运行：
 
 ```bash
-git clone https://github.com/CncCbz/one-search.git
-cd one-search
+git clone https://github.com/vihor3/searchmeld.git
+cd searchmeld
 ./install.sh
 ```
 
@@ -49,11 +51,25 @@ cd one-search
 
 已有持久化密码、`ENCRYPTION_KEY`、内置 PostgreSQL Volume 和外部数据库连接不会在更新时被静默替换。
 
+### 从 One Search 迁移
+
+现有源码安装可以保留原目录名、`.env`、数据库和 Docker Volume，只把 Git 远端切换到 SearchMeld：
+
+```bash
+git remote set-url origin https://github.com/vihor3/searchmeld.git
+git fetch origin
+git switch main
+git merge --ff-only origin/main
+./install.sh
+```
+
+安装脚本继续识别旧版 `ONE_SEARCH_INSTALL_MODE`、`ONE_SEARCH_USE_SHARED_DB_NETWORK` 和代理变量；重新运行配置向导后会写入新的 `SEARCHMELD_*` 安装键。已有 `osr_` Token、`one_search` 数据库和管理台登录数据不需要重建。
+
 ### 手动安装
 
 ```bash
-git clone https://github.com/CncCbz/one-search.git
-cd one-search
+git clone https://github.com/vihor3/searchmeld.git
+cd searchmeld
 cp .env.example .env
 ```
 
@@ -77,6 +93,8 @@ curl http://localhost:5173/healthz
 后端原生读取 `DATABASE_URL`。`external` 镜像默认使用外部数据库，不会初始化本地数据目录或覆盖连接串；`all-in-one` 镜像默认仍使用内置数据库，避免升级时被 `.env` 中遗留的开发连接串意外切换。外部数据库要求 PostgreSQL 15+，因为迁移使用了 `UNIQUE NULLS NOT DISTINCT`。
 
 先创建项目专用账号和数据库，确保该账号拥有目标数据库及 schema，能够执行建表、索引和后续迁移：
+
+为保证已有 One Search 部署可以无损升级，默认数据库名和用户名暂时保留为 `one_search`；新部署可以自行替换。
 
 ```sql
 CREATE ROLE one_search LOGIN;
@@ -116,10 +134,10 @@ docker compose -f docker-compose.external-db.yml up --build -d
 
 ```bash
 # 轻量镜像：必须提供 DATABASE_URL 或 DATABASE_URL_FILE
-docker build --target external -t one-search:external .
+docker build --target external -t searchmeld:external .
 
-# 原有一体化镜像：默认目标和默认 embedded 模式
-docker build --target all-in-one -t one-search:all-in-one .
+# 一体化镜像：默认目标和默认 embedded 模式
+docker build --target all-in-one -t searchmeld:all-in-one .
 ```
 
 `all-in-one` 镜像也保留了连接外部数据库的能力，但必须显式传入 `DATABASE_MODE=external` 和 `DATABASE_URL`；它仍然包含 PostgreSQL 软件及数据卷声明。希望镜像和运行配置都不包含内置数据库时，请使用 `external` 构建目标或专用 Compose 文件。
@@ -143,7 +161,7 @@ docker build --target all-in-one -t one-search:all-in-one .
 - Serper 没有公开余额接口，按注册赠送的 2500 credits 减本实例全生命周期累计 credits 估算，不会按月重置。
 - Brave 从正常搜索响应的 `X-RateLimit-*` headers 被动保存额度快照；点击查询不会额外发起一次收费搜索，没有快照时显示本地累计请求数。
 
-本地统计只覆盖经过当前 One Search 数据库记录的调用，无法感知同一个上游 Key 在其它客户端中的消费；这类结果会在管理台标记为“本地”或“本地估算”。
+本地统计只覆盖经过当前 SearchMeld 数据库记录的调用，无法感知同一个上游 Key 在其它客户端中的消费；这类结果会在管理台标记为“本地”或“本地估算”。
 
 ## 使用
 
@@ -219,21 +237,21 @@ curl http://localhost:5173/mcp
 ### Codex
 
 ```bash
-export ONE_SEARCH_API_TOKEN=osr_xxx
+export SEARCHMELD_API_TOKEN=osr_xxx
 ```
 
 写入 `~/.codex/config.toml`：
 
 ```toml
-[mcp_servers.one_search]
+[mcp_servers.searchmeld]
 url = "http://localhost:5173/mcp"
-bearer_token_env_var = "ONE_SEARCH_API_TOKEN"
+bearer_token_env_var = "SEARCHMELD_API_TOKEN"
 enabled = true
 tool_timeout_sec = 60
 enabled_tools = ["search", "extract"]
 ```
 
-启动 Codex 后输入 `/mcp`，应能看到 `one_search` 的 `search` 和 `extract`。
+启动 Codex 后输入 `/mcp`，应能看到 `searchmeld` 的 `search` 和 `extract`。
 
 ### Claude Desktop / 通用 HTTP MCP
 
@@ -257,6 +275,8 @@ enabled_tools = ["search", "extract"]
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `HOST_PORT` | `5173` | 宿主机端口 |
+| `SEARCHMELD_INSTALL_MODE` | `embedded` | 安装脚本记录的数据库模式；通常由向导维护 |
+| `SEARCHMELD_USE_SHARED_DB_NETWORK` | `false` | 安装脚本是否组合共享数据库网络配置 |
 | `POSTGRES_PASSWORD` | — | 使用内置 PostgreSQL 时**必填**；外部数据库模式不需要 |
 | `DATABASE_URL` | 空 | 外部 Compose 或容器直接运行时使用的 PostgreSQL 连接串 |
 | `DATABASE_MODE` | 取决于镜像 | `all-in-one` 默认 `embedded`，`external` 默认 `external`；一体化镜像切外部库时须显式设为 `external` |
@@ -284,7 +304,7 @@ enabled_tools = ["search", "extract"]
 | `ADMIN_SESSION_TTL_HOURS` | `24` | 管理 Session 时长 |
 | `ADMIN_LOGIN_MAX_ATTEMPTS` 等 | 5 / 5min / 15min | 登录限速与锁定 |
 | `VITE_API_BASE` | 空 | 前后端分离开发时指向后端 |
-| `ONE_SEARCH_HTTP(S)_PROXY` | 空 | 容器访问上游时的代理 |
+| `SEARCHMELD_HTTP(S)_PROXY` | 空 | 容器访问上游时的代理；兼容旧版 `ONE_SEARCH_HTTP(S)_PROXY` |
 
 公网请在前面加 HTTPS 反代，转发 `/`、`/api/`、`/v1/`、`/healthz`（以及 `/mcp`）。
 
@@ -292,7 +312,7 @@ enabled_tools = ["search", "extract"]
 
 ```bash
 # DB
-docker run -d --name one-search-postgres \
+docker run -d --name searchmeld-postgres \
   -e POSTGRES_DB=one_search -e POSTGRES_USER=one_search -e POSTGRES_PASSWORD=one_search \
   -p 15432:5432 postgres:16-alpine
 
@@ -321,7 +341,7 @@ docs/        接口文档
 
 ## License
 
-[Apache License 2.0](LICENSE) © 2026 CncCbz
+[Apache License 2.0](LICENSE)。SearchMeld 保留原项目版权与许可证声明，并在 [NOTICE](NOTICE) 中记录来源和独立修改关系。
 
 ## 致谢
 

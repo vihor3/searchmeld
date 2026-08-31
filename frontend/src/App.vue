@@ -2,9 +2,9 @@
   <router-view v-if="$route.path === '/login'" />
   <div v-else class="app-shell">
     <aside class="float-nav" aria-label="主导航">
-      <router-link class="float-brand" to="/playground" title="One Search">
+      <router-link class="float-brand" to="/playground" title="SearchMeld">
         <img class="float-mark" src="/icon-192.png" alt="" width="28" height="28" />
-        <strong>One Search</strong>
+        <strong>SearchMeld</strong>
       </router-link>
 
       <el-menu router :default-active="activeMenu" class="float-menu">

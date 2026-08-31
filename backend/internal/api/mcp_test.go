@@ -10,9 +10,9 @@ import (
 	"testing"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/one-search/one-search/backend/internal/model"
-	"github.com/one-search/one-search/backend/internal/provider"
-	"github.com/one-search/one-search/backend/internal/search"
+	"github.com/vihor3/searchmeld/backend/internal/model"
+	"github.com/vihor3/searchmeld/backend/internal/provider"
+	"github.com/vihor3/searchmeld/backend/internal/search"
 )
 
 func TestMCPStreamableHTTPHandshakeAndListTools(t *testing.T) {
@@ -62,7 +62,7 @@ func TestMCPStreamableHTTPHandshakeAndListTools(t *testing.T) {
 	if initResp.JSONRPC != "2.0" || initResp.ID != 1 || initResp.Result.ProtocolVersion != "2025-06-18" {
 		t.Fatalf("unexpected initialize response: %+v", initResp)
 	}
-	if initResp.Result.ServerInfo.Name != "one-search-relay" || initResp.Result.ServerInfo.Version == "" {
+	if initResp.Result.ServerInfo.Name != "searchmeld" || initResp.Result.ServerInfo.Version == "" {
 		t.Fatalf("unexpected serverInfo: %+v", initResp.Result.ServerInfo)
 	}
 	if initResp.Result.Capabilities.Tools == nil {

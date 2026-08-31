@@ -10,9 +10,9 @@ import (
 
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
-	"github.com/one-search/one-search/backend/internal/billing"
-	"github.com/one-search/one-search/backend/internal/model"
-	"github.com/one-search/one-search/backend/internal/security"
+	"github.com/vihor3/searchmeld/backend/internal/billing"
+	"github.com/vihor3/searchmeld/backend/internal/model"
+	"github.com/vihor3/searchmeld/backend/internal/security"
 )
 
 type Store struct {

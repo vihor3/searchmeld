@@ -5,7 +5,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/one-search/one-search/backend/internal/config"
+	"github.com/vihor3/searchmeld/backend/internal/config"
 )
 
 type Server struct {

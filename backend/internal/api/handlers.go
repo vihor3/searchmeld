@@ -14,10 +14,10 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/one-search/one-search/backend/internal/compat"
-	"github.com/one-search/one-search/backend/internal/model"
-	"github.com/one-search/one-search/backend/internal/provider"
-	"github.com/one-search/one-search/backend/internal/search"
+	"github.com/vihor3/searchmeld/backend/internal/compat"
+	"github.com/vihor3/searchmeld/backend/internal/model"
+	"github.com/vihor3/searchmeld/backend/internal/provider"
+	"github.com/vihor3/searchmeld/backend/internal/search"
 )
 
 type AppStore interface {

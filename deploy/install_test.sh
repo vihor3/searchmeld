@@ -58,7 +58,7 @@ case "$command_name" in
     esac
     ;;
   symbolic-ref) printf '%s\n' main ;;
-  remote) printf '%s\n' https://example.invalid/one-search.git ;;
+  remote) printf '%s\n' https://example.invalid/searchmeld.git ;;
   status)
     if [ -f "$project/.mock-git-dirty" ]; then
       printf '%s\n' ' M install.sh'
@@ -99,7 +99,9 @@ embedded_log="$tmpdir/embedded-docker.log"
 printf '\n\n\n\n\n\n' | env \
   PATH="$tmpdir/bin:$PATH" \
   MOCK_DOCKER_LOG="$embedded_log" \
+  SEARCHMELD_INSTALL_MODE=external \
   ONE_SEARCH_INSTALL_MODE=external \
+  ONE_SEARCH_USE_SHARED_DB_NETWORK=true \
   DATABASE_URL='postgresql://ignored:ignored@ignored:5432/ignored' \
   HOST_PORT=65500 \
   "$embedded_project/install.sh" > "$tmpdir/embedded-output" 2>&1
@@ -108,7 +110,7 @@ embedded_env="$embedded_project/.env"
 assert_env_nonempty "$embedded_env" POSTGRES_PASSWORD
 assert_env_nonempty "$embedded_env" ADMIN_PASSWORD
 assert_env_nonempty "$embedded_env" ENCRYPTION_KEY
-grep -q "^ONE_SEARCH_INSTALL_MODE='embedded'$" "$embedded_env"
+grep -q "^SEARCHMELD_INSTALL_MODE='embedded'$" "$embedded_env"
 grep -q "^HOST_PORT='5173'$" "$embedded_env"
 grep -q 'compose .*docker-compose.yml up --build -d' "$embedded_log"
 if grep -q 'docker-compose.external-db.yml' "$embedded_log"; then
@@ -127,6 +129,21 @@ encryption_after=$(grep '^ENCRYPTION_KEY=' "$embedded_env")
   printf '%s\n' 'rerun replaced ENCRYPTION_KEY' >&2
   exit 1
 }
+
+# 旧版 One Search 的安装模式键仍可直接用于重建，不要求用户先手工迁移 .env。
+legacy_project=$(make_project legacy-config)
+cp "$embedded_env" "$legacy_project/.env"
+sed -i \
+  -e 's/^SEARCHMELD_INSTALL_MODE=/ONE_SEARCH_INSTALL_MODE=/' \
+  -e 's/^SEARCHMELD_USE_SHARED_DB_NETWORK=/ONE_SEARCH_USE_SHARED_DB_NETWORK=/' \
+  "$legacy_project/.env"
+legacy_log="$tmpdir/legacy-docker.log"
+printf '\n\n' | env \
+  PATH="$tmpdir/bin:$PATH" \
+  MOCK_DOCKER_LOG="$legacy_log" \
+  "$legacy_project/install.sh" > "$tmpdir/legacy-output" 2>&1
+grep -q 'compose .*docker-compose.yml up --build -d' "$legacy_log"
+grep -q "^ONE_SEARCH_INSTALL_MODE='embedded'$" "$legacy_project/.env"
 
 # Git 安装目录可选择从当前分支的 upstream 快进更新；先构建，再切换服务。
 update_project=$(make_project update)
@@ -207,8 +224,8 @@ expected_database_url='postgresql://one_search:s%40cr%20et%2F%23%3F@shared-postg
 
 external_env="$external_project/.env"
 grep -q "^DATABASE_URL='$expected_database_url'$" "$external_env"
-grep -q "^ONE_SEARCH_INSTALL_MODE='external'$" "$external_env"
-grep -q "^ONE_SEARCH_USE_SHARED_DB_NETWORK='true'$" "$external_env"
+grep -q "^SEARCHMELD_INSTALL_MODE='external'$" "$external_env"
+grep -q "^SEARCHMELD_USE_SHARED_DB_NETWORK='true'$" "$external_env"
 grep -q "^HOST_PORT='5180'$" "$external_env"
 grep -q '^network create --internal shared-db$' "$external_log"
 grep -q 'docker-compose.external-db.yml .*docker-compose.shared-db.yml config --quiet' "$external_log"
@@ -239,8 +256,8 @@ switch_log="$tmpdir/switch-docker.log"
   PATH="$tmpdir/bin:$PATH" \
   MOCK_DOCKER_LOG="$switch_log" \
   "$external_project/install.sh" > "$tmpdir/switch-output" 2>&1
-grep -q "^ONE_SEARCH_INSTALL_MODE='embedded'$" "$external_env"
-grep -q "^ONE_SEARCH_USE_SHARED_DB_NETWORK='false'$" "$external_env"
+grep -q "^SEARCHMELD_INSTALL_MODE='embedded'$" "$external_env"
+grep -q "^SEARCHMELD_USE_SHARED_DB_NETWORK='false'$" "$external_env"
 grep -q "^DATABASE_URL=''$" "$external_env"
 assert_env_nonempty "$external_env" POSTGRES_PASSWORD
 
@@ -309,5 +326,16 @@ if env PATH="$tmpdir/bin:$PATH" MOCK_DOCKER_LOG="$tmpdir/duplicate-docker.log" \
   printf '%s\n' 'installer accepted duplicate managed keys' >&2
   exit 1
 fi
+
+# 新旧品牌键同时存在但值不一致时拒绝猜测，避免使用错误的数据库模式。
+conflict_project=$(make_project conflicting-brand-keys)
+cp "$embedded_env" "$conflict_project/.env"
+printf "%s\n" "ONE_SEARCH_INSTALL_MODE='external'" >> "$conflict_project/.env"
+if env PATH="$tmpdir/bin:$PATH" MOCK_DOCKER_LOG="$tmpdir/conflict-docker.log" \
+  "$conflict_project/install.sh" > "$tmpdir/conflict-output" 2>&1; then
+  printf '%s\n' 'installer accepted conflicting SearchMeld and One Search keys' >&2
+  exit 1
+fi
+grep -q 'SEARCHMELD_INSTALL_MODE 与旧版 ONE_SEARCH_INSTALL_MODE 冲突' "$tmpdir/conflict-output"
 
 printf '%s\n' 'installer tests passed'

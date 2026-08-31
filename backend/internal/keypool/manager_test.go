@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/one-search/one-search/backend/internal/model"
-	"github.com/one-search/one-search/backend/internal/provider"
+	"github.com/vihor3/searchmeld/backend/internal/model"
+	"github.com/vihor3/searchmeld/backend/internal/provider"
 )
 
 type fakeStore struct {

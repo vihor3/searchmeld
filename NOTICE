@@ -1,0 +1,10 @@
+SearchMeld
+Copyright 2026 SearchMeld contributors
+
+This product is an independent derivative of One Search, originally
+copyright 2026 CncCbz and licensed under the Apache License, Version 2.0.
+
+SearchMeld retains the original license and copyright notices. Changes made
+for SearchMeld include multi-provider extraction, external PostgreSQL support,
+interactive installation and updates, quota and token management improvements,
+Tavily compatibility, and independent branding and release management.

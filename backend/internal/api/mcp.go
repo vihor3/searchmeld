@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/one-search/one-search/backend/internal/model"
+	"github.com/vihor3/searchmeld/backend/internal/model"
 )
 
 const (
@@ -428,11 +428,11 @@ func mcpInitializeResult(params json.RawMessage) map[string]interface{} {
 			"prompts":   map[string]interface{}{"listChanged": false},
 		},
 		"serverInfo": map[string]interface{}{
-			"name":    "one-search-relay",
-			"title":   "One Search Relay",
+			"name":    "searchmeld",
+			"title":   "SearchMeld",
 			"version": "0.1.0",
 		},
-		"instructions": "Use tools/call with search for web search or extract to fetch content from known URLs through configured One Search Relay providers.",
+		"instructions": "Use tools/call with search for web search or extract to fetch content from known URLs through configured SearchMeld providers.",
 	}
 }
 
@@ -457,8 +457,8 @@ func negotiateMCPProtocolVersion(params json.RawMessage) string {
 func mcpSearchToolSchema() map[string]interface{} {
 	return map[string]interface{}{
 		"name":        "search",
-		"title":       "One Search",
-		"description": "Search the web through configured One Search Relay providers.",
+		"title":       "SearchMeld",
+		"description": "Search the web through configured SearchMeld providers.",
 		"inputSchema": map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -503,7 +503,7 @@ func mcpSearchToolSchema() map[string]interface{} {
 			"required": []string{"query"},
 		},
 		"annotations": map[string]interface{}{
-			"title":         "One Search",
+			"title":         "SearchMeld",
 			"readOnlyHint":  true,
 			"openWorldHint": true,
 		},
@@ -513,8 +513,8 @@ func mcpSearchToolSchema() map[string]interface{} {
 func mcpExtractToolSchema() map[string]interface{} {
 	return map[string]interface{}{
 		"name":        "extract",
-		"title":       "One Search Extract",
-		"description": "Extract page content from known URLs through configured One Search Relay providers.",
+		"title":       "SearchMeld Extract",
+		"description": "Extract page content from known URLs through configured SearchMeld providers.",
 		"inputSchema": map[string]interface{}{
 			"type": "object",
 			"dependentRequired": map[string]interface{}{
@@ -575,7 +575,7 @@ func mcpExtractToolSchema() map[string]interface{} {
 			"required": []string{"urls"},
 		},
 		"annotations": map[string]interface{}{
-			"title":         "One Search Extract",
+			"title":         "SearchMeld Extract",
 			"readOnlyHint":  true,
 			"openWorldHint": true,
 		},

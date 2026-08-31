@@ -1,6 +1,6 @@
 # Extract 接口
 
-One Search Relay 的 Extract 是“给定 URL，返回页面正文”的独立能力，不会先把 URL 当关键词执行搜索。它复用现有的 API Token、Provider Key 池、换 Key 重试、超时、代理、调用日志和用量统计。
+SearchMeld 的 Extract 是“给定 URL，返回页面正文”的独立能力，不会先把 URL 当关键词执行搜索。它复用现有的 API Token、Provider Key 池、换 Key 重试、超时、代理、调用日志和用量统计。
 
 ## 支持的 Provider
 
@@ -69,7 +69,7 @@ Jina Reader 和 Firecrawl 的上游接口一次只处理一个 URL。网关会�
 
 Extract 默认不写搜索缓存，确保每次向上游获取当前页面内容。
 
-为避免批量页面把网关内存或 PostgreSQL 日志撑爆，响应有明确大小预算：单条正文最多 512 KiB，单次原生响应的正文合计最多 8 MiB，最终 JSON 最多约 12 MiB；超过时会按各结果公平缩减，并在原生/MCP 结果中设置 `content_truncated: true`，同时在 `meta.response_truncated` 汇总标记。单条 `raw` 超过 64 KiB 时会替换为截断标记并设置 `raw_truncated: true`；图片列表也受数量和总字节限制，并通过 `images_truncated` 标记。Tavily 兼容响应保持其字段结构，因此只返回已受预算约束的 `raw_content`，不会额外加入这些 One Search 扩展标记。请求日志只保存更短的正文/图片预览，单条 Extract 日志 JSON 另有 4 MiB 硬上限。
+为避免批量页面把网关内存或 PostgreSQL 日志撑爆，响应有明确大小预算：单条正文最多 512 KiB，单次原生响应的正文合计最多 8 MiB，最终 JSON 最多约 12 MiB；超过时会按各结果公平缩减，并在原生/MCP 结果中设置 `content_truncated: true`，同时在 `meta.response_truncated` 汇总标记。单条 `raw` 超过 64 KiB 时会替换为截断标记并设置 `raw_truncated: true`；图片列表也受数量和总字节限制，并通过 `images_truncated` 标记。Tavily 兼容响应保持其字段结构，因此只返回已受预算约束的 `raw_content`，不会额外加入这些 SearchMeld 扩展标记。请求日志只保存更短的正文/图片预览，单条 Extract 日志 JSON 另有 4 MiB 硬上限。
 
 ### 响应
 
@@ -160,7 +160,7 @@ curl -X POST http://localhost:5173/v1/compat/tavily/extract \
 | `include_favicon` | boolean | 请求 favicon URL。 |
 | `timeout` | number | 1–60 秒，可以使用小数。它会传给 Tavily，并限制整个兼容请求（包括走其它 Provider 的 fallback）；网关会额外保留少量 HTTP 收尾时间。 |
 | `include_usage` | boolean | 为 `true` 时在响应中加入 `usage.credits`；为 `false` 或省略时不返回 `usage`。 |
-| `providers` / `mode` | string[] / string | One Search Relay 扩展，用于控制渠道和编排模式。 |
+| `providers` / `mode` | string[] / string | SearchMeld 扩展，用于控制渠道和编排模式。 |
 
 响应字段为 Tavily 风格的 `results[].raw_content`、`failed_results`、`response_time` 和 `request_id`。`include_usage=true` 时还会返回本次各上游 credit 计量之和；无法提供 credit 计量的渠道不会凭空估算。
 

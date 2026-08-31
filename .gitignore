@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+.searchmeld-install.lock/
 .one-search-install.lock/
 
 # logs / os junk
@@ -10,6 +11,7 @@
 
 # backend build artifacts
 backend/one-search
+backend/searchmeld
 backend/tmp/
 
 # frontend

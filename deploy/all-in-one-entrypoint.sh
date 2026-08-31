@@ -73,7 +73,9 @@ load_database_url() {
 }
 
 select_database_mode() {
-  requested_mode=$(printf '%s' "${DATABASE_MODE:-${ONE_SEARCH_DEFAULT_DATABASE_MODE:-auto}}" | tr '[:upper:]' '[:lower:]')
+  default_database_mode=${SEARCHMELD_DEFAULT_DATABASE_MODE:-${ONE_SEARCH_DEFAULT_DATABASE_MODE:-auto}}
+  embedded_postgres=${SEARCHMELD_EMBEDDED_POSTGRES:-${ONE_SEARCH_EMBEDDED_POSTGRES:-false}}
+  requested_mode=$(printf '%s' "${DATABASE_MODE:-$default_database_mode}" | tr '[:upper:]' '[:lower:]')
   case "$requested_mode" in
     external)
       load_database_url
@@ -84,7 +86,7 @@ select_database_mode() {
       database_mode="external"
       ;;
     embedded)
-      if [ "${ONE_SEARCH_EMBEDDED_POSTGRES:-false}" != "true" ]; then
+      if [ "$embedded_postgres" != "true" ]; then
         log "DATABASE_MODE=embedded requires the all-in-one image"
         exit 1
       fi
@@ -97,7 +99,7 @@ select_database_mode() {
       load_database_url
       if [ -n "${DATABASE_URL:-}" ]; then
         database_mode="external"
-      elif [ "${ONE_SEARCH_EMBEDDED_POSTGRES:-false}" = "true" ]; then
+      elif [ "$embedded_postgres" = "true" ]; then
         database_mode="embedded"
       else
         log "DATABASE_URL or DATABASE_URL_FILE is required by the external image"
@@ -210,7 +212,7 @@ start_backend() {
   export MCP_ENABLED="${MCP_ENABLED:-false}"
   export MCP_PATH="${MCP_PATH:-/mcp}"
   export CORS_ALLOWED_ORIGINS="${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:8080}"
-  export UPSTREAM_USER_AGENT="${UPSTREAM_USER_AGENT:-OneSearchRelay/0.1}"
+  export UPSTREAM_USER_AGENT="${UPSTREAM_USER_AGENT:-SearchMeld/0.1}"
   export REQUEST_TIMEOUT_MS="${REQUEST_TIMEOUT_MS:-20000}"
   if [ "$database_mode" = "embedded" ]; then
     database_user=$(escape_conninfo_value "$POSTGRES_USER")
@@ -220,7 +222,7 @@ start_backend() {
   fi
 
   log "starting backend on ${HTTP_ADDR} with ${database_mode} database"
-  /usr/local/bin/one-search &
+  /usr/local/bin/searchmeld &
   backend_pid=$!
 
   wait_for_backend
@@ -250,7 +252,7 @@ main() {
   start_backend
   start_nginx
 
-  log "one-search stack is ready"
+  log "SearchMeld stack is ready"
 
   while true; do
     if [ "$database_mode" = "embedded" ] && ! kill -0 "$postgres_pid" 2>/dev/null; then
@@ -269,6 +271,6 @@ main() {
   done
 }
 
-if [ "${ONE_SEARCH_ENTRYPOINT_SKIP_MAIN:-false}" != "true" ]; then
+if [ "${SEARCHMELD_ENTRYPOINT_SKIP_MAIN:-${ONE_SEARCH_ENTRYPOINT_SKIP_MAIN:-false}}" != "true" ]; then
   main "$@"
 fi

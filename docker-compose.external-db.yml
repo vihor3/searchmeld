@@ -17,14 +17,14 @@ services:
       MCP_ENABLED: ${MCP_ENABLED:-false}
       MCP_PATH: ${MCP_PATH:-/mcp}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:8080}
-      HTTP_PROXY: ${ONE_SEARCH_HTTP_PROXY:-}
-      HTTPS_PROXY: ${ONE_SEARCH_HTTPS_PROXY:-}
-      ALL_PROXY: ${ONE_SEARCH_ALL_PROXY:-}
-      NO_PROXY: ${ONE_SEARCH_NO_PROXY:-localhost,127.0.0.1,::1,shared-postgres}
-      http_proxy: ${ONE_SEARCH_HTTP_PROXY:-}
-      https_proxy: ${ONE_SEARCH_HTTPS_PROXY:-}
-      all_proxy: ${ONE_SEARCH_ALL_PROXY:-}
-      no_proxy: ${ONE_SEARCH_NO_PROXY:-localhost,127.0.0.1,::1,shared-postgres}
+      HTTP_PROXY: ${SEARCHMELD_HTTP_PROXY:-${ONE_SEARCH_HTTP_PROXY:-}}
+      HTTPS_PROXY: ${SEARCHMELD_HTTPS_PROXY:-${ONE_SEARCH_HTTPS_PROXY:-}}
+      ALL_PROXY: ${SEARCHMELD_ALL_PROXY:-${ONE_SEARCH_ALL_PROXY:-}}
+      NO_PROXY: ${SEARCHMELD_NO_PROXY:-${ONE_SEARCH_NO_PROXY:-localhost,127.0.0.1,::1,shared-postgres}}
+      http_proxy: ${SEARCHMELD_HTTP_PROXY:-${ONE_SEARCH_HTTP_PROXY:-}}
+      https_proxy: ${SEARCHMELD_HTTPS_PROXY:-${ONE_SEARCH_HTTPS_PROXY:-}}
+      all_proxy: ${SEARCHMELD_ALL_PROXY:-${ONE_SEARCH_ALL_PROXY:-}}
+      no_proxy: ${SEARCHMELD_NO_PROXY:-${ONE_SEARCH_NO_PROXY:-localhost,127.0.0.1,::1,shared-postgres}}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:

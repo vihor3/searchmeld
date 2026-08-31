@@ -5,7 +5,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/one-search/one-search/backend/internal/model"
+	"github.com/vihor3/searchmeld/backend/internal/model"
 )
 
 func TestTavilyExtractRequestAcceptsSingleOrMultipleURLs(t *testing.T) {

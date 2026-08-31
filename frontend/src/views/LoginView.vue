@@ -1,8 +1,8 @@
 <template>
   <div class="login-page">
     <el-card class="login-card soft-card" shadow="never">
-      <img class="login-logo" src="/icon-192.png" alt="One Search" width="52" height="52" />
-      <h2>One Search</h2>
+      <img class="login-logo" src="/icon-192.png" alt="SearchMeld" width="52" height="52" />
+      <h2>SearchMeld</h2>
       <p class="muted">搜索中转控制台</p>
       <el-form label-position="top" @submit.prevent="login">
         <el-form-item label="用户名"><el-input v-model="form.username" /></el-form-item>

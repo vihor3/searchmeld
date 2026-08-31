@@ -19,7 +19,11 @@ unset \
   APP_ENV POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD DATABASE_URL \
   DATABASE_URL_FILE DATABASE_MODE DATABASE_DOCKER_NETWORK RUN_MIGRATIONS \
   ADMIN_USERNAME ADMIN_PASSWORD ENCRYPTION_KEY API_AUTH_REQUIRED MCP_ENABLED \
-  MCP_PATH CORS_ALLOWED_ORIGINS HOST_PORT ONE_SEARCH_INSTALL_MODE \
+  MCP_PATH CORS_ALLOWED_ORIGINS HOST_PORT SEARCHMELD_INSTALL_MODE \
+  SEARCHMELD_USE_SHARED_DB_NETWORK SEARCHMELD_HTTP_PROXY \
+  SEARCHMELD_HTTPS_PROXY SEARCHMELD_ALL_PROXY SEARCHMELD_NO_PROXY \
+  SEARCHMELD_PROJECT_DIR SEARCHMELD_ENV_FILE SEARCHMELD_DATABASE_URL_FILE \
+  SEARCHMELD_INSTALL_HEALTH_TIMEOUT ONE_SEARCH_INSTALL_MODE \
   ONE_SEARCH_USE_SHARED_DB_NETWORK ONE_SEARCH_HTTP_PROXY \
   ONE_SEARCH_HTTPS_PROXY ONE_SEARCH_ALL_PROXY ONE_SEARCH_NO_PROXY \
   ONE_SEARCH_PROJECT_DIR ONE_SEARCH_ENV_FILE ONE_SEARCH_DATABASE_URL_FILE \
@@ -61,6 +65,17 @@ get_env_value() {
   printf '%s' "$raw"
 }
 
+get_compat_env_value() {
+  primary_key="$1"
+  legacy_key="$2"
+  primary_value=$(get_env_value "$primary_key")
+  if [ -n "$primary_value" ]; then
+    printf '%s' "$primary_value"
+    return
+  fi
+  get_env_value "$legacy_key"
+}
+
 validate_env_value() {
   key="$1"
   value="$2"
@@ -87,7 +102,7 @@ write_configuration() {
   fi
   awk '
     BEGIN {
-      split("ONE_SEARCH_INSTALL_MODE ONE_SEARCH_USE_SHARED_DB_NETWORK HOST_PORT POSTGRES_PASSWORD DATABASE_URL DATABASE_DOCKER_NETWORK ADMIN_USERNAME ADMIN_PASSWORD ENCRYPTION_KEY API_AUTH_REQUIRED MCP_ENABLED", items, " ")
+      split("SEARCHMELD_INSTALL_MODE SEARCHMELD_USE_SHARED_DB_NETWORK ONE_SEARCH_INSTALL_MODE ONE_SEARCH_USE_SHARED_DB_NETWORK HOST_PORT POSTGRES_PASSWORD DATABASE_URL DATABASE_DOCKER_NETWORK ADMIN_USERNAME ADMIN_PASSWORD ENCRYPTION_KEY API_AUTH_REQUIRED MCP_ENABLED", items, " ")
       for (item_index in items) managed[items[item_index]] = 1
     }
     $0 == "# --- install.sh managed values ---" { next }
@@ -99,8 +114,8 @@ write_configuration() {
   ' "$source_file" > "$active_tmp_file"
 
   printf '\n%s\n' '# --- install.sh managed values ---' >> "$active_tmp_file"
-  write_env_line ONE_SEARCH_INSTALL_MODE "$install_mode"
-  write_env_line ONE_SEARCH_USE_SHARED_DB_NETWORK "$use_database_network"
+  write_env_line SEARCHMELD_INSTALL_MODE "$install_mode"
+  write_env_line SEARCHMELD_USE_SHARED_DB_NETWORK "$use_database_network"
   write_env_line HOST_PORT "$host_port"
   write_env_line POSTGRES_PASSWORD "$postgres_password"
   write_env_line DATABASE_URL "$database_url"
@@ -118,6 +133,7 @@ write_configuration() {
 
 validate_env_file() {
   for key in \
+    SEARCHMELD_INSTALL_MODE SEARCHMELD_USE_SHARED_DB_NETWORK \
     ONE_SEARCH_INSTALL_MODE ONE_SEARCH_USE_SHARED_DB_NETWORK HOST_PORT \
     POSTGRES_PASSWORD DATABASE_URL DATABASE_DOCKER_NETWORK ADMIN_USERNAME \
     ADMIN_PASSWORD ENCRYPTION_KEY API_AUTH_REQUIRED MCP_ENABLED
@@ -127,6 +143,17 @@ validate_env_file() {
       die "$env_file 中存在重复的 $key，请先合并为一项"
     fi
   done
+
+  primary_mode=$(get_env_value SEARCHMELD_INSTALL_MODE)
+  legacy_mode=$(get_env_value ONE_SEARCH_INSTALL_MODE)
+  if [ -n "$primary_mode" ] && [ -n "$legacy_mode" ] && [ "$primary_mode" != "$legacy_mode" ]; then
+    die "$env_file 中 SEARCHMELD_INSTALL_MODE 与旧版 ONE_SEARCH_INSTALL_MODE 冲突"
+  fi
+  primary_network=$(get_env_value SEARCHMELD_USE_SHARED_DB_NETWORK)
+  legacy_network=$(get_env_value ONE_SEARCH_USE_SHARED_DB_NETWORK)
+  if [ -n "$primary_network" ] && [ -n "$legacy_network" ] && [ "$primary_network" != "$legacy_network" ]; then
+    die "$env_file 中 SEARCHMELD_USE_SHARED_DB_NETWORK 与旧版 ONE_SEARCH_USE_SHARED_DB_NETWORK 冲突"
+  fi
 }
 
 generate_secret() {
@@ -291,7 +318,7 @@ validate_database_url() {
 
 configure_external_database() {
   default_network_choice=false
-  existing_network_choice=$(get_env_value ONE_SEARCH_USE_SHARED_DB_NETWORK)
+  existing_network_choice=$(get_compat_env_value SEARCHMELD_USE_SHARED_DB_NETWORK ONE_SEARCH_USE_SHARED_DB_NETWORK)
   if [ -n "$existing_network_choice" ]; then
     default_network_choice=$(normalize_bool "$existing_network_choice") || default_network_choice=false
   fi
@@ -369,7 +396,7 @@ configure_external_database() {
 }
 
 configure_installation() {
-  existing_mode=$(get_env_value ONE_SEARCH_INSTALL_MODE)
+  existing_mode=$(get_compat_env_value SEARCHMELD_INSTALL_MODE ONE_SEARCH_INSTALL_MODE)
   if [ "$existing_mode" = external ]; then
     default_database_choice=2
   else
@@ -460,10 +487,10 @@ configure_installation() {
 }
 
 load_existing_configuration() {
-  install_mode=$(get_env_value ONE_SEARCH_INSTALL_MODE)
+  install_mode=$(get_compat_env_value SEARCHMELD_INSTALL_MODE ONE_SEARCH_INSTALL_MODE)
   case "$install_mode" in
     embedded|external) ;;
-    *) die "现有 .env 缺少有效的 ONE_SEARCH_INSTALL_MODE，请选择重新配置" ;;
+    *) die "现有 .env 缺少有效的 SEARCHMELD_INSTALL_MODE（或旧版 ONE_SEARCH_INSTALL_MODE），请选择重新配置" ;;
   esac
 
   host_port=$(get_env_value HOST_PORT)
@@ -478,8 +505,8 @@ load_existing_configuration() {
   database_url=$(get_env_value DATABASE_URL)
   database_network=$(get_env_value DATABASE_DOCKER_NETWORK)
   database_network=${database_network:-shared-db}
-  existing_network_choice=$(get_env_value ONE_SEARCH_USE_SHARED_DB_NETWORK)
-  use_database_network=$(normalize_bool "${existing_network_choice:-false}") || die "现有 ONE_SEARCH_USE_SHARED_DB_NETWORK 无效"
+  existing_network_choice=$(get_compat_env_value SEARCHMELD_USE_SHARED_DB_NETWORK ONE_SEARCH_USE_SHARED_DB_NETWORK)
+  use_database_network=$(normalize_bool "${existing_network_choice:-false}") || die "现有 SEARCHMELD_USE_SHARED_DB_NETWORK（或旧版 ONE_SEARCH_USE_SHARED_DB_NETWORK）无效"
   mcp_enabled=$(normalize_bool "$(get_env_value MCP_ENABLED)") || die "现有 MCP_ENABLED 无效"
   generated_admin_password=false
 
@@ -608,7 +635,7 @@ check_prerequisites() {
 
 wait_until_healthy() {
   attempt=0
-  log "等待 One Search 健康检查通过……"
+  log "等待 SearchMeld 健康检查通过……"
   while [ "$attempt" -lt "$health_timeout" ]; do
     if run_compose exec -T app curl --noproxy '*' -fsS http://127.0.0.1/healthz >/dev/null 2>&1; then
       return
@@ -638,7 +665,7 @@ main() {
   [ "$#" -eq 0 ] || usage_error
   cd "$project_dir"
   [ -f "$env_example" ] || die "找不到 $env_example"
-  [ -f "$project_dir/docker-compose.yml" ] || die "当前目录不是 One Search 项目"
+  [ -f "$project_dir/docker-compose.yml" ] || die "当前目录不是 SearchMeld 项目"
   [ -f "$project_dir/docker-compose.external-db.yml" ] || die "缺少外部数据库 Compose 配置"
 
   if [ -L "$env_file" ]; then
@@ -648,7 +675,9 @@ main() {
     die "配置路径不是普通文件：$env_file"
   fi
 
-  lock_dir="$project_dir/.one-search-install.lock"
+  legacy_lock_dir="$project_dir/.one-search-install.lock"
+  [ ! -d "$legacy_lock_dir" ] || die "检测到旧版安装锁；确认没有安装进程后删除 $legacy_lock_dir"
+  lock_dir="$project_dir/.searchmeld-install.lock"
   if ! mkdir "$lock_dir" 2>/dev/null; then
     die "另一个安装进程可能正在运行；确认没有运行后删除 $lock_dir"
   fi
@@ -663,7 +692,7 @@ main() {
 
   log ""
   log "========================================"
-  log "          One Search 安装向导"
+  log "          SearchMeld 安装向导"
   log "========================================"
   log "无需设置环境变量，也无需传入参数。"
 
@@ -673,7 +702,7 @@ main() {
   updated_revision=""
   update_upstream=""
   update_remote=""
-  existing_mode=$(get_env_value ONE_SEARCH_INSTALL_MODE)
+  existing_mode=$(get_compat_env_value SEARCHMELD_INSTALL_MODE ONE_SEARCH_INSTALL_MODE)
   if [ "$existing_mode" = embedded ] || [ "$existing_mode" = external ]; then
     log ""
     log "检测到现有安装配置：$existing_mode"
@@ -742,13 +771,13 @@ main() {
     log "切换到新版本……"
     run_compose up -d --remove-orphans
   else
-    log "构建并启动 One Search……"
+    log "构建并启动 SearchMeld……"
     run_compose up --build -d --remove-orphans
   fi
   wait_until_healthy
 
   log ""
-  log "One Search 安装完成"
+  log "SearchMeld 安装完成"
   if [ "$install_action" = update ]; then
     updated_short=$(printf '%s' "$updated_revision" | cut -c1-12)
     log "当前版本：$updated_short（$update_upstream）"

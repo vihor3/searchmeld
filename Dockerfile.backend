@@ -4,12 +4,13 @@ WORKDIR /app/backend
 COPY backend/go.mod backend/go.sum* ./
 RUN go mod download
 COPY backend/ ./
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/one-search ./cmd/server
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/searchmeld ./cmd/server
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
-COPY --from=builder /out/one-search /usr/local/bin/one-search
+COPY --from=builder /out/searchmeld /usr/local/bin/searchmeld
+RUN ln -s /usr/local/bin/searchmeld /usr/local/bin/one-search
 COPY backend/migrations ./backend/migrations
 EXPOSE 8080
-CMD ["one-search"]
+CMD ["searchmeld"]

@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/one-search/one-search/backend/internal/model"
-	"github.com/one-search/one-search/backend/internal/security"
+	"github.com/vihor3/searchmeld/backend/internal/model"
+	"github.com/vihor3/searchmeld/backend/internal/security"
 	"golang.org/x/crypto/bcrypt"
 )
 

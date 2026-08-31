@@ -1,4 +1,4 @@
-module github.com/one-search/one-search/backend
+module github.com/vihor3/searchmeld/backend
 
 go 1.18
 

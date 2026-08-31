@@ -59,7 +59,7 @@ func Load() (Config, error) {
 		MCPEnabled:              getBool("MCP_ENABLED", false),
 		MCPPath:                 normalizePath(getString("MCP_PATH", "/mcp")),
 		CorsOrigins:             getCSV("CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:8080"),
-		UpstreamUserAgent:       getString("UPSTREAM_USER_AGENT", "OneSearchRelay/0.1"),
+		UpstreamUserAgent:       getString("UPSTREAM_USER_AGENT", "SearchMeld/0.1"),
 		RequestTimeout:          time.Duration(getInt("REQUEST_TIMEOUT_MS", 20000)) * time.Millisecond,
 		RequestBodyLimitBytes:   int64(getInt("REQUEST_BODY_LIMIT_BYTES", 1048576)),
 		ServerReadHeaderTimeout: time.Duration(getInt("SERVER_READ_HEADER_TIMEOUT_MS", 10000)) * time.Millisecond,

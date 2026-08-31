@@ -10,6 +10,7 @@ backups/
 secrets/
 coverage
 backend/one-search
+backend/searchmeld
 backend/tmp
 frontend/node_modules
 frontend/dist

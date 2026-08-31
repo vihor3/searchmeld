@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/one-search/one-search/backend/internal/model"
+	"github.com/vihor3/searchmeld/backend/internal/model"
 )
 
 func TestQueryTavilyQuota(t *testing.T) {

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/one-search/one-search/backend/internal/model"
+	"github.com/vihor3/searchmeld/backend/internal/model"
 )
 
 // StringList accepts either a single JSON string or an array of strings.
