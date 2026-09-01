@@ -565,11 +565,11 @@ configure_external_database() {
     database_port=$prompted_value
     validate_port "数据库端口" "$database_port"
 
-    prompt_line "数据库名称" one_search
+    prompt_line "数据库名称" searchmeld_db
     database_name=$prompted_value
     [ -n "$database_name" ] || die "数据库名称不能为空"
 
-    prompt_line "数据库用户名" one_search
+    prompt_line "数据库用户名" searchmeld
     database_user=$prompted_value
     [ -n "$database_user" ] || die "数据库用户名不能为空"
 

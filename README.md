@@ -97,18 +97,18 @@ curl http://localhost:5173/healthz
 
 先创建项目专用账号和数据库，确保该账号拥有目标数据库及 schema，能够执行建表、索引和后续迁移：
 
-为保证已有 One Search 部署可以无损升级，默认数据库名和用户名暂时保留为 `one_search`；新部署可以自行替换。
+安装向导新建外部数据库连接时，默认数据库名为 `searchmeld_db`、用户名为 `searchmeld`。已有 One Search 部署会继续沿用 `.env` 中保存的连接串，不需要迁移数据库。
 
 ```sql
-CREATE ROLE one_search LOGIN;
-\password one_search
-CREATE DATABASE one_search OWNER one_search;
+CREATE ROLE searchmeld LOGIN;
+\password searchmeld
+CREATE DATABASE searchmeld_db OWNER searchmeld;
 ```
 
 如果数据库运行在另一个 Compose 项目的 `shared-db` 网络中，在 `.env` 中填写：
 
 ```dotenv
-DATABASE_URL=postgres://one_search:URL编码后的密码@shared-postgres:5432/one_search?sslmode=disable
+DATABASE_URL=postgres://searchmeld:URL编码后的密码@shared-postgres:5432/searchmeld_db?sslmode=disable
 DATABASE_DOCKER_NETWORK=shared-db
 ADMIN_PASSWORD=管理员密码
 ENCRYPTION_KEY=至少32字符

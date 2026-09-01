@@ -217,7 +217,7 @@ fi
 external_project=$(make_project external)
 external_log="$tmpdir/external-docker.log"
 database_password='s@cr et/#?'
-expected_database_url='postgresql://one_search:s%40cr%20et%2F%23%3F@shared-postgres:5432/one_search?sslmode=disable'
+expected_database_url='postgresql://searchmeld:s%40cr%20et%2F%23%3F@shared-postgres:5432/searchmeld_db?sslmode=disable'
 {
   printf '%s\n' 2
   printf '%s\n' y
