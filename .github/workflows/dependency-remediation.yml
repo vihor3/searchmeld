@@ -48,6 +48,35 @@ jobs:
         run: |
           govulncheck -format json ./... > "$RUNNER_TEMP/dependency-evidence/go-before.json"
           jq -s '[.[] | select(has("finding"))]' "$RUNNER_TEMP/dependency-evidence/go-before.json"
+      - name: Generate the minimal npm lockfile update on the runner
+        working-directory: frontend
+        run: |
+          npm install --package-lock-only --ignore-scripts --no-audit --no-fund --save-dev 'vite@^7.3.6'
+          npm update esbuild postcss nanoid --package-lock-only --ignore-scripts --no-audit --no-fund
+          npm audit --package-lock-only --audit-level=low --json > "$RUNNER_TEMP/dependency-evidence/npm-after.json"
+          mkdir -p "$RUNNER_TEMP/dependency-candidates/frontend"
+          cp package.json package-lock.json "$RUNNER_TEMP/dependency-candidates/frontend/"
+      - name: Generate the patched pgx v5 module graph on the runner
+        working-directory: backend
+        env:
+          GOFLAGS: -mod=mod
+        run: |
+          # Only the candidate graph is exported; source migration has its own reviewed patch.
+          sed -i 's@github.com/jackc/pgx/v4@github.com/jackc/pgx/v5@g; s@pgxpool.ConnectConfig@pgxpool.NewWithConfig@g' internal/db/*.go
+          go mod edit -go=1.26.0 -droprequire=github.com/jackc/pgx/v4
+          go get github.com/jackc/pgx/v5@v5.9.2 github.com/go-chi/chi/v5@v5.3.2 golang.org/x/crypto@v0.56.0 golang.org/x/text@v0.41.0
+          go mod tidy
+          govulncheck -format json ./... > "$RUNNER_TEMP/dependency-evidence/go-after.json"
+          govulncheck ./...
+          mkdir -p "$RUNNER_TEMP/dependency-candidates/backend"
+          cp go.mod go.sum "$RUNNER_TEMP/dependency-candidates/backend/"
+      - name: Upload generated manifests for manual review
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dependency-candidates-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dependency-candidates/
+          if-no-files-found: error
+          retention-days: 7
       - name: Upload dependency evidence only
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
