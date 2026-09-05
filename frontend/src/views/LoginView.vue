@@ -28,13 +28,17 @@ const loading = ref(false)
 const form = reactive({ username: '', password: '' })
 
 async function login() {
+  if (loading.value) return
   loading.value = true
+  let revision = session.advanceRevision()
   try {
-    const result = await api.login(form.username, form.password)
-    session.setToken(result.token)
+    await api.login(form.username, form.password)
+    if (revision !== session.revision) return
+    revision = session.advanceRevision()
+    form.password = ''
     await router.replace(loginRedirect(route.query.redirect))
   } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '登录失败')
+    if (revision === session.revision) ElMessage.error(error instanceof Error ? error.message : '登录失败')
   } finally {
     loading.value = false
   }
@@ -43,7 +47,7 @@ async function login() {
 
 <style scoped>
 .login-page { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
-.login-card { width: 390px; text-align: center; }
+.login-card { width: 390px; max-width: 100%; text-align: center; }
 .login-logo {
   width: 52px; height: 52px; display: block; margin: 0 auto 12px;
   border-radius: 14px; object-fit: cover;

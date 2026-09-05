@@ -18,6 +18,10 @@ mkdir -p "$tmpdir/bin"
 mock_docker="$tmpdir/bin/docker"
 cat > "$mock_docker" <<'EOF'
 #!/bin/sh
+if [ "${ADMIN_PUBLIC_ORIGIN+x}" = x ]; then
+  printf '%s\n' 'installer leaked inherited ADMIN_PUBLIC_ORIGIN to Docker' >&2
+  exit 1
+fi
 printf '%s\n' "$*" >> "$MOCK_DOCKER_LOG"
 if [ "${1:-}" = network ] && [ "${2:-}" = inspect ]; then
   exit 1
@@ -108,6 +112,7 @@ printf '\n\n\n\n\n\n\n' | env \
   SEARCHMELD_DNS_SECONDARY=1.1.1.1 \
   TZ=UTC \
   DATABASE_URL='postgresql://ignored:ignored@ignored:5432/ignored' \
+  ADMIN_PUBLIC_ORIGIN='https://ignored.example.invalid' \
   HOST_PORT=65500 \
   "$embedded_project/install.sh" > "$tmpdir/embedded-output" 2>&1
 
@@ -121,6 +126,7 @@ grep -q "^SEARCHMELD_USE_CUSTOM_DNS='false'$" "$embedded_env"
 grep -q "^SEARCHMELD_DNS_PRIMARY=''$" "$embedded_env"
 grep -q "^SEARCHMELD_DNS_SECONDARY=''$" "$embedded_env"
 grep -q '^TZ=Asia/Shanghai$' "$embedded_env"
+grep -q '^ADMIN_PUBLIC_ORIGIN=$' "$embedded_env"
 grep -q 'compose .*docker-compose.yml up --build -d' "$embedded_log"
 if grep -q 'docker-compose.external-db.yml\|docker-compose.dns.yml' "$embedded_log"; then
   printf '%s\n' 'embedded install used external compose' >&2
@@ -129,11 +135,15 @@ fi
 
 # 重复运行默认沿用现有配置，且不会替换持久化密钥。
 encryption_before=$(grep '^ENCRYPTION_KEY=' "$embedded_env")
+public_origin_line='ADMIN_PUBLIC_ORIGIN=https://admin.example.invalid:8443'
+sed -i "s|^ADMIN_PUBLIC_ORIGIN=.*|$public_origin_line|" "$embedded_env"
 printf '\n\n' | env \
   PATH="$tmpdir/bin:$PATH" \
   MOCK_DOCKER_LOG="$embedded_log" \
+  ADMIN_PUBLIC_ORIGIN= \
   "$embedded_project/install.sh" > "$tmpdir/embedded-rerun-output" 2>&1
 encryption_after=$(grep '^ENCRYPTION_KEY=' "$embedded_env")
+grep -Fxq "$public_origin_line" "$embedded_env"
 [ "$encryption_before" = "$encryption_after" ] || {
   printf '%s\n' 'rerun replaced ENCRYPTION_KEY' >&2
   exit 1
@@ -266,11 +276,14 @@ fi
 
 # 外部配置重复运行仍选择原来的 Compose 文件组合。
 external_rerun_log="$tmpdir/external-rerun-docker.log"
+sed -i "s|^ADMIN_PUBLIC_ORIGIN=.*|$public_origin_line|" "$external_env"
 printf '\n\n' | env \
   PATH="$tmpdir/bin:$PATH" \
   MOCK_DOCKER_LOG="$external_rerun_log" \
+  ADMIN_PUBLIC_ORIGIN='https://ignored.example.invalid' \
   "$external_project/install.sh" > "$tmpdir/external-rerun-output" 2>&1
 grep -q 'docker-compose.external-db.yml .*docker-compose.shared-db.yml .*docker-compose.dns.yml up --build -d' "$external_rerun_log"
+grep -Fxq "$public_origin_line" "$external_env"
 
 # 共享数据库网络也可继续使用 Docker/宿主机默认 DNS。
 external_default_dns_project=$(make_project external-shared-default-dns)
@@ -304,6 +317,7 @@ switch_log="$tmpdir/switch-docker.log"
 } | env \
   PATH="$tmpdir/bin:$PATH" \
   MOCK_DOCKER_LOG="$switch_log" \
+  ADMIN_PUBLIC_ORIGIN= \
   "$external_project/install.sh" > "$tmpdir/switch-output" 2>&1
 grep -q "^SEARCHMELD_INSTALL_MODE='embedded'$" "$external_env"
 grep -q "^SEARCHMELD_USE_SHARED_DB_NETWORK='false'$" "$external_env"
@@ -311,6 +325,7 @@ grep -q "^DATABASE_URL=''$" "$external_env"
 grep -q "^SEARCHMELD_USE_CUSTOM_DNS='false'$" "$external_env"
 grep -q "^SEARCHMELD_DNS_PRIMARY=''$" "$external_env"
 grep -q "^SEARCHMELD_DNS_SECONDARY=''$" "$external_env"
+grep -Fxq "$public_origin_line" "$external_env"
 if grep -q 'docker-compose.dns.yml' "$switch_log"; then
   printf '%s\n' 'reconfigured embedded install kept custom DNS override' >&2
   exit 1

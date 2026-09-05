@@ -1,0 +1,705 @@
+'use strict'
+
+if (process.env.GITHUB_ACTIONS !== 'true') {
+  throw new Error('Packaged admin Cookie checks may run only in GitHub Actions')
+}
+
+const assert = require('node:assert/strict')
+const { execFile } = require('node:child_process')
+const { randomBytes } = require('node:crypto')
+const { mkdir, readFile, rm, writeFile } = require('node:fs/promises')
+const http = require('node:http')
+const https = require('node:https')
+const { join, resolve, sep } = require('node:path')
+const { promisify } = require('node:util')
+const { chromium } = require('playwright')
+
+const execute = promisify(execFile)
+const cookieName = 'searchmeld_admin_session'
+const proof = { 'X-SearchMeld-Admin': '1' }
+const tokenKeys = ['searchmeld-admin-token', 'one-search-admin-token']
+const desktop = { width: 1440, height: 1000 }
+const mobile = { width: 390, height: 844 }
+const target = '/providers?fixture=a%2Bb#shared'
+const prefix = process.env.COOKIE_CONTAINER_PREFIX
+assert.match(prefix || '', /^searchmeld-admin-cookie-[0-9]+-[0-9]+$/)
+assert.ok(process.env.RUNNER_TEMP, 'RUNNER_TEMP is required')
+assert.ok(process.env.COOKIE_TEST_TEMP, 'COOKIE_TEST_TEMP is required')
+assert.ok(process.env.ARTIFACT_DIR, 'ARTIFACT_DIR is required')
+const temporary = resolve(process.env.COOKIE_TEST_TEMP)
+const artifacts = resolve(process.env.ARTIFACT_DIR)
+for (const directory of [temporary, artifacts]) {
+  assert.ok(directory.startsWith(`${resolve(process.env.RUNNER_TEMP)}${sep}`), 'Fixture files must stay in runner temporary storage')
+}
+
+const containers = new Set()
+const servers = new Set()
+const contexts = new Set()
+const gates = new Set()
+const secrets = new Set()
+let browser
+let cleanupPromise
+
+function secret(value) {
+  if (value) secrets.add(value)
+  return value
+}
+
+function redact(value) {
+  let text = String(value)
+  for (const value of secrets) text = text.replaceAll(value, '[redacted]')
+  return text
+}
+
+function deferred() {
+  let resolve
+  const promise = new Promise((done) => { resolve = done })
+  return { promise, resolve }
+}
+
+async function bounded(promise, label, milliseconds = 15000) {
+  let timer
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Timed out: ${label}`)), milliseconds) })
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function docker(args) {
+  const { stdout } = await execute('docker', args, { timeout: 90000, maxBuffer: 1024 * 1024 })
+  return stdout.trim()
+}
+
+function request(origin, path, { method = 'GET', headers = {}, body } = {}) {
+  const url = new URL(path, origin)
+  assert.equal(url.hostname, '127.0.0.1', 'Fixtures must not contact external services')
+  return new Promise((resolve, reject) => {
+    const transport = url.protocol === 'https:' ? https : http
+    const payload = body === undefined ? undefined : JSON.stringify(body)
+    const req = transport.request(url, {
+      method, agent: false, rejectUnauthorized: false,
+      headers: { ...(payload === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers }
+    }, (res) => {
+      const chunks = []
+      let size = 0
+      res.on('data', (chunk) => {
+        size += chunk.length
+        if (size > 4 * 1024 * 1024) res.destroy(new Error('Fixture response exceeded its bound'))
+        else chunks.push(chunk)
+      })
+      res.on('error', reject)
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }))
+    })
+    req.setTimeout(10000, () => req.destroy(new Error('Fixture HTTP request timed out')))
+    req.on('error', reject)
+    req.end(payload)
+  })
+}
+
+function adminReply(reply, status, label, { login = false } = {}) {
+  assert.equal(reply.status, status, label)
+  assert.equal(reply.headers['cache-control'], 'no-store', `${label}: no-store`)
+  assert.equal(reply.headers.pragma, 'no-cache', `${label}: no-cache`)
+  if (!login) assert.ok(!reply.headers['set-cookie'], `${label}: only login may set a Cookie`)
+  return reply
+}
+
+async function waitHealthy(origin) {
+  const deadline = Date.now() + 120000
+  while (Date.now() < deadline) {
+    try {
+      if ((await request(origin, '/healthz')).status === 200) return
+    } catch { /* The packaged database and backend are still starting. */ }
+    await new Promise((resolve) => setTimeout(resolve, 500))
+  }
+  throw new Error('Packaged instance did not become healthy within 120 seconds')
+}
+
+async function listen(server) {
+  servers.add(server)
+  server.requestTimeout = 15000
+  server.headersTimeout = 10000
+  server.on('connection', (socket) => {
+    socket.setTimeout(15000, () => socket.destroy())
+  })
+  await bounded(new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  }), 'loopback listener')
+  return server.address().port
+}
+
+async function startFixture(mode, tls) {
+  const fixture = { mode, name: `${prefix}-${mode}`, problems: [], observations: [], pages: [], pendingObservations: [] }
+  fixture.credentials = { username: 'ci-cookie-operator', password: secret(randomBytes(24).toString('hex')) }
+  let upstream
+  if (mode === 'https') {
+    // This is only TLS termination. Both application and API still go through
+    // the unchanged built asset tree and the bundled Nginx -> Go boundary.
+    const proxy = https.createServer(tls, (req, res) => {
+      if (!upstream) { res.writeHead(503).end(); return }
+      const headers = { ...req.headers, host: req.headers.host }
+      for (const name of ['forwarded', 'true-client-ip', 'x-real-ip', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-port']) delete headers[name]
+      headers['x-forwarded-proto'] = 'https'
+      const destination = new URL(upstream)
+      const forwarded = http.request({ hostname: destination.hostname, port: destination.port, path: req.url, method: req.method, headers, agent: false }, (reply) => {
+        res.writeHead(reply.statusCode, reply.headers)
+        reply.on('error', () => res.destroy())
+        reply.pipe(res)
+      })
+      forwarded.setTimeout(10000, () => forwarded.destroy())
+      forwarded.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end() })
+      req.on('aborted', () => forwarded.destroy())
+      res.on('close', () => forwarded.destroy())
+      req.pipe(forwarded)
+    })
+    fixture.origin = `https://127.0.0.1:${await listen(proxy)}`
+  }
+  const environment = {
+    APP_ENV: 'production', DATABASE_MODE: 'embedded', DATABASE_URL: '',
+    POSTGRES_DB: 'cookie_fixture', POSTGRES_USER: 'cookie_fixture',
+    POSTGRES_PASSWORD: secret(randomBytes(24).toString('hex')),
+    ENCRYPTION_KEY: secret(randomBytes(32).toString('hex')),
+    ADMIN_USERNAME: fixture.credentials.username, ADMIN_PASSWORD: fixture.credentials.password,
+    ADMIN_PUBLIC_ORIGIN: fixture.origin || '', ADMIN_LOGIN_MAX_ATTEMPTS: '5',
+    API_AUTH_REQUIRED: 'true', MCP_ENABLED: 'true',
+    CORS_ALLOWED_ORIGINS: fixture.origin ? `*,${fixture.origin}` : '*',
+    HTTP_PROXY: '', HTTPS_PROXY: '', ALL_PROXY: '', http_proxy: '', https_proxy: '', all_proxy: ''
+  }
+  const environmentPath = join(temporary, `${mode}.env`)
+  const origins = mode === 'https' ? ['', fixture.origin] : ['']
+  for (const publicOrigin of origins) {
+    environment.ADMIN_PUBLIC_ORIGIN = publicOrigin
+    await writeFile(environmentPath, Object.entries(environment).map(([key, value]) => `${key}=${value}\n`).join(''), { mode: 0o600 })
+    // The image's anonymous PostgreSQL volume belongs only to this fixture. It
+    // survives its restart assertion and is removed with docker rm --volumes.
+    containers.add(fixture.name)
+    await docker(['run', '--detach', '--pull', 'never', '--name', fixture.name,
+      '--label', `searchmeld.admin-cookie-fixture=${prefix}`,
+      '--publish', '127.0.0.1::80', '--env-file', environmentPath, 'searchmeld:ci-all-in-one'])
+    const bindings = JSON.parse(await docker(['inspect', '--format', '{{json .NetworkSettings.Ports}}', fixture.name]))
+    const [binding] = bindings['80/tcp']
+    assert.equal(binding.HostIp, '127.0.0.1')
+    upstream = `http://127.0.0.1:${binding.HostPort}`
+    if (mode === 'http') fixture.origin = upstream
+    assert.ok(new URL(fixture.origin).port, 'Exercise a non-default Host port')
+    await waitHealthy(fixture.origin)
+    if (mode === 'https' && !publicOrigin) {
+      adminReply(await request(fixture.origin, '/api/admin/login', {
+        method: 'POST', headers: { ...proof, Origin: fixture.origin }, body: fixture.credentials
+      }), 403, 'Allowlisted HTTPS Origin without public-origin configuration must not downgrade Cookie security')
+      await docker(['rm', '--force', '--volumes', fixture.name])
+      containers.delete(fixture.name)
+      upstream = undefined
+    }
+  }
+
+  const hostileHandler = (_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-store' })
+    res.end('<!doctype html><title>Synthetic same-site origin</title><p>CI origin fixture</p>')
+  }
+  const hostile = mode === 'https' ? https.createServer(tls, hostileHandler) : http.createServer(hostileHandler)
+  fixture.hostileOrigin = `${mode}://127.0.0.1:${await listen(hostile)}`
+  return fixture
+}
+
+async function openContext(fixture, viewport = desktop) {
+  const context = await browser.newContext({ viewport, ignoreHTTPSErrors: true, serviceWorkers: 'block', reducedMotion: 'reduce' })
+  contexts.add(context)
+  context.setDefaultTimeout(15000)
+  context.setDefaultNavigationTimeout(20000)
+  await context.route('**/*', async (route) => {
+    const origin = new URL(route.request().url()).origin
+    if (![fixture.origin, fixture.hostileOrigin].includes(origin)) {
+      fixture.problems.push('Unexpected external browser request')
+      await route.abort()
+    } else await route.continue()
+  })
+  context.on('page', (page) => {
+    fixture.pages.push(page)
+    page.on('pageerror', (error) => {
+      // A rejected refresh is allowed to propagate from the existing view.
+      if (error.message !== 'admin login required') fixture.problems.push(redact(error.message))
+    })
+    page.on('request', (req) => {
+      if (!new URL(req.url()).pathname.startsWith('/api/admin/')) return
+      fixture.pendingObservations.push(req.allHeaders().then((headers) => {
+        fixture.observations.push({
+          path: new URL(req.url()).pathname, method: req.method(),
+          headerCredential: 'authorization' in headers || 'x-api-key' in headers,
+          cookie: Boolean(headers.cookie?.includes(`${cookieName}=`)),
+          proof: headers['x-searchmeld-admin'], origin: headers.origin
+        })
+      }).catch(() => { fixture.problems.push('Could not inspect browser request headers') }))
+    })
+  })
+  return context
+}
+
+async function browserRequest(page, url, { method = 'GET', headers = proof, body } = {}) {
+  return page.evaluate(async ({ url, method, headers, body }) => {
+    try {
+      const response = await fetch(url, {
+        method, headers, credentials: 'include', signal: AbortSignal.timeout(10000),
+        ...(body === undefined ? {} : { body: JSON.stringify(body) })
+      })
+      return { status: response.status, body: await response.text(), headers: Object.fromEntries(response.headers) }
+    } catch {
+      return { blocked: true }
+    }
+  }, { url, method, headers, body })
+}
+
+async function atLogin(page, redirect = target) {
+  await page.locator('.login-card').waitFor()
+  const url = new URL(page.url())
+  assert.equal(url.pathname, '/login')
+  assert.equal(url.searchParams.get('redirect'), redirect)
+  assert.equal(await page.locator('.app-shell').count(), 0, 'Protected shell must not mount anonymously')
+}
+
+async function atProtected(page, fixture, path = target) {
+  await page.waitForURL(new URL(path, fixture.origin).href)
+  await page.locator('.app-shell').waitFor()
+  if (new URL(path, fixture.origin).pathname === '/providers') await page.locator('.provider-grid').waitFor()
+  assert.equal(await page.locator('.login-card').count(), 0)
+}
+
+async function currentCookie(context, fixture) {
+  const cookies = (await context.cookies(`${fixture.origin}/api/admin/me`)).filter((cookie) => cookie.name === cookieName)
+  assert.equal(cookies.length, 1, 'One shared admin Cookie')
+  const cookie = cookies[0]
+  secret(cookie.value)
+  assert.equal(cookie.domain, '127.0.0.1')
+  assert.equal(cookie.path, '/api/admin')
+  assert.equal(cookie.httpOnly, true)
+  assert.equal(cookie.sameSite, 'Lax')
+  assert.equal(cookie.secure, fixture.mode === 'https')
+  assert.equal(cookie.expires, -1, 'Browser-session Cookie, not a persistent credential')
+  return cookie
+}
+
+async function login(page, fixture, { wrongPassword = false } = {}) {
+  const inputs = page.locator('.login-card input')
+  await inputs.nth(0).fill(fixture.credentials.username)
+  await inputs.nth(1).fill(wrongPassword ? secret(`${fixture.credentials.password}-wrong`) : fixture.credentials.password)
+  const pending = page.waitForResponse((res) => new URL(res.url()).pathname === '/api/admin/login' && res.request().method() === 'POST')
+  await page.locator('.login-card .el-button').click()
+  const response = await pending
+  await response.finished()
+  const reply = { status: response.status(), headers: await response.allHeaders() }
+  adminReply(reply, wrongPassword ? 401 : 200, 'password login', { login: !wrongPassword })
+  if (wrongPassword) {
+    await page.locator('.login-card .el-button.is-loading').waitFor({ state: 'hidden' })
+    await atLogin(page)
+    await page.locator('.el-message--error').waitFor()
+    return
+  }
+  const cookie = await currentCookie(page.context(), fixture)
+  const body = await response.json()
+  assert.deepEqual(Object.keys(body), ['expires_at'], 'No session credential in login JSON')
+  assert.ok(Number.isFinite(Date.parse(body.expires_at)))
+  const setCookie = reply.headers['set-cookie'] || ''
+  assert.ok(setCookie.startsWith(`${cookieName}=`))
+  assert.ok(!/;\s*(domain|max-age|expires)=/i.test(setCookie), 'Host-only session Cookie')
+  await atProtected(page, fixture)
+  return cookie
+}
+
+async function storageIsClean(page) {
+  const state = await page.evaluate(() => ({ session: { ...sessionStorage }, local: { ...localStorage }, visibleCookies: document.cookie }))
+  for (const key of tokenKeys) {
+    assert.ok(!(key in state.session) && !(key in state.local), 'Legacy credential storage must be deleted')
+  }
+  const serialized = JSON.stringify(state)
+  for (const value of secrets) assert.ok(!serialized.includes(value), 'Credentials must not be visible in JS storage or document.cookie')
+  assert.ok(!state.visibleCookies.includes(`${cookieName}=`), 'Admin Cookie must remain HttpOnly')
+}
+
+async function screenshot(page, name) {
+  await mkdir(artifacts, { recursive: true })
+  await page.screenshot({
+    path: join(artifacts, `${name}.png`), fullPage: true,
+    mask: [page.locator('input'), page.locator('code'), page.locator('.raw-token-row'), page.locator('.token-copy-button')]
+  })
+}
+
+async function me(page, fixture, status = 200) {
+  const reply = await browserRequest(page, `${fixture.origin}/api/admin/me`)
+  adminReply(reply, status, 'browser me')
+  if (status === 200) assert.equal(typeof JSON.parse(reply.body).username, 'string')
+}
+
+async function authBoundaries(fixture, page) {
+  const cookie = await currentCookie(page.context(), fixture)
+  const cookieHeaders = { ...proof, Cookie: `${cookieName}=${cookie.value}`, Origin: fixture.origin }
+  const admin = (path, options = {}) => request(fixture.origin, path, { ...options, headers: { ...cookieHeaders, ...options.headers } })
+  const rotation = adminReply(await admin('/api/admin/settings/admin-api-key', { method: 'POST' }), 201, 'first Key provisioning')
+  const key = secret(JSON.parse(rotation.body).key)
+  assert.ok(key.startsWith('oak_'))
+  const tokenReply = adminReply(await admin('/api/admin/tokens', {
+    method: 'POST', body: { name: 'ci-cookie-control', scopes: ['search'], allowed_providers: [] }
+  }), 201, 'ordinary Token provisioning')
+  const token = secret(JSON.parse(tokenReply.body).raw_token)
+  assert.ok(token.startsWith('osr_'))
+
+  for (const headers of [
+    { Authorization: `Bearer ${cookie.value}` }, { 'X-API-Key': cookie.value },
+    { Authorization: `Bearer ${token}` }, { Authorization: 'Bearer oak_invalid_fixture' },
+    { Authorization: '' }, { Authorization: 'Bearer ' }, { 'X-API-Key': '' },
+    { Authorization: 'Basic invalid' },
+    { Authorization: 'Bearer oak_invalid_fixture', 'X-API-Key': key }
+  ]) {
+    adminReply(await admin('/api/admin/me', { headers }), 401, 'Selected invalid header cannot borrow a Cookie')
+  }
+  adminReply(await request(fixture.origin, '/api/admin/me', { headers: proof }), 401, 'Unauthenticated me')
+  for (const headers of [{ Authorization: `Bearer ${key}` }, { 'X-API-Key': key }]) {
+    adminReply(await request(fixture.origin, '/api/admin/me', { headers }), 200, 'Key-only CLI without proof or Origin')
+    adminReply(await request(fixture.origin, '/api/admin/me', {
+      headers: { ...headers, Cookie: `${cookieName}=adm_invalid_fixture` }
+    }), 200, 'Valid Key wins over stale Cookie')
+    assert.equal((await request(fixture.origin, '/v1/providers', { headers })).status, 200, 'Key business API')
+    adminReply(await request(fixture.origin, '/api/admin/logout', {
+      method: 'POST', headers: { ...headers, Cookie: cookieHeaders.Cookie }
+    }), 200, 'Key logout is non-revoking and ignores incidental Cookie')
+    await me(page, fixture)
+    adminReply(await request(fixture.origin, '/api/admin/me', { headers }), 200, 'Key survives its logout')
+  }
+
+  // Send the Cookie explicitly beyond its browser Path. Path omission alone
+  // would not establish the backend's public credential boundary.
+  const business = [
+    ['/v1/providers', 'GET'], ['/v1/usage/summary', 'GET'],
+    ['/v1/search', 'POST'], ['/v1/extract', 'POST'],
+    ['/v1/compat/tavily/search', 'POST'], ['/v1/compat/tavily/extract', 'POST'],
+    ['/v1/compat/serper/search', 'POST'], ['/v1/compat/openai/responses-search', 'POST']
+  ]
+  for (const [path, method] of business) {
+    const reply = await request(fixture.origin, path, {
+      method, headers: cookieHeaders,
+      ...(method === 'GET' ? {} : { body: { query: 'ci-only', urls: ['https://example.invalid/article'] } })
+    })
+    assert.equal(reply.status, 401, `${path}: explicit session Cookie must not authorize business calls`)
+  }
+  const rpc = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'ci-no-such-tool', arguments: {} } }
+  for (const path of ['/mcp', '/v1/mcp']) {
+    for (const headers of [cookieHeaders, { Authorization: `Bearer ${cookie.value}` }]) {
+      assert.equal((await request(fixture.origin, path, { method: 'POST', headers, body: rpc })).status, 401, 'MCP rejects session credentials')
+    }
+    const reply = await request(fixture.origin, path, { method: 'POST', headers: { Authorization: `Bearer ${key}` }, body: rpc })
+    assert.equal(reply.status, 200, 'Key passes MCP auth without calling a provider')
+    assert.equal(JSON.parse(reply.body).error.code, -32602, 'Synthetic unknown tool reaches method validation')
+  }
+
+  for (const suppliedProof of [undefined, '0']) {
+    const headers = suppliedProof === undefined ? {} : { 'X-SearchMeld-Admin': suppliedProof }
+    for (const [path, method] of [['/api/admin/me', 'GET'], ['/api/admin/logout', 'POST'], ['/api/admin/login', 'POST']]) {
+      adminReply(await browserRequest(page, `${fixture.origin}${path}`, {
+        method, headers: { 'Content-Type': 'application/json', ...headers },
+        ...(path.endsWith('/login') ? { body: fixture.credentials } : {})
+      }), 403, 'Missing/wrong browser proof')
+    }
+  }
+  await me(page, fixture)
+
+  const preflight = {
+    'Access-Control-Request-Method': 'POST',
+    'Access-Control-Request-Headers': 'content-type,x-searchmeld-admin'
+  }
+  const allowed = adminReply(await request(fixture.origin, '/api/admin/logout', {
+    method: 'OPTIONS', headers: { Origin: fixture.origin, ...preflight }
+  }), 204, 'Canonical preflight with non-default Host port')
+  assert.equal(allowed.headers['access-control-allow-origin'], fixture.origin)
+  assert.equal(allowed.headers['access-control-allow-credentials'], 'true')
+  assert.match(allowed.headers.vary, /\borigin\b/i)
+  assert.match(allowed.headers['access-control-allow-headers'], /x-searchmeld-admin/i)
+  for (const origin of [fixture.hostileOrigin, 'null', `${fixture.origin}/path`]) {
+    for (const [path, method] of [['/api/admin/me', 'GET'], ['/api/admin/logout', 'POST'], ['/api/admin/login', 'POST']]) {
+      const denied = adminReply(await admin(path, {
+        method, headers: { Origin: origin }, ...(path.endsWith('/login') ? { body: fixture.credentials } : {})
+      }), 403, 'Untrusted supplied Origin')
+      assert.ok(!denied.headers['access-control-allow-origin'], 'Do not reflect hostile/null Origin')
+    }
+    adminReply(await admin('/api/admin/me', { headers: { Origin: origin, Authorization: `Bearer ${key}` } }), 403, 'Key cannot bypass supplied Origin')
+    const denied = adminReply(await request(fixture.origin, '/api/admin/logout', {
+      method: 'OPTIONS', headers: { Origin: origin, ...preflight }
+    }), 403, 'Hostile preflight; wildcard CORS is not admin trust')
+    assert.ok(!denied.headers['access-control-allow-origin'])
+  }
+
+  // A different port is a different origin but the SAME site and Cookie host.
+  // Simple requests really carry the shared Cookie; SameSite cannot stop them.
+  const hostile = await page.context().newPage()
+  await hostile.goto(fixture.hostileOrigin)
+  const metadataBefore = JSON.parse((await admin('/api/admin/settings/admin-api-key')).body)
+  for (const [path, method] of [
+    ['/api/admin/me', 'GET'], ['/api/admin/logout', 'POST'], ['/api/admin/settings/admin-api-key', 'POST']
+  ]) {
+    const seen = hostile.waitForRequest((req) => new URL(req.url()).pathname === path && req.method() === method)
+    const result = await browserRequest(hostile, `${fixture.origin}${path}`, { method, headers: {} })
+    assert.equal(result.blocked, true, 'Hostile same-site browser cannot read admin replies')
+    const sent = await (await seen).allHeaders()
+    assert.equal(sent.origin, fixture.hostileOrigin)
+    assert.ok(sent.cookie?.includes(`${cookieName}=`), 'Prove ambient Cookie was present on the hostile simple request')
+    await me(page, fixture)
+  }
+  assert.deepEqual(JSON.parse((await admin('/api/admin/settings/admin-api-key')).body), metadataBefore, 'Hostile simple write did not rotate the Key')
+  const preflighted = await browserRequest(hostile, `${fixture.origin}/api/admin/logout`, { method: 'POST' })
+  assert.equal(preflighted.blocked, true, 'Hostile custom-header fetch is rejected by CORS')
+  await me(page, fixture)
+  await hostile.close()
+  return key
+}
+
+async function holdResponses(fixture, page, paths, status) {
+  const arrived = deferred()
+  const released = deferred()
+  const settled = deferred()
+  const remaining = new Set(paths)
+  let captured = 0
+  let completed = 0
+  let failure
+  gates.add(released)
+  const matcher = (url) => paths.includes(url.pathname)
+  const handler = async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (!remaining.delete(path)) { await route.continue(); return }
+    try {
+      // Fetch the real protected response now, then delay only its delivery.
+      const response = await route.fetch({ timeout: 10000, maxRedirects: 0 })
+      adminReply({ status: response.status(), headers: response.headers() }, status, 'Held real admin response')
+      captured += 1
+      if (captured === paths.length) arrived.resolve()
+      await released.promise
+      await route.fulfill({ response })
+      await response.dispose()
+    } catch (error) {
+      failure = error
+      fixture.problems.push(redact(error.message))
+      arrived.resolve()
+      await route.abort().catch(() => {})
+    } finally {
+      completed += 1
+      if (completed === paths.length) settled.resolve()
+    }
+  }
+  await page.route(matcher, handler)
+  return {
+    async wait() { await bounded(arrived.promise, 'real response capture'); if (failure) throw failure },
+    async release() {
+      released.resolve()
+      await bounded(settled.promise, 'held response delivery')
+      gates.delete(released)
+      await page.unroute(matcher, handler)
+      if (failure) throw failure
+    }
+  }
+}
+
+async function refresh(page) {
+  await page.locator('.page-actions .el-button[title="\u5237\u65b0"]').click()
+}
+
+async function staleResponses(fixture, first, second) {
+  for (const kind of ['401', 'logout']) {
+    const old = await currentCookie(first.context(), fixture)
+    if (kind === '401') {
+      adminReply(await request(fixture.origin, '/api/admin/logout', {
+        method: 'POST', headers: { ...proof, Cookie: `${cookieName}=${old.value}` }
+      }), 200, 'Revoke old session before stale 401')
+    }
+    const hold = await holdResponses(fixture, first, kind === '401' ? ['/api/admin/providers', '/api/admin/keys'] : ['/api/admin/logout'], kind === '401' ? 401 : 200)
+    if (kind === '401') await refresh(first)
+    else await first.locator('.float-logout').click()
+    await hold.wait()
+    await second.reload()
+    await atLogin(second)
+    const newer = await login(second, fixture)
+    assert.ok(newer.value !== old.value, 'New login must mint another session')
+    const reprobe = first.waitForResponse((res) => new URL(res.url()).pathname === '/api/admin/me' && res.status() === 200)
+    await hold.release()
+    await reprobe
+    // Wait for the originating action's loading/finally path, not only HTTP
+    // headers; then perform another real navigation from the affected page.
+    await first.waitForFunction(() => !document.querySelector('.float-logout')?.disabled && !document.querySelector('.page-actions .el-button.is-loading'))
+    await atProtected(first, fixture, kind === 'logout' ? '/playground' : target)
+    assert.ok((await currentCookie(first.context(), fixture)).value === newer.value, 'Old response must not clear the newer Cookie')
+    await me(first, fixture)
+    await me(second, fixture)
+    await first.goto(`${fixture.origin}${target}`)
+    await atProtected(first, fixture)
+  }
+}
+
+async function lockoutDespiteSpoofing(fixture) {
+  // Run last, and use a different nonexistent username so the shared account's
+  // successful-login and restart cases can never inherit the lockout bucket.
+  const body = { username: 'ci-forwarded-ip-lockout', password: secret(randomBytes(16).toString('hex')) }
+  for (let attempt = 1; attempt <= 7; attempt += 1) {
+    const reply = await request(fixture.origin, '/api/admin/login', {
+      method: 'POST', body,
+      headers: {
+        ...proof, Origin: fixture.origin,
+        'True-Client-IP': `198.51.100.${attempt}`, 'X-Real-IP': `203.0.113.${attempt}`,
+        'X-Forwarded-For': `192.0.2.${attempt}`, 'X-Forwarded-Host': 'untrusted.invalid',
+        'X-Forwarded-Port': '443', 'X-Forwarded-Proto': 'https',
+        Forwarded: `for=192.0.2.${attempt};proto=https;host=untrusted.invalid`
+      }
+    })
+    adminReply(reply, attempt < 5 ? 401 : 429, 'Forged forwarding headers cannot choose login buckets')
+  }
+}
+
+async function exercise(fixture) {
+  const context = await openContext(fixture)
+  const first = await context.newPage()
+  const second = await context.newPage()
+  // Neither page is a popup/opener clone. Only the browser Cookie jar is shared.
+  await first.goto(`${fixture.origin}${target}`)
+  await atLogin(first)
+  await login(first, fixture, { wrongPassword: true })
+  await screenshot(first, `${fixture.mode}-desktop-login-error`)
+  await login(first, fixture)
+  await second.goto(`${fixture.origin}${target}`)
+  await atProtected(second, fixture)
+  await second.reload()
+  await atProtected(second, fixture)
+  await me(first, fixture)
+  await me(second, fixture)
+  await storageIsClean(first)
+  await storageIsClean(second)
+  assert.equal(await first.locator('.float-mark').evaluate((img) => img.complete && img.naturalWidth > 0), true, 'Packaged logo asset renders')
+  await screenshot(first, `${fixture.mode}-desktop-shared-login`)
+  await second.setViewportSize(mobile)
+  await screenshot(second, `${fixture.mode}-mobile-shared-login`)
+
+  const independent = await openContext(fixture, mobile)
+  const anonymous = await independent.newPage()
+  await anonymous.goto(`${fixture.origin}${target}`)
+  await atLogin(anonymous)
+  await me(anonymous, fixture, 401)
+  await me(first, fixture)
+  await independent.close()
+  contexts.delete(independent)
+  const key = await authBoundaries(fixture, first)
+
+  const formerlyValid = await currentCookie(context, fixture)
+  for (const page of [first, second]) {
+    await page.evaluate(({ keys, value }) => {
+      for (const key of keys) { sessionStorage.setItem(key, value); localStorage.setItem(key, value) }
+    }, { keys: tokenKeys, value: formerlyValid.value })
+  }
+  await context.clearCookies({ name: cookieName })
+  for (const page of [first, second]) {
+    await me(page, fixture, 401)
+    await refresh(page)
+    await atLogin(page)
+    await page.reload()
+    await atLogin(page)
+    await storageIsClean(page)
+  }
+  await screenshot(second, `${fixture.mode}-mobile-cookie-deleted`)
+  await login(first, fixture)
+  await second.reload()
+  await atProtected(second, fixture)
+
+  const beforeLogout = await currentCookie(context, fixture)
+  const loggedOut = first.waitForResponse((res) => new URL(res.url()).pathname === '/api/admin/logout')
+  await first.locator('.float-logout').click()
+  const response = await loggedOut
+  adminReply({ status: response.status(), headers: await response.allHeaders() }, 200, 'Explicit UI logout')
+  await atLogin(first, null)
+  assert.ok((await currentCookie(context, fixture)).value === beforeLogout.value, 'Logout revokes server state without clearing the Cookie')
+  await me(second, fixture, 401)
+  await refresh(second)
+  await atLogin(second)
+  adminReply(await request(fixture.origin, '/api/admin/me', { headers: { Authorization: `Bearer ${key}` } }), 200, 'Browser logout leaves installed Key valid')
+  await first.goto(`${fixture.origin}${target}`)
+  await atLogin(first)
+  await login(first, fixture)
+  await second.reload()
+  await atProtected(second, fixture)
+  await staleResponses(fixture, first, second)
+
+  await docker(['restart', '--time', '5', fixture.name])
+  await waitHealthy(fixture.origin)
+  for (const page of [first, second]) {
+    await me(page, fixture, 401)
+    await refresh(page)
+    await atLogin(page)
+  }
+  adminReply(await request(fixture.origin, '/api/admin/me', { headers: { Authorization: `Bearer ${key}` } }), 200, 'Installed Key survives restart while memory sessions do not')
+  await screenshot(first, `${fixture.mode}-desktop-restarted-session`)
+  await login(first, fixture)
+  await second.reload()
+  await atProtected(second, fixture)
+  await storageIsClean(first)
+  await storageIsClean(second)
+  await lockoutDespiteSpoofing(fixture)
+  await Promise.all(fixture.pendingObservations)
+  assert.ok(fixture.observations.length > 0)
+  assert.ok(fixture.observations.every((entry) => !entry.headerCredential), 'Packaged browser must never attach a stored header credential')
+  assert.ok(fixture.observations.some((entry) => entry.path === '/api/admin/me' && entry.cookie && entry.proof === '1'))
+  assert.deepEqual(fixture.problems, [], 'Unexpected browser/fixture errors')
+  await context.close()
+  contexts.delete(context)
+  await docker(['rm', '--force', '--volumes', fixture.name])
+  containers.delete(fixture.name)
+  console.log(`Packaged ${fixture.mode} Cookie, shared-tab, CSRF, Key and stale-response cases completed`)
+}
+
+async function cleanup() {
+  if (cleanupPromise) return cleanupPromise
+  cleanupPromise = (async () => {
+    for (const gate of gates) gate.resolve()
+    for (const context of contexts) await bounded(context.close(), 'context cleanup', 5000).catch(() => {})
+    if (browser) await bounded(browser.close(), 'browser cleanup', 5000).catch(() => {})
+    for (const server of servers) {
+      server.closeAllConnections()
+      await bounded(new Promise((resolve) => server.close(resolve)), 'listener cleanup', 5000).catch(() => {})
+    }
+    for (const name of containers) await docker(['rm', '--force', '--volumes', name]).catch(() => {})
+    await rm(temporary, { recursive: true, force: true })
+  })()
+  return cleanupPromise
+}
+
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.once(signal, () => {
+    console.error(`Packaged fixture interrupted by ${signal}`)
+    const forcedExit = setTimeout(() => process.exit(1), 20000)
+    cleanup().finally(() => { clearTimeout(forcedExit); process.exit(1) })
+  })
+}
+
+async function main() {
+  const watchdog = setTimeout(() => process.kill(process.pid, 'SIGTERM'), 9 * 60 * 1000)
+  let fixture
+  try {
+    await mkdir(temporary, { recursive: true, mode: 0o700 })
+    // Certificates are generated only on the remote runner and never uploaded.
+    await execute('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+      '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1',
+      '-keyout', join(temporary, 'tls.key'), '-out', join(temporary, 'tls.crt')], { timeout: 30000 })
+    const tls = { key: await readFile(join(temporary, 'tls.key')), cert: await readFile(join(temporary, 'tls.crt')) }
+    browser = await chromium.launch({ headless: true })
+    for (const mode of ['http', 'https']) {
+      fixture = await startFixture(mode, tls)
+      await exercise(fixture)
+    }
+  } catch (error) {
+    for (const [index, page] of (fixture?.pages || []).entries()) {
+      if (!page.isClosed()) await bounded(screenshot(page, `${fixture.mode}-failure-${index}`), 'failure screenshot', 5000).catch(() => {})
+    }
+    throw error
+  } finally {
+    clearTimeout(watchdog)
+    await cleanup()
+  }
+}
+
+main().catch((error) => { console.error(redact(error.stack || error)); process.exitCode = 1 })

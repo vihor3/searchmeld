@@ -8,7 +8,7 @@
 
 - 管理员 API Key 前缀：`oak_`
 - 外部搜索 API Token 前缀：`osr_`
-- 管理员登录 Session Token 前缀：`adm_`
+- 管理员密码会话：服务端生成的 HttpOnly Cookie `searchmeld_admin_session`，不是请求头 Token。
 - 系统同时只保存一个管理员 API Key。每次重新生成都会让旧 Key 立即失效。
 - 管理员 API Key 明文只在生成响应中显示一次，之后只能查看 `key_prefix`、`created_at`、`updated_at`。
 - 管理员 API Key 拥有完整管理权限，并可调用 Extract 而无需单独声明 `extract` scope，请只保存在可信服务端环境中。
@@ -17,37 +17,52 @@
 
 ### 2.1 管理员登录
 
-先使用管理员账号登录，获取 `adm_` Session Token：
+可以在管理台用现有管理员账号和密码登录，然后在“系统设置”中生成管理员 API Key。首次账号仍由现有启动配置创建，不需要新的初始化服务。
+
+无浏览器的 HTTP 客户端也可以登录。下面的 Bash 示例使用权限受限的临时 Cookie jar，后续 2.2–2.4 在同一 shell 中执行。示例密码仅是占位符；真实凭据不要写入命令行参数、shell 历史或日志，可改用权限为 `600` 的 JSON 文件作为 `--data-binary @文件路径` 输入。公网将 `BASE_URL` 改为已配置的 HTTPS 源，部署要求见 [README](../README.md)。
 
 ```bash
-curl -X POST http://localhost:5173/api/admin/login \
+umask 077
+BASE_URL=http://localhost:5173
+COOKIE_JAR=$(mktemp)
+trap 'rm -f -- "$COOKIE_JAR"' EXIT
+
+curl --fail-with-body -X POST "$BASE_URL/api/admin/login" \
+  --cookie-jar "$COOKIE_JAR" \
+  -H 'X-SearchMeld-Admin: 1' \
   -H 'Content-Type: application/json' \
-  -d '{
-    "username": "admin",
-    "password": "your-admin-password"
-  }'
+  --data-binary @- <<'JSON'
+{
+  "username": "admin",
+  "password": "your-admin-password"
+}
+JSON
 ```
 
 响应：
 
 ```json
 {
-  "token": "adm_xxx",
   "expires_at": "2026-06-12T00:00:00Z"
 }
 ```
 
+登录只通过 `Set-Cookie` 返回会话凭据，JSON 不包含 `token`。Cookie 为 host-only、`Path=/api/admin`、`HttpOnly`、`SameSite=Lax`，无 Max-Age/Expires；HTTPS 规范源下设置 Secure。服务端默认固定 24 小时到期，后端重启也会失效；浏览器的会话恢复不会延长服务端期限。不要展示、提交或上传 Cookie jar。
+
+Cookie 登录在同一浏览器配置的独立标签页共享。所有 Cookie 管理调用（包括 GET）及密码登录都需要 `X-SearchMeld-Admin: 1`；浏览器 fetch 还需 `credentials: 'include'`。如果提供 Origin，必须匹配规范源或明确配置的可信源；originless CLI 可以凭证明头和 Cookie 使用这些接口。
+
 ### 2.2 生成或轮换管理员 API Key
 
 ```bash
-curl -X POST http://localhost:5173/api/admin/settings/admin-api-key \
-  -H "Authorization: Bearer adm_xxx"
+curl --fail-with-body -X POST "$BASE_URL/api/admin/settings/admin-api-key" \
+  --cookie "$COOKIE_JAR" \
+  -H 'X-SearchMeld-Admin: 1'
 ```
 
 也可以用已有管理员 API Key 自我轮换：
 
 ```bash
-curl -X POST http://localhost:5173/api/admin/settings/admin-api-key \
+curl -X POST "$BASE_URL/api/admin/settings/admin-api-key" \
   -H "Authorization: Bearer oak_old_xxx"
 ```
 
@@ -71,8 +86,9 @@ curl -X POST http://localhost:5173/api/admin/settings/admin-api-key \
 ### 2.3 查看当前管理员 API Key 元信息
 
 ```bash
-curl http://localhost:5173/api/admin/settings/admin-api-key \
-  -H "Authorization: Bearer adm_xxx"
+curl --fail-with-body "$BASE_URL/api/admin/settings/admin-api-key" \
+  --cookie "$COOKIE_JAR" \
+  -H 'X-SearchMeld-Admin: 1'
 ```
 
 响应示例：
@@ -90,6 +106,17 @@ curl http://localhost:5173/api/admin/settings/admin-api-key \
 ```json
 {}
 ```
+
+### 2.4 注销密码会话
+
+```bash
+curl --fail-with-body -X POST "$BASE_URL/api/admin/logout" \
+  --cookie "$COOKIE_JAR" \
+  -H 'X-SearchMeld-Admin: 1'
+rm -f -- "$COOKIE_JAR"
+```
+
+成功返回 `{"status":"ok"}`，只撤销本次鉴权的服务端会话，不发送清除 Cookie 的 `Set-Cookie`，避免延迟响应抹掉其他标签页的新登录。失效 Cookie 即使保留也无法鉴权。Cookie 删除、服务端到期/重启、成功退出后，下一次管理请求必须重新登录。403、网络错误或 5xx 不证明注销成功，应确认后重试。API Key 调用 logout 是不撤销 Key 的成功操作，也不注销请求中偶然携带的 Cookie 会话。
 
 ## 3. 鉴权调用方式
 
@@ -124,6 +151,10 @@ curl "$BASE_URL/api/admin/dashboard" \
   -H "X-API-Key: $ADMIN_API_KEY"
 ```
 
+请求一旦携带 Authorization 或 X-API-Key，就只按请求头选择规则验证管理员 Key；已选的空值、无效凭据、旧 `adm_` 或普通 `osr_` 管理请求返回 401，不回退到偶然携带的有效 Cookie。Bearer 优先于 X-API-Key；有效 `oak_` CLI 无需 Cookie 或 `X-SearchMeld-Admin`。提供了 Origin 的 Key 请求仍须通过严格的管理源校验。
+
+**旧客户端迁移**：账号密码登录接口没有删除，但不再返回 JSON `token`，`adm_` 不再可作 Bearer/X-API-Key 管理凭据。已有脚本改用持久 `oak_`，首次生成使用上面的 Cookie jar 或设置页。升级前已打开的管理页面仍有期待 token JSON 的旧 JavaScript，先刷新旧页面加载新版，再登录一次；不要只在旧表单中重新输入密码。新版页面和新标签页共享 Cookie。已有账号、Key、Token 及权限不重建。网页 Cookie 不授予业务 API 或需要鉴权的 MCP 权限，不能用旧 localStorage/sessionStorage Token 绕过 Cookie 删除。管理接口的成功、失败及秘密查看响应均设置 `Cache-Control: no-store`、`Pragma: no-cache`。
+
 ## 4. 管理员 API Key 开放接口总览
 
 除 `POST /api/admin/login` 是用户名密码登录入口外，管理员 API Key 可调用以下两类接口：
@@ -137,8 +168,8 @@ curl "$BASE_URL/api/admin/dashboard" \
 
 | 方法 | 路径 | 能否使用管理员 API Key | 说明 |
 | --- | --- | --- | --- |
-| `POST` | `/api/admin/logout` | 可以 | 注销管理员 Session。用管理员 API Key 调用时不会吊销 API Key 本身。 |
-| `GET` | `/api/admin/me` | 可以 | 返回当前管理员身份信息。当前固定返回 `{"username":"admin"}`。 |
+| `POST` | `/api/admin/logout` | 可以 | Cookie 调用撤销本会话且不清除 Cookie；Key 调用不吊销 Key，也不注销偶然携带的 Cookie。 |
+| `GET` | `/api/admin/me` | 可以 | 返回 `{"username":"admin"}` 形式的身份信息，不返回凭据。 |
 | `GET` | `/api/admin/dashboard` | 可以 | 获取用量、Provider、Provider 健康度、30 天账单摘要。 |
 | `GET` | `/api/admin/providers` | 可以 | 获取 Provider 配置列表。 |
 | `GET` | `/api/admin/providers/health` | 可以 | 获取 Provider 健康状态。 |
@@ -695,8 +726,9 @@ curl "$BASE_URL/v1/usage/summary" \
 | --- | --- |
 | `400` | JSON 格式错误、路径参数错误、请求体非法。 |
 | `401` | 缺少或使用了无效管理员 Session / 管理员 API Key / API Token。 |
-| `403` | 普通 API Token 缺少接口所需 scope，或请求了未授权 Provider。管理员 API Key 不受此限制。 |
+| `403` | 普通 API Token 缺少 scope/Provider 权限（管理员 Key 不受这两项限制）；管理接口还会拒绝不可信 Origin 或 Cookie/登录调用缺少、错误的证明头。 |
 | `404` | 兼容接口被禁用时返回；或反向代理未命中路径。 |
+| `415` | 密码登录请求不是 JSON 媒体类型。 |
 | `429` | 管理员登录失败次数过多，或普通 API Token 触发 RPM 限制。 |
 | `502` | Provider Key 测试或官方额度查询时上游失败。 |
 | `500` | 数据库、配置、加解密或内部服务错误。 |

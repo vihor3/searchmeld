@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import { api } from '../api/client'
 import { useSessionStore } from '../stores/session'
 
 const LoginView = () => import('../views/LoginView.vue')
@@ -43,12 +44,49 @@ export function loginRedirect(value: unknown): string {
   }
 }
 
-router.beforeEach((to) => {
+let guardAttempt = 0
+let pendingRecovery: { revision: number; promise: Promise<void> } | null = null
+
+export function recheckSession(requestRevision: number, explicitLogout = false): Promise<void> {
   const session = useSessionStore()
-  if (!to.meta.public && !session.token) {
+  const route = router.currentRoute.value
+  if (requestRevision !== session.revision || (!explicitLogout && route.meta.public)) return Promise.resolve()
+  if (pendingRecovery?.revision === requestRevision) return pendingRecovery.promise
+
+  const target = explicitLogout
+    ? { path: '/login', force: true }
+    : { path: '/login', query: { redirect: loginRedirect(route.fullPath) }, force: true }
+  const promise = router.replace(target).then(() => {}).catch((cause: unknown) => {
+    if (requestRevision === session.revision) {
+      session.error = cause instanceof Error && cause.message ? cause.message : '\u65e0\u6cd5\u786e\u8ba4\u767b\u5f55\u72b6\u6001\uff0c\u8bf7\u91cd\u8bd5'
+      session.retryTarget = router.resolve(target).fullPath
+    }
+  }).finally(() => {
+    if (pendingRecovery?.promise === promise) pendingRecovery = null
+  })
+  pendingRecovery = { revision: requestRevision, promise }
+  return promise
+}
+
+router.beforeEach(async (to) => {
+  const attempt = ++guardAttempt
+  const session = useSessionStore()
+  let result = await session.check(api.me)
+  if (attempt !== guardAttempt) return false
+  if (result.revision !== session.revision) {
+    // One fresh check is enough; a second auth transition owns its own navigation.
+    result = await session.check(api.me)
+    if (attempt !== guardAttempt || result.revision !== session.revision) return false
+  }
+  if (result.status === 'error') {
+    session.retryTarget = to.fullPath
+    return false
+  }
+  if (!to.meta.public && result.status === 'anonymous') {
     return { path: '/login', query: { redirect: loginRedirect(to.fullPath) } }
   }
-  if (to.meta.public && session.token) return loginRedirect(to.query.redirect)
+  if (to.meta.public && result.status === 'authenticated') return loginRedirect(to.query.redirect)
+  if (!to.matched.length) return '/playground'
 })
 
 export default router

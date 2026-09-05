@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -31,6 +33,7 @@ type Config struct {
 	ServerWriteTimeout      time.Duration
 	ServerIdleTimeout       time.Duration
 	AdminSessionTTL         time.Duration
+	AdminPublicOrigin       string
 	AdminLoginMaxAttempts   int
 	AdminLoginWindow        time.Duration
 	AdminLoginLockout       time.Duration
@@ -67,9 +70,17 @@ func Load() (Config, error) {
 		ServerWriteTimeout:      time.Duration(getInt("SERVER_WRITE_TIMEOUT_MS", 1200000)) * time.Millisecond,
 		ServerIdleTimeout:       time.Duration(getInt("SERVER_IDLE_TIMEOUT_MS", 60000)) * time.Millisecond,
 		AdminSessionTTL:         time.Duration(getInt("ADMIN_SESSION_TTL_HOURS", 24)) * time.Hour,
+		AdminPublicOrigin:       getString("ADMIN_PUBLIC_ORIGIN", ""),
 		AdminLoginMaxAttempts:   getInt("ADMIN_LOGIN_MAX_ATTEMPTS", 5),
 		AdminLoginWindow:        time.Duration(getInt("ADMIN_LOGIN_WINDOW_MS", 300000)) * time.Millisecond,
 		AdminLoginLockout:       time.Duration(getInt("ADMIN_LOGIN_LOCKOUT_MS", 900000)) * time.Millisecond,
+	}
+	if cfg.AdminPublicOrigin != "" {
+		origin, err := NormalizeHTTPOrigin(cfg.AdminPublicOrigin)
+		if err != nil {
+			return cfg, fmt.Errorf("ADMIN_PUBLIC_ORIGIN: %w", err)
+		}
+		cfg.AdminPublicOrigin = origin
 	}
 	return cfg, cfg.Validate()
 }
@@ -80,6 +91,11 @@ func (c Config) Validate() error {
 	}
 	if c.AdminSessionTTL <= 0 {
 		return fmt.Errorf("ADMIN_SESSION_TTL_HOURS must be positive")
+	}
+	if c.AdminPublicOrigin != "" {
+		if _, err := NormalizeHTTPOrigin(c.AdminPublicOrigin); err != nil {
+			return fmt.Errorf("ADMIN_PUBLIC_ORIGIN: %w", err)
+		}
 	}
 	if isProduction(c.AppEnv) {
 		if strings.TrimSpace(c.EncryptionKey) == "" {
@@ -93,6 +109,67 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// NormalizeHTTPOrigin accepts an HTTP(S) authority, optionally followed by /.
+// Keep config and browser-origin comparisons on the same parsing rules.
+func NormalizeHTTPOrigin(value string) (string, error) {
+	invalid := fmt.Errorf("must be one HTTP(S) origin without credentials, path, query, fragment or wildcard")
+	u, err := url.Parse(value)
+	if err != nil || u.Opaque != "" || u.User != nil || u.Host == "" ||
+		(u.Path != "" && u.Path != "/") || u.RawPath != "" || u.RawQuery != "" ||
+		u.ForceQuery || u.Fragment != "" || strings.ContainsAny(value, "*#\\ \t\r\n") {
+		return "", invalid
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", invalid
+	}
+	host := strings.ToLower(u.Hostname())
+	if ip, err := netip.ParseAddr(host); err == nil {
+		if ip.Zone() != "" {
+			return "", invalid
+		}
+		if ip.Is6() {
+			if !strings.HasPrefix(u.Host, "[") {
+				return "", invalid
+			}
+			host = "[" + ip.String() + "]"
+		} else {
+			if strings.HasPrefix(u.Host, "[") {
+				return "", invalid
+			}
+			host = ip.String()
+		}
+	} else {
+		if strings.HasPrefix(u.Host, "[") || len(host) > 253 {
+			return "", invalid
+		}
+		for _, label := range strings.Split(strings.TrimSuffix(host, "."), ".") {
+			if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+				return "", invalid
+			}
+			for _, ch := range label {
+				if (ch < 'a' || ch > 'z') && (ch < '0' || ch > '9') && ch != '-' {
+					return "", invalid
+				}
+			}
+		}
+	}
+	port := u.Port()
+	if port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return "", invalid
+		}
+		port = strconv.Itoa(number)
+	} else if strings.HasSuffix(u.Host, ":") {
+		return "", invalid
+	}
+	if port != "" && !(scheme == "http" && port == "80") && !(scheme == "https" && port == "443") {
+		host += ":" + port
+	}
+	return (&url.URL{Scheme: scheme, Host: host}).String(), nil
 }
 
 func isProduction(appEnv string) bool {

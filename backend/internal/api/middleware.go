@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/vihor3/searchmeld/backend/internal/config"
 	"github.com/vihor3/searchmeld/backend/internal/model"
 )
 
@@ -22,6 +23,13 @@ const (
 	compatAPIKey  contextKey = "compat_api_key"
 	adminActorKey contextKey = "admin_actor"
 )
+
+const (
+	adminSessionCookieName = "searchmeld_admin_session"
+	adminBrowserHeader     = "X-SearchMeld-Admin"
+)
+
+const adminCookieSecureKey contextKey = "admin_cookie_secure"
 
 func requestIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -62,6 +70,10 @@ func corsMiddleware(origins []string) func(http.Handler) http.Handler {
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if isAdminPath(r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
 			origin := r.Header.Get("Origin")
 			if allowAll || allowed[origin] {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
@@ -80,6 +92,139 @@ func corsMiddleware(origins []string) func(http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func isAdminPath(path string) bool {
+	return path == "/api/admin" || strings.HasPrefix(path, "/api/admin/")
+}
+
+func adminBrowserMiddleware(publicOrigin string, corsOrigins []string) func(http.Handler) http.Handler {
+	allowed := map[string]bool{}
+	for _, raw := range corsOrigins {
+		if origin, err := config.NormalizeHTTPOrigin(raw); err == nil {
+			allowed[origin] = true
+		}
+	}
+	configuredOrigin := ""
+	var configErr error
+	if publicOrigin != "" {
+		configuredOrigin, configErr = config.NormalizeHTTPOrigin(publicOrigin)
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !isAdminPath(r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("Pragma", "no-cache")
+			w.Header().Add("Vary", "Origin")
+			if configErr != nil {
+				writeError(w, http.StatusInternalServerError, "invalid admin public origin configuration")
+				return
+			}
+			targetOrigin := configuredOrigin
+			if targetOrigin == "" {
+				scheme := "http"
+				if r.TLS != nil {
+					scheme = "https"
+				}
+				var err error
+				targetOrigin, err = config.NormalizeHTTPOrigin(scheme + "://" + r.Host)
+				if err != nil {
+					writeError(w, http.StatusForbidden, "invalid admin request origin")
+					return
+				}
+			}
+			origins, supplied := r.Header["Origin"]
+			if supplied {
+				if len(origins) != 1 || strings.HasSuffix(origins[0], "/") {
+					writeError(w, http.StatusForbidden, "admin origin not allowed")
+					return
+				}
+				origin, err := config.NormalizeHTTPOrigin(origins[0])
+				if err != nil || (origin != targetOrigin && !allowed[origin]) {
+					writeError(w, http.StatusForbidden, "admin origin not allowed")
+					return
+				}
+				if configuredOrigin == "" && r.TLS == nil && strings.HasPrefix(origin, "https://") {
+					writeError(w, http.StatusForbidden, "ADMIN_PUBLIC_ORIGIN is required for HTTPS admin access behind a proxy")
+					return
+				}
+				w.Header().Set("Access-Control-Allow-Origin", origins[0])
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+				w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID")
+			}
+			if r.Method == http.MethodOptions {
+				w.Header().Add("Vary", "Access-Control-Request-Method")
+				w.Header().Add("Vary", "Access-Control-Request-Headers")
+				if !supplied || !validAdminPreflight(r) {
+					writeError(w, http.StatusForbidden, "admin preflight not allowed")
+					return
+				}
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key, X-Request-ID, "+adminBrowserHeader)
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			ctx := context.WithValue(r.Context(), adminCookieSecureKey, r.TLS != nil || strings.HasPrefix(targetOrigin, "https://"))
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+func validAdminPreflight(r *http.Request) bool {
+	methods := r.Header.Values("Access-Control-Request-Method")
+	if len(methods) != 1 {
+		return false
+	}
+	switch methods[0] {
+	case http.MethodGet, http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, http.MethodOptions:
+	default:
+		return false
+	}
+	for _, value := range r.Header.Values("Access-Control-Request-Headers") {
+		for _, name := range strings.Split(value, ",") {
+			switch strings.ToLower(strings.TrimSpace(name)) {
+			case "authorization", "content-type", "x-api-key", "x-request-id", "x-searchmeld-admin":
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func requireAdminBrowserProof(w http.ResponseWriter, r *http.Request) bool {
+	values := r.Header.Values(adminBrowserHeader)
+	if len(values) != 1 || values[0] != "1" {
+		writeError(w, http.StatusForbidden, "admin browser proof required")
+		return false
+	}
+	return true
+}
+
+func adminCookieSecure(r *http.Request) bool {
+	if secure, ok := r.Context().Value(adminCookieSecureKey).(bool); ok {
+		return secure
+	}
+	return r.TLS != nil
+}
+
+// Only the bundled loopback proxy may replace the socket peer's address.
+func trustedProxyIPMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		peer := net.ParseIP(clientIP(r))
+		if peer != nil && peer.IsLoopback() {
+			values := r.Header.Values("X-Real-IP")
+			if len(values) == 1 {
+				if ip := net.ParseIP(values[0]); ip != nil {
+					r.RemoteAddr = ip.String()
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func securityHeadersMiddleware(next http.Handler) http.Handler {

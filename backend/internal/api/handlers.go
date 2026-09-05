@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
@@ -585,11 +586,29 @@ func (h *Handler) auditLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
+	if !requireAdminBrowserProof(w, r) {
+		return
+	}
+	mediaTypes := r.Header.Values("Content-Type")
+	if len(mediaTypes) != 1 {
+		writeError(w, http.StatusUnsupportedMediaType, "application/json required")
+		return
+	}
+	mediaType, _, err := mime.ParseMediaType(mediaTypes[0])
+	if err != nil || mediaType != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, "application/json required")
+		return
+	}
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if err := decoder.Decode(new(interface{})); err != io.EOF {
 		writeError(w, http.StatusBadRequest, "invalid json body")
 		return
 	}
@@ -609,11 +628,23 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	h.audit(r, req.Username, "admin.login", "session", "", map[string]interface{}{"ip": ip, "expires_at": expiresAt})
-	writeJSON(w, http.StatusOK, map[string]interface{}{"token": token, "expires_at": expiresAt})
+	http.SetCookie(w, &http.Cookie{
+		Name:     adminSessionCookieName,
+		Value:    token,
+		Path:     "/api/admin",
+		HttpOnly: true,
+		Secure:   adminCookieSecure(r),
+		SameSite: http.SameSiteLaxMode,
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"expires_at": expiresAt})
 }
 
 func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
-	loggedOut := h.auth.Logout(bearerToken(r))
+	credential, _ := r.Context().Value(adminCredentialKey).(adminCredential)
+	loggedOut := false
+	if credential.Kind == adminCookieCredential {
+		loggedOut = h.auth.Logout(credential.SessionToken)
+	}
 	h.audit(r, "admin", "admin.logout", "session", "", map[string]interface{}{"logged_out": loggedOut, "ip": clientIP(r)})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

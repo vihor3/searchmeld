@@ -20,6 +20,20 @@ var (
 
 const extractRejectedKey contextKey = "extract_rejected"
 
+const adminCredentialKey contextKey = "admin_credential"
+
+type adminCredentialKind string
+
+const (
+	adminCookieCredential adminCredentialKind = "cookie"
+	adminKeyCredential    adminCredentialKind = "key"
+)
+
+type adminCredential struct {
+	Kind         adminCredentialKind
+	SessionToken string
+}
+
 type AuthStore interface {
 	GetAdminByUsername(ctx context.Context, username string) (model.AdminUser, error)
 	FindAdminAPIKey(ctx context.Context, token string) (model.AdminAPIKey, bool, error)
@@ -126,26 +140,49 @@ func (a *AuthService) Logout(token string) bool {
 
 func (a *AuthService) requireAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := bearerToken(r)
-		if token != "" && a.validSession(token) {
-			ctx := context.WithValue(r.Context(), adminActorKey, "admin")
+		if token, supplied := adminHeaderCredential(r); supplied {
+			if !strings.HasPrefix(token, "oak_") {
+				writeError(w, http.StatusUnauthorized, "admin login required")
+				return
+			}
+			adminKey, ok, err := a.store.FindAdminAPIKey(r.Context(), token)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "could not validate admin api key")
+				return
+			}
+			if !ok {
+				writeError(w, http.StatusUnauthorized, "admin login required")
+				return
+			}
+			ctx := context.WithValue(r.Context(), adminActorKey, adminAPIKeyActor(adminKey))
+			ctx = context.WithValue(ctx, adminCredentialKey, adminCredential{Kind: adminKeyCredential})
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
-		if token != "" {
-			adminKey, ok, err := a.store.FindAdminAPIKey(r.Context(), token)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			if ok {
-				ctx := context.WithValue(r.Context(), adminActorKey, adminAPIKeyActor(adminKey))
-				next.ServeHTTP(w, r.WithContext(ctx))
-				return
-			}
+		cookie, err := r.Cookie(adminSessionCookieName)
+		if err != nil || !a.validSession(cookie.Value) {
+			writeError(w, http.StatusUnauthorized, "admin login required")
+			return
 		}
-		writeError(w, http.StatusUnauthorized, "admin login required")
+		if !requireAdminBrowserProof(w, r) {
+			return
+		}
+		ctx := context.WithValue(r.Context(), adminActorKey, "admin")
+		ctx = context.WithValue(ctx, adminCredentialKey, adminCredential{Kind: adminCookieCredential, SessionToken: cookie.Value})
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func adminHeaderCredential(r *http.Request) (string, bool) {
+	authorization, hasAuthorization := r.Header["Authorization"]
+	apiKey, hasAPIKey := r.Header[http.CanonicalHeaderKey("X-API-Key")]
+	if !hasAuthorization && !hasAPIKey {
+		return "", false
+	}
+	if len(authorization) > 1 || len(apiKey) > 1 {
+		return "", true
+	}
+	return bearerToken(r), true
 }
 
 func (a *AuthService) requireAPIToken(next http.Handler) http.Handler {

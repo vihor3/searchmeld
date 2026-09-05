@@ -185,7 +185,7 @@ jobs:
   images:
     name: Image build (${{ matrix.target }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -199,6 +199,61 @@ jobs:
 
       - name: Build root image without publishing
         run: docker build --pull --progress plain --target "$BUILD_TARGET" --tag "searchmeld:ci-$BUILD_TARGET" .
+
+      - name: Set up Node for packaged browser integration
+        if: ${{ matrix.target == 'all-in-one' }}
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      - name: Install test-only Playwright for the existing all-in-one image
+        if: ${{ matrix.target == 'all-in-one' }}
+        timeout-minutes: 8
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/admin-cookie-browsers
+        run: |
+          test "${GITHUB_ACTIONS:-}" = true
+          npm install --prefix "$RUNNER_TEMP/admin-cookie-playwright" \
+            --no-save --no-package-lock --ignore-scripts --no-audit --no-fund playwright@1.63.0
+          node "$RUNNER_TEMP/admin-cookie-playwright/node_modules/playwright/cli.js" \
+            install --with-deps chromium
+
+      - name: Exercise packaged HTTP and HTTPS admin Cookies
+        if: ${{ matrix.target == 'all-in-one' }}
+        id: cookies
+        timeout-minutes: 12
+        env:
+          COOKIE_CONTAINER_PREFIX: searchmeld-admin-cookie-${{ github.run_id }}-${{ github.run_attempt }}
+          COOKIE_TEST_TEMP: ${{ runner.temp }}/admin-cookie-fixture
+          NODE_PATH: ${{ runner.temp }}/admin-cookie-playwright/node_modules
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/admin-cookie-browsers
+          ARTIFACT_DIR: ${{ runner.temp }}/admin-cookie-artifacts
+        run: |
+          test "${GITHUB_ACTIONS:-}" = true
+          node deploy/admin_cookie_integration_test.cjs
+
+      - name: Upload synthetic packaged-browser screenshots
+        if: ${{ matrix.target == 'all-in-one' && !cancelled() && (steps.cookies.outcome == 'success' || steps.cookies.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 2
+        with:
+          name: admin-cookie-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/admin-cookie-artifacts/**/*.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove packaged browser containers, volumes and temporary files
+        if: ${{ always() && matrix.target == 'all-in-one' }}
+        timeout-minutes: 3
+        run: |
+          test "${GITHUB_ACTIONS:-}" = true
+          # Named fallback also runs when cancellation interrupts Node cleanup.
+          for mode in http https; do
+            docker rm --force --volumes "searchmeld-admin-cookie-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$mode" >/dev/null 2>&1 || true
+          done
+          rm -rf -- "$RUNNER_TEMP/admin-cookie-fixture" \
+            "$RUNNER_TEMP/admin-cookie-playwright" "$RUNNER_TEMP/admin-cookie-browsers" \
+            "$RUNNER_TEMP/admin-cookie-artifacts"
 
       - name: Remove the test image
         if: ${{ always() }}

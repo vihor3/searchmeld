@@ -4,7 +4,6 @@ import (
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
 	"github.com/vihor3/searchmeld/backend/internal/config"
 )
 
@@ -19,8 +18,9 @@ func NewServer(cfg config.Config, log requestLogger) *Server {
 	server := &Server{cfg: cfg, log: log, healthy: func() bool { return true }}
 	r := chi.NewRouter()
 	r.Use(requestIDMiddleware)
-	r.Use(middleware.RealIP)
+	r.Use(trustedProxyIPMiddleware)
 	r.Use(securityHeadersMiddleware)
+	r.Use(adminBrowserMiddleware(cfg.AdminPublicOrigin, cfg.CorsOrigins))
 	r.Use(corsMiddleware(cfg.CorsOrigins))
 	r.Use(bodyLimitMiddleware(cfg.RequestBodyLimitBytes))
 	r.Use(loggingMiddleware(log))
