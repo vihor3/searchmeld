@@ -46,8 +46,8 @@ async function login() {
 </script>
 
 <style scoped>
-.login-page { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
-.login-card { width: 390px; max-width: 100%; text-align: center; }
+.login-page { min-height: 100vh; display: grid; grid-template-columns: minmax(0, 1fr); place-items: center; padding: 24px; }
+.login-card { width: 100%; max-width: 390px; min-width: 0; text-align: center; }
 .login-logo {
   width: 52px; height: 52px; display: block; margin: 0 auto 12px;
   border-radius: 14px; object-fit: cover;

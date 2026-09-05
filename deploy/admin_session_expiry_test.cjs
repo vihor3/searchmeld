@@ -234,6 +234,24 @@ async function legacyCopies(app) {
 
 async function onLogin(app, redirect) {
   await app.page.locator('.login-card').waitFor()
+  const viewport = app.page.viewportSize()
+  assert.ok(viewport, 'Login layout requires an explicit browser viewport')
+  const layout = await app.page.evaluate(() => ({
+    viewport: document.documentElement.clientWidth,
+    windowWidth: window.innerWidth,
+    elements: ['html', 'body', '#app', '.login-page', '.login-card'].map((selector) => {
+      const element = document.querySelector(selector)
+      if (!element) throw new Error(`Missing login layout element: ${selector}`)
+      const bounds = element.getBoundingClientRect()
+      return { selector, left: bounds.left, right: bounds.right, clientWidth: element.clientWidth, scrollWidth: element.scrollWidth }
+    })
+  }))
+  assert.equal(layout.windowWidth, viewport.width, 'Login window must retain the configured viewport width')
+  assert.ok(layout.viewport <= viewport.width, 'Login root must not expand the configured viewport')
+  for (const element of layout.elements) {
+    assert.ok(element.scrollWidth <= element.clientWidth + 1, `${element.selector} scrollWidth ${element.scrollWidth} exceeds clientWidth ${element.clientWidth}`)
+    assert.ok(element.left >= -1 && element.right <= viewport.width + 1, `${element.selector} bounds [${element.left}, ${element.right}] exceed configured viewport ${viewport.width}`)
+  }
   const url = new URL(app.page.url())
   assert.equal(url.pathname, '/login')
   assert.equal(url.searchParams.get('redirect'), redirect)

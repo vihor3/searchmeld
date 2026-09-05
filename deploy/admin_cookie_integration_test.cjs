@@ -74,14 +74,28 @@ async function docker(args) {
   return stdout.trim()
 }
 
-function request(origin, path, { method = 'GET', headers = {}, body } = {}) {
+async function inspectContainer(name) {
+  // Never inspect Env, State.Health.Log or application logs: only lifecycle
+  // status and published bindings are needed to diagnose this fixture.
+  const format = '{"status":{{json .State.Status}},"running":{{json .State.Running}},"exit_code":{{json .State.ExitCode}},"ports":{{json .NetworkSettings.Ports}}}'
+  const { stdout } = await execute('docker', ['inspect', '--type', 'container', '--format', format, name], {
+    timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 64 * 1024
+  })
+  return JSON.parse(stdout)
+}
+
+function requestErrorCode(error) {
+  return typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : 'REQUEST_FAILED'
+}
+
+function request(origin, path, { method = 'GET', headers = {}, body, timeout = 10000 } = {}) {
   const url = new URL(path, origin)
   assert.equal(url.hostname, '127.0.0.1', 'Fixtures must not contact external services')
   return new Promise((resolve, reject) => {
     const transport = url.protocol === 'https:' ? https : http
     const payload = body === undefined ? undefined : JSON.stringify(body)
     const req = transport.request(url, {
-      method, agent: false, rejectUnauthorized: false,
+      method, agent: false, rejectUnauthorized: false, signal: AbortSignal.timeout(timeout),
       headers: { ...(payload === undefined ? {} : { 'Content-Type': 'application/json' }), ...headers }
     }, (res) => {
       const chunks = []
@@ -94,7 +108,7 @@ function request(origin, path, { method = 'GET', headers = {}, body } = {}) {
       res.on('error', reject)
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks).toString('utf8') }))
     })
-    req.setTimeout(10000, () => req.destroy(new Error('Fixture HTTP request timed out')))
+    req.setTimeout(timeout, () => req.destroy(Object.assign(new Error('Fixture HTTP request timed out'), { code: 'ETIMEDOUT' })))
     req.on('error', reject)
     req.end(payload)
   })
@@ -108,15 +122,51 @@ function adminReply(reply, status, label, { login = false } = {}) {
   return reply
 }
 
-async function waitHealthy(origin) {
-  const deadline = Date.now() + 120000
-  while (Date.now() < deadline) {
-    try {
-      if ((await request(origin, '/healthz')).status === 200) return
-    } catch { /* The packaged database and backend are still starting. */ }
-    await new Promise((resolve) => setTimeout(resolve, 500))
+async function healthDiagnostics(fixture, phase, lastHealthError) {
+  let state
+  try {
+    state = await inspectContainer(fixture.name)
+  } catch (error) {
+    state = { inspect_error: requestErrorCode(error) }
   }
-  throw new Error('Packaged instance did not become healthy within 120 seconds')
+  console.error(`Packaged ${fixture.mode} ${phase} health diagnostics: ${JSON.stringify({
+    ...state, browser_origin: fixture.origin, upstream: fixture.upstream || null, last_health_error: lastHealthError
+  })}`)
+}
+
+async function waitHealthy(fixture, phase) {
+  let lastHealthError = { error: 'NOT_PROBED' }
+  try {
+    const state = await inspectContainer(fixture.name)
+    const bindings = state.ports?.['80/tcp'] || []
+    assert.equal(bindings.length, 1, 'One published fixture binding is required')
+    const [binding] = bindings
+    assert.equal(binding.HostIp, '127.0.0.1')
+    const port = Number(binding.HostPort)
+    assert.ok(Number.isInteger(port) && port > 0 && port <= 65535, 'Valid published fixture port')
+    const previousUpstream = fixture.upstream || null
+    fixture.upstream = `http://127.0.0.1:${port}`
+    console.log(`Packaged ${fixture.mode} ${phase} mapping: ${JSON.stringify({
+      browser_origin: fixture.origin, previous_upstream: previousUpstream, upstream: fixture.upstream
+    })}`)
+
+    const deadline = Date.now() + 120000
+    while (Date.now() < deadline) {
+      fixture.upstreamHealthError = null
+      try {
+        const response = await request(fixture.origin, '/healthz', { timeout: Math.max(1, Math.min(10000, deadline - Date.now())) })
+        if (response.status === 200) return
+        lastHealthError = { status: response.status, upstream_error: fixture.upstreamHealthError }
+      } catch (error) {
+        lastHealthError = { error: requestErrorCode(error), upstream_error: fixture.upstreamHealthError }
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(500, deadline - Date.now()))))
+    }
+    throw new Error(`Packaged ${fixture.mode} instance did not become healthy within 120 seconds (${phase})`)
+  } catch (error) {
+    await healthDiagnostics(fixture, phase, lastHealthError)
+    throw error
+  }
 }
 
 async function listen(server) {
@@ -136,38 +186,45 @@ async function listen(server) {
 async function startFixture(mode, tls) {
   const fixture = { mode, name: `${prefix}-${mode}`, problems: [], observations: [], pages: [], pendingObservations: [] }
   fixture.credentials = { username: 'ci-cookie-operator', password: secret(randomBytes(24).toString('hex')) }
-  let upstream
-  if (mode === 'https') {
-    // This is only TLS termination. Both application and API still go through
-    // the unchanged built asset tree and the bundled Nginx -> Go boundary.
-    const proxy = https.createServer(tls, (req, res) => {
-      if (!upstream) { res.writeHead(503).end(); return }
-      const headers = { ...req.headers, host: req.headers.host }
+  // Keep the browser's actual listening origin alive across container restarts.
+  // Docker's dynamically published upstream is re-inspected after every start;
+  // all traffic still traverses the built assets and bundled Nginx -> Go.
+  const forward = (req, res) => {
+    if (!fixture.upstream) { res.writeHead(503).end(); return }
+    const headers = { ...req.headers, host: req.headers.host }
+    if (mode === 'https') {
       for (const name of ['forwarded', 'true-client-ip', 'x-real-ip', 'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-port']) delete headers[name]
       headers['x-forwarded-proto'] = 'https'
-      const destination = new URL(upstream)
-      const forwarded = http.request({ hostname: destination.hostname, port: destination.port, path: req.url, method: req.method, headers, agent: false }, (reply) => {
-        res.writeHead(reply.statusCode, reply.headers)
-        reply.on('error', () => res.destroy())
-        reply.pipe(res)
-      })
-      forwarded.setTimeout(10000, () => forwarded.destroy())
-      forwarded.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end() })
-      req.on('aborted', () => forwarded.destroy())
-      res.on('close', () => forwarded.destroy())
-      req.pipe(forwarded)
+    }
+    // HTTP forwards spoof-test headers unchanged to the bundled proxy.
+    const destination = new URL(fixture.upstream)
+    const forwarded = http.request({ hostname: destination.hostname, port: destination.port, path: req.url, method: req.method, headers, agent: false }, (reply) => {
+      res.writeHead(reply.statusCode, reply.headers)
+      reply.on('error', () => res.destroy())
+      reply.pipe(res)
     })
-    fixture.origin = `https://127.0.0.1:${await listen(proxy)}`
+    forwarded.setTimeout(10000, () => forwarded.destroy(Object.assign(new Error('Fixture upstream request timed out'), { code: 'ETIMEDOUT' })))
+    forwarded.on('error', (error) => {
+      if (req.url === '/healthz') fixture.upstreamHealthError = requestErrorCode(error)
+      if (!res.headersSent) res.writeHead(502)
+      res.end()
+    })
+    req.on('aborted', () => forwarded.destroy())
+    res.on('close', () => forwarded.destroy())
+    req.pipe(forwarded)
   }
+  const proxy = mode === 'https' ? https.createServer(tls, forward) : http.createServer(forward)
+  fixture.origin = `${mode}://127.0.0.1:${await listen(proxy)}`
+  assert.ok(new URL(fixture.origin).port, 'Exercise a non-default Host port')
   const environment = {
     APP_ENV: 'production', DATABASE_MODE: 'embedded', DATABASE_URL: '',
     POSTGRES_DB: 'cookie_fixture', POSTGRES_USER: 'cookie_fixture',
     POSTGRES_PASSWORD: secret(randomBytes(24).toString('hex')),
     ENCRYPTION_KEY: secret(randomBytes(32).toString('hex')),
     ADMIN_USERNAME: fixture.credentials.username, ADMIN_PASSWORD: fixture.credentials.password,
-    ADMIN_PUBLIC_ORIGIN: fixture.origin || '', ADMIN_LOGIN_MAX_ATTEMPTS: '5',
+    ADMIN_PUBLIC_ORIGIN: '', ADMIN_LOGIN_MAX_ATTEMPTS: '5',
     API_AUTH_REQUIRED: 'true', MCP_ENABLED: 'true',
-    CORS_ALLOWED_ORIGINS: fixture.origin ? `*,${fixture.origin}` : '*',
+    CORS_ALLOWED_ORIGINS: mode === 'https' ? `*,${fixture.origin}` : '*',
     HTTP_PROXY: '', HTTPS_PROXY: '', ALL_PROXY: '', http_proxy: '', https_proxy: '', all_proxy: ''
   }
   const environmentPath = join(temporary, `${mode}.env`)
@@ -181,20 +238,14 @@ async function startFixture(mode, tls) {
     await docker(['run', '--detach', '--pull', 'never', '--name', fixture.name,
       '--label', `searchmeld.admin-cookie-fixture=${prefix}`,
       '--publish', '127.0.0.1::80', '--env-file', environmentPath, 'searchmeld:ci-all-in-one'])
-    const bindings = JSON.parse(await docker(['inspect', '--format', '{{json .NetworkSettings.Ports}}', fixture.name]))
-    const [binding] = bindings['80/tcp']
-    assert.equal(binding.HostIp, '127.0.0.1')
-    upstream = `http://127.0.0.1:${binding.HostPort}`
-    if (mode === 'http') fixture.origin = upstream
-    assert.ok(new URL(fixture.origin).port, 'Exercise a non-default Host port')
-    await waitHealthy(fixture.origin)
+    await waitHealthy(fixture, mode === 'https' && !publicOrigin ? 'missing-origin startup' : 'startup')
     if (mode === 'https' && !publicOrigin) {
       adminReply(await request(fixture.origin, '/api/admin/login', {
         method: 'POST', headers: { ...proof, Origin: fixture.origin }, body: fixture.credentials
       }), 403, 'Allowlisted HTTPS Origin without public-origin configuration must not downgrade Cookie security')
       await docker(['rm', '--force', '--volumes', fixture.name])
       containers.delete(fixture.name)
-      upstream = undefined
+      fixture.upstream = undefined
     }
   }
 
@@ -564,6 +615,7 @@ async function exercise(fixture) {
   await login(first, fixture, { wrongPassword: true })
   await screenshot(first, `${fixture.mode}-desktop-login-error`)
   await login(first, fixture)
+  await first.locator('.el-message--error').waitFor({ state: 'hidden' })
   await second.goto(`${fixture.origin}${target}`)
   await atProtected(second, fixture)
   await second.reload()
@@ -625,9 +677,19 @@ async function exercise(fixture) {
   await atProtected(second, fixture)
   await staleResponses(fixture, first, second)
 
-  await docker(['restart', '--time', '5', fixture.name])
-  await waitHealthy(fixture.origin)
+  const browserOrigin = fixture.origin
+  const beforeRestart = await currentCookie(context, fixture)
+  try {
+    await docker(['restart', '--time', '5', fixture.name])
+  } catch (error) {
+    await healthDiagnostics(fixture, 'restart command failed', { error: 'NOT_PROBED' })
+    throw error
+  }
+  await waitHealthy(fixture, 'after restart')
+  assert.equal(fixture.origin, browserOrigin, 'Restart must retain the browser public origin')
+  assert.ok((await currentCookie(context, fixture)).value === beforeRestart.value, 'Restart rejection must use the existing Cookie jar')
   for (const page of [first, second]) {
+    assert.equal(new URL(page.url()).origin, browserOrigin, 'Existing pages keep their origin across restart')
     await me(page, fixture, 401)
     await refresh(page)
     await atLogin(page)
