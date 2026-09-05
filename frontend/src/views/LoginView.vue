@@ -15,11 +15,13 @@
 
 <script setup lang="ts">
 import { reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus/es/components/message/index'
 import { api } from '../api/client'
+import { loginRedirect } from '../router'
 import { useSessionStore } from '../stores/session'
 
+const route = useRoute()
 const router = useRouter()
 const session = useSessionStore()
 const loading = ref(false)
@@ -30,9 +32,9 @@ async function login() {
   try {
     const result = await api.login(form.username, form.password)
     session.setToken(result.token)
-    router.push('/playground')
+    await router.replace(loginRedirect(route.query.redirect))
   } catch (error) {
-    ElMessage.error((error as Error).message)
+    ElMessage.error(error instanceof Error ? error.message : '登录失败')
   } finally {
     loading.value = false
   }

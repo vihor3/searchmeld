@@ -1,0 +1,206 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CI: 'true'
+
+jobs:
+  frontend:
+    name: Frontend build and session regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      VITE_API_BASE: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Type check and build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Install test-only Playwright and matching Chromium
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/admin-session-browsers
+        run: |
+          npm install --prefix "$RUNNER_TEMP/admin-session-playwright" \
+            --no-save --no-package-lock --ignore-scripts --no-audit --no-fund playwright@1.63.0
+          node "$RUNNER_TEMP/admin-session-playwright/node_modules/playwright/cli.js" \
+            install --with-deps chromium
+
+      - name: Exercise admin session recovery in Chromium
+        id: browser
+        timeout-minutes: 10
+        env:
+          FRONTEND_DIR: ${{ github.workspace }}/frontend
+          NODE_PATH: ${{ runner.temp }}/admin-session-playwright/node_modules
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/admin-session-browsers
+          ARTIFACT_DIR: ${{ runner.temp }}/admin-session-artifacts
+        run: node deploy/admin_session_expiry_test.cjs
+
+      - name: Upload browser screenshots
+        if: ${{ !cancelled() && (steps.browser.outcome == 'success' || steps.browser.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 2
+        with:
+          name: admin-session-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/admin-session-artifacts/**/*.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove temporary browser resources
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: |
+          rm -rf -- "$RUNNER_TEMP/admin-session-playwright" \
+            "$RUNNER_TEMP/admin-session-browsers" "$RUNNER_TEMP/admin-session-artifacts"
+
+  backend:
+    name: Go format, vet and PostgreSQL tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      GOFLAGS: -mod=readonly
+      GOTOOLCHAIN: local
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: searchmeld_test
+          POSTGRES_USER: searchmeld_test
+          POSTGRES_PASSWORD: ci-only-password
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U searchmeld_test -d searchmeld_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Match the Dockerfile builder, not go.mod's older module minimum.
+          go-version: '1.22.x'
+          cache-dependency-path: backend/go.sum
+
+      - name: Check Go formatting without rewriting source
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            printf 'Go files need formatting:\n%s\n' "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: Vet Go packages
+        run: go vet ./...
+
+      - name: Run Go tests with the isolated database
+        env:
+          SEARCHMELD_TEST_DATABASE_URL: postgres://searchmeld_test:ci-only-password@127.0.0.1:${{ job.services.postgres.ports[5432] }}/searchmeld_test?sslmode=disable
+        run: |
+          : "${SEARCHMELD_TEST_DATABASE_URL:?CI requires an isolated test database}"
+          go test -v -count=1 -timeout=5m ./...
+
+  shell-regressions:
+    name: Frontend source and Alpine shell regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check frontend registration and token scopes
+        run: |
+          sh deploy/frontend_component_registration_test.sh
+          sh deploy/token_scope_selector_test.sh
+
+      - name: Prove missing component registrations are rejected
+        run: |
+          fixture=$(mktemp -d "$RUNNER_TEMP/component-registration.XXXXXX")
+          trap 'rm -rf -- "$fixture"' EXIT
+          cp -R frontend/src "$fixture/src"
+          for component in ElButton ElInput; do
+            sed "/^[[:space:]]*${component},$/d" frontend/src/main.ts > "$fixture/src/main.ts"
+            if FRONTEND_DIR="$fixture" sh deploy/frontend_component_registration_test.sh > "$fixture/output" 2>&1; then
+              printf 'Missing %s registration was not detected\n' "$component" >&2
+              exit 1
+            fi
+            cat "$fixture/output"
+            grep -Fq "Element Plus template component is not registered: $component " "$fixture/output"
+          done
+
+      - name: Check shell syntax and run installer and entrypoint regressions
+        run: |
+          # Tests mock Docker and Git; the container receives no Docker socket or network.
+          docker run --rm --network none \
+            --name "searchmeld-shell-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace,readonly" \
+            --workdir /workspace alpine:3.20 sh -eu -c '
+              for script in install.sh deploy/*.sh; do
+                sh -n "$script"
+              done
+              sh deploy/install_test.sh
+              sh deploy/all-in-one-entrypoint_test.sh
+            '
+
+      - name: Remove the shell test container
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: docker rm --force "searchmeld-shell-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >/dev/null 2>&1 || true
+
+  images:
+    name: Image build (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [external, all-in-one]
+    env:
+      BUILD_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build root image without publishing
+        run: docker build --pull --progress plain --target "$BUILD_TARGET" --tag "searchmeld:ci-$BUILD_TARGET" .
+
+      - name: Remove the test image
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: docker image rm --force "searchmeld:ci-$BUILD_TARGET" >/dev/null 2>&1 || true

@@ -86,11 +86,14 @@ const activeMenu = computed(() => {
 })
 
 async function logout() {
+  const logoutToken = session.token
   try {
     await api.logout()
   } finally {
-    session.logout()
-    router.push('/login')
+    if (!session.token || session.token === logoutToken) {
+      session.logout()
+      router.push('/login')
+    }
   }
 }
 </script>

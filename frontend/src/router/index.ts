@@ -26,10 +26,29 @@ const router = createRouter({
   ]
 })
 
+export function loginRedirect(value: unknown): string {
+  const fallback = '/playground'
+  if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')) return fallback
+
+  try {
+    // URL parsing alone tolerates broken escapes and control characters.
+    if (/[\u0000-\u001f\u007f]/.test(decodeURIComponent(value))) return fallback
+    const url = new URL(value, window.location.origin)
+    const target = router.resolve(value)
+    if (url.origin !== window.location.origin || url.pathname !== target.path || /%2f|%5c/i.test(target.path)) return fallback
+    if (!target.matched.length || target.matched.some((record) => record.meta.public)) return fallback
+    return target.fullPath
+  } catch {
+    return fallback
+  }
+}
+
 router.beforeEach((to) => {
   const session = useSessionStore()
-  if (!to.meta.public && !session.token) return '/login'
-  if (to.path === '/login' && session.token) return '/playground'
+  if (!to.meta.public && !session.token) {
+    return { path: '/login', query: { redirect: loginRedirect(to.fullPath) } }
+  }
+  if (to.meta.public && session.token) return loginRedirect(to.query.redirect)
 })
 
 export default router

@@ -151,15 +151,7 @@ docker compose \
 
 不使用共享数据库网络时去掉 `docker-compose.shared-db.yml`；使用内置数据库时把前两个文件替换为 `docker-compose.yml`。禁用自定义 DNS 时不要加载 `docker-compose.dns.yml`。
 
-也可以直接构建镜像：
-
-```bash
-# 轻量镜像：必须提供 DATABASE_URL 或 DATABASE_URL_FILE
-docker build --target external -t searchmeld:external .
-
-# 一体化镜像：默认目标和默认 embedded 模式
-docker build --target all-in-one -t searchmeld:all-in-one .
-```
+镜像构建由 GitHub Actions 执行，保留 `external` 和 `all-in-one` 两个构建目标。
 
 `all-in-one` 镜像也保留了连接外部数据库的能力，但必须显式传入 `DATABASE_MODE=external` 和 `DATABASE_URL`；它仍然包含 PostgreSQL 软件及数据卷声明。希望镜像和运行配置都不包含内置数据库时，请使用 `external` 构建目标或专用 Compose 文件。
 
@@ -332,27 +324,18 @@ enabled_tools = ["search", "extract"]
 
 公网请在前面加 HTTPS 反代，转发 `/`、`/api/`、`/v1/`、`/healthz`（以及 `/mcp`）。
 
-## 本地开发
+## 开发与验证
 
-```bash
-# DB
-docker run -d --name searchmeld-postgres \
-  -e POSTGRES_DB=one_search -e POSTGRES_USER=one_search -e POSTGRES_PASSWORD=one_search \
-  -p 15432:5432 postgres:16-alpine
+**硬约束：本地只写代码，CI、测试、编译和打包全部在 GitHub Actions 的远端 runner 执行。**
 
-# 后端
-cd backend
-export APP_ENV=development HTTP_ADDR=:18080 \
-  DATABASE_URL='postgres://one_search:one_search@localhost:15432/one_search?sslmode=disable' \
-  ADMIN_PASSWORD=admin123456 \
-  ENCRYPTION_KEY=local-test-encryption-key-for-runtime \
-  RUN_MIGRATIONS=true MIGRATIONS_DIR=migrations
-go run ./cmd/server
+- 本地仅进行源码和文档的阅读、编辑、代码审阅、Git 操作及必要的任务记录维护。
+- 依赖安装、自动化测试、lint/格式检查、类型检查、编译、前端构建、打包、镜像构建和浏览器运行验证均交给 [GitHub Actions](.github/workflows/ci.yml)。
+- 不得用本地 Docker、`act`、本机 self-hosted runner、后台进程或子代理绕过该规则，也不在本地启动开发服务进行验证。
+- 验证结果必须对应具体提交 SHA 和远端 Actions 作业；尚未推送或远端执行失败时，明确标记待验证，不回退到本地执行。
+- 可在明确授权后先提交、推送验证版本以触发 CI；只有对应远端检查通过后，才能标记验证完成。
+- 工作流只负责验证和构建，不自动发布生产镜像或部署；提交、推送和发布仍按明确授权执行。
 
-# 前端
-cd frontend && npm install && npm run dev
-# 分离运行时可设 VITE_API_BASE=http://localhost:18080
-```
+这条约束适用于开发人员和所有编码代理，并替代旧的本地 Docker 验证说明。现有部署入口未因此调整。
 
 ## 目录
 

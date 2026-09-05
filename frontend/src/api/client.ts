@@ -1,4 +1,5 @@
 import { useSessionStore } from '../stores/session'
+import router from '../router'
 
 const API_BASE = import.meta.env.VITE_API_BASE || ''
 
@@ -265,13 +266,27 @@ export interface ProviderCallLog {
 
 export async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
   const session = useSessionStore()
+  const requestToken = session.token
   const headers = new Headers(options.headers || {})
   headers.set('Content-Type', 'application/json')
-  if (session.token) {
-    headers.set('Authorization', `Bearer ${session.token}`)
+  if (requestToken) {
+    headers.set('Authorization', `Bearer ${requestToken}`)
   }
   const response = await fetch(`${API_BASE}${path}`, { ...options, headers })
   if (!response.ok) {
+    if (response.status === 401 && requestToken && requestToken === session.token && path.startsWith('/api/admin/')) {
+      const { pathname } = new URL(path, window.location.origin)
+      if (pathname.startsWith('/api/admin/') && pathname !== '/api/admin/login' && pathname !== '/api/admin/logout') {
+        // Clear synchronously, before any await, so other old requests cannot redirect again.
+        session.logout()
+        const route = router.currentRoute.value
+        if (!route.meta.public) {
+          await router.replace({ path: '/login', query: { redirect: route.fullPath } }).catch((error: unknown) => {
+            console.error('Failed to navigate after admin session expiry', error)
+          })
+        }
+      }
+    }
     const payload = await response.json().catch(() => ({}))
     throw new Error(payload?.error?.message || response.statusText)
   }
