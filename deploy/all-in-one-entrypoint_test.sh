@@ -233,11 +233,13 @@ assert_readiness_failure() {
         printf "probe\n" >> "$PROBES"
         return 1
       }
-      curl() {
-        case " $* " in
-          *" --connect-timeout 1 --max-time 1 "*) ;;
-          *) exit 97 ;;
-        esac
+      timeout() {
+        [ "$1 $2 $3" = "-s KILL 1" ] || exit 97
+        shift 3
+        "$@"
+      }
+      wget() {
+        [ "$*" = "-Y off -T 1 -q -O /dev/null http://127.0.0.1:8080/healthz" ] || exit 97
         printf "probe\n" >> "$PROBES"
         return 1
       }
@@ -266,7 +268,15 @@ env SEARCHMELD_ENTRYPOINT_SKIP_MAIN=true POSTGRES_USER=synthetic-test-user \
   sh -c '
     . "$1"
     pg_isready() { return 0; }
-    curl() { return 0; }
+    timeout() {
+      [ "$1 $2 $3" = "-s KILL 1" ] || exit 97
+      shift 3
+      "$@"
+    }
+    wget() {
+      [ "$*" = "-Y off -T 1 -q -O /dev/null http://127.0.0.1:8080/healthz" ] || exit 97
+      return 0
+    }
     wait_for_postgres
     wait_for_backend
   ' sh "$entrypoint"

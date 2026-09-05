@@ -201,7 +201,8 @@ prepare_embedded_postgres() {
 
 wait_for_backend() {
   attempts=0
-  while ! curl --noproxy '*' --connect-timeout 1 --max-time 1 -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; do
+  # Keep this URL literal: readiness never consumes a caller-supplied target.
+  while ! timeout -s KILL 1 wget -Y off -T 1 -q -O /dev/null http://127.0.0.1:8080/healthz >/dev/null 2>&1; do
     if ! kill -0 "$backend_pid" 2>/dev/null; then
       log "backend exited before becoming healthy"
       exit 1

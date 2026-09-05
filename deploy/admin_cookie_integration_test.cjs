@@ -332,6 +332,11 @@ async function startFixture(mode, tls) {
     if (fixture.database) await docker(['network', 'connect', 'bridge', fixture.name])
     await docker(['start', fixture.name])
     await waitHealthy(fixture, mode === 'https' && !publicOrigin ? 'missing-origin startup' : 'startup')
+    const probe = ['exec', '--env', 'http_proxy=http://127.0.0.1:9', '--env', 'HTTP_PROXY=http://127.0.0.1:9',
+      fixture.name, 'timeout', '-s', 'KILL', '4', 'wget', '-Y', 'off', '-T', '4', '-q', '-O', '/dev/null']
+    await docker([...probe, 'http://127.0.0.1/healthz'], { timeout: 10000 })
+    await assert.rejects(() => docker([...probe, 'http://127.0.0.1/v1/providers'], { timeout: 10000 }),
+      (error) => error.code === 1, 'Packaged health client must bypass proxies and reject HTTP errors')
     if (mode === 'https' && !publicOrigin) {
       adminReply(await request(fixture.origin, '/api/admin/login', {
         method: 'POST', headers: { ...proof, Origin: fixture.origin }, body: fixture.credentials

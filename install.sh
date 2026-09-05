@@ -884,7 +884,7 @@ wait_until_healthy() {
   attempt=0
   log "等待 SearchMeld 健康检查通过……"
   while [ "$attempt" -lt "$health_timeout" ]; do
-    if run_compose exec -T app curl --noproxy '*' -fsS http://127.0.0.1/healthz >/dev/null 2>&1; then
+    if run_compose exec -T app timeout -s KILL 4 wget -Y off -T 4 -q -O /dev/null http://127.0.0.1/healthz >/dev/null 2>&1; then
       return
     fi
     attempt=$((attempt + 1))

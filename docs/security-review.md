@@ -2,7 +2,7 @@
 
 Review date: **2026-09-06**. Historical vulnerable baseline: `1e10c565dc5443e5bafcc391a95563df51c08bad`. Shared-login baseline: `ad50edd2cb2754f28efb14486e5b2dcc3bc41753`. The user subsequently authorized PUB-01 through PUB-05 remediation, dependency repairs and upgrade validation.
 
-**Verification status:** remediation source and fixtures are being integrated. Full matching-SHA CI, packaged image audits and upgrade/browser verification are pending. Earlier green auth or candidate-dependency runs are not final remediation acceptance. All execution is on remote GitHub Actions; local work is editing, static review, Git/task bookkeeping and evidence retrieval. No production deployment or penetration test has occurred.
+**Verification status:** the first full remediation run at `30e14c1` passed application, race, database, browser and historical-upgrade checks, but both final-image vulnerability gates failed. System-package remediation and an all-green matching-SHA run remain pending. All execution is on remote GitHub Actions; local work is editing, static review, Git/task bookkeeping and evidence retrieval. No production deployment or penetration test has occurred.
 
 ## Findings and Disposition
 
@@ -100,13 +100,15 @@ Official sources: [Go policy](https://go.dev/doc/devel/release#policy), [Alpine 
 
 Permanent [CI](../.github/workflows/ci.yml) audits committed npm dependencies including build packages, Go call reachability, and both final images' OS/Go packages. npm/image gates start at low severity; no blanket ignore-unfixed or audit-error suppression. Reports retain seven days. The temporary candidate workflow is deleted after import. Chunk-size warnings are performance notices, not vulnerabilities.
 
+The actual-source Go report at `30e14c1` has zero affected symbols and zero imported-package vulnerabilities. It separately lists module-only [GO-2026-5932](https://pkg.go.dev/vuln/GO-2026-5932), which affects the unimported OpenPGP packages in x/crypto, not the password-hashing package this project uses. This is an applicability distinction, not a scanner suppression or a claim that every package in the dependency module is safe.
+
 ## Upgrade and Auth Evidence
 
 Shared-login [run33988333263](https://github.com/vihor3/searchmeld/actions/runs/33988333263) passed five jobs at `ad50edd`: Go/PostgreSQL, frontend/mock browser, shell, external-image build and all-in-one real HTTP/HTTPS. This corrected the first-run restart-fixture and mobile-layout failures.
 
 Remediation adds [historical DB upgrade](../deploy/database_upgrade_test.cjs) and extends [real browser integration](../deploy/admin_cookie_integration_test.cjs) to external PostgreSQL. Old source is immutable `1e10c565dc5443e5bafcc391a95563df51c08bad`, not an invented release. Fixtures use synthetic accounts/Keys/data, disposable volumes and stable loopback HTTP/browser origins across Docker port changes. External PostgreSQL stays on an internal network without host publication; its application also joins the normal bridge to support loopback-only HTTP publication. Historical upgrade applications use a run-scoped normal bridge with loopback-only HTTP publication; providers are disabled and redirected to container loopback before synthetic provider secrets are created. These application networks are not an egress firewall. Upgrade helpers and PG17 containers use no network. Fixtures must prove credential/data preservation, incompatible PGDATA rejection before mutation, and recovery from a separate copy. No dumps, secrets or traces are artifacts.
 
-**Pending:** final remediation SHA and complete successful CI. Source fixtures are not passed upgrade/browser evidence.
+[First full remediation run33991999625](https://github.com/vihor3/searchmeld/actions/runs/33991999625), exact SHA `30e14c114d79c5ee22c2302fdc9f0932585a754e`, passed Go formatting/vet/race tests with PostgreSQL, frontend build/session regression, shell regressions, both packaged HTTP/HTTPS browser modes, and the historical upgrade/backup/PG17 mismatch-recovery fixture. Synthetic desktop/mobile PNGs were inspected. Both image builds succeeded but their vulnerability gates failed on system packages; this run does not close overall acceptance. The next image changes must rerun these checks.
 
 ## Operational Boundaries
 

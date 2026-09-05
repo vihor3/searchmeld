@@ -14,7 +14,10 @@ COPY backend/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -o /out/searchmeld ./cmd/server
 
 FROM alpine:3.22.5 AS runtime-base
-RUN apk add --no-cache ca-certificates curl nginx tzdata
+# Refresh installed APKs too; a supported base tag can predate security fixes.
+RUN apk upgrade --no-cache && \
+    apk add --no-cache ca-certificates nginx tzdata \
+      'libcrypto3>=3.5.8-r0' 'libssl3>=3.5.8-r0'
 ENV TZ=Asia/Shanghai
 WORKDIR /app
 COPY --from=frontend-builder /app/frontend/dist /usr/share/nginx/html

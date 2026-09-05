@@ -32,7 +32,7 @@ services:
     ports:
       - "${HOST_PORT:-5173}:80"
     healthcheck:
-      test: ["CMD", "curl", "--noproxy", "*", "-fsS", "http://127.0.0.1/healthz"]
+      test: ["CMD", "timeout", "-s", "KILL", "4", "wget", "-Y", "off", "-T", "4", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
       interval: 10s
       timeout: 5s
       retries: 5

@@ -177,6 +177,17 @@ jobs:
           sh deploy/frontend_component_registration_test.sh
           sh deploy/token_scope_selector_test.sh
 
+      - name: Verify Compose health probes
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          DATABASE_URL: postgres://ci-only:ci-only@database.invalid/ci-only
+          ENCRYPTION_KEY: ci-only-encryption-key-not-for-deployment
+        run: |
+          for compose_file in docker-compose.yml docker-compose.external-db.yml; do
+            docker compose --env-file /dev/null -f "$compose_file" config --format json |
+              jq -e '.services.app.healthcheck.test == ["CMD", "timeout", "-s", "KILL", "4", "wget", "-Y", "off", "-T", "4", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]' >/dev/null
+          done
+
       - name: Prove missing component registrations are rejected
         run: |
           fixture=$(mktemp -d "$RUNNER_TEMP/component-registration.XXXXXX")

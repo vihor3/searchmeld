@@ -128,6 +128,7 @@ grep -q "^SEARCHMELD_DNS_SECONDARY=''$" "$embedded_env"
 grep -q '^TZ=Asia/Shanghai$' "$embedded_env"
 grep -q '^ADMIN_PUBLIC_ORIGIN=$' "$embedded_env"
 grep -q 'compose .*docker-compose.yml up --build -d' "$embedded_log"
+grep -Fq 'exec -T app timeout -s KILL 4 wget -Y off -T 4 -q -O /dev/null http://127.0.0.1/healthz' "$embedded_log"
 if grep -q 'docker-compose.external-db.yml\|docker-compose.dns.yml' "$embedded_log"; then
   printf '%s\n' 'embedded install used external compose' >&2
   exit 1
@@ -269,6 +270,7 @@ grep -q '备用 DNS 不能与首选 DNS 相同' "$tmpdir/external-output"
 grep -q '^network create --internal shared-db$' "$external_log"
 grep -q 'docker-compose.external-db.yml .*docker-compose.shared-db.yml .*docker-compose.dns.yml config --quiet' "$external_log"
 grep -q 'docker-compose.external-db.yml .*docker-compose.shared-db.yml .*docker-compose.dns.yml up --build -d' "$external_log"
+grep -Fq 'exec -T app timeout -s KILL 4 wget -Y off -T 4 -q -O /dev/null http://127.0.0.1/healthz' "$external_log"
 if grep -q "$database_password\|$expected_database_url" "$tmpdir/external-output" "$external_log"; then
   printf '%s\n' 'installer leaked external database credentials' >&2
   exit 1
