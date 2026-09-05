@@ -1,0 +1,27 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "urn:searchmeld:vex:CVE-2025-60876:2026-09-06",
+  "author": "SearchMeld maintainers",
+  "timestamp": "2026-09-06T00:00:00+08:00",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "CVE-2025-60876"
+      },
+      "products": [
+        {
+          "@id": "urn:searchmeld:ci-image-template",
+          "subcomponents": [
+            { "@id": "pkg:apk/alpine/busybox@1.37.0-r20?arch=x86_64&distro=alpine-3.22.5" },
+            { "@id": "pkg:apk/alpine/busybox-binsh@1.37.0-r20?arch=x86_64&distro=alpine-3.22.5&upstream=busybox" },
+            { "@id": "pkg:apk/alpine/ssl_client@1.37.0-r20?arch=x86_64&distro=alpine-3.22.5&upstream=busybox" }
+          ]
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_cannot_be_controlled_by_adversary",
+      "impact_statement": "Applies only to the CI-built, unmodified SearchMeld image identified during this run. All shipped wget calls use literal loopback HTTP health URLs with proxies disabled; the bundled handlers never redirect or include attacker-controlled URL data. This is not a BusyBox package fix and does not cover arbitrary operator wget commands or custom proxy/health handlers. Owner: SearchMeld maintainers. Re-review before 2026-10-06 UTC and whenever these call paths, packages or image assumptions change. Evidence and limits: docs/security-review.md#busybox-applicability."
+    }
+  ]
+}

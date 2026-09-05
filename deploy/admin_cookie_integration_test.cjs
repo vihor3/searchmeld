@@ -332,6 +332,10 @@ async function startFixture(mode, tls) {
     if (fixture.database) await docker(['network', 'connect', 'bridge', fixture.name])
     await docker(['start', fixture.name])
     await waitHealthy(fixture, mode === 'https' && !publicOrigin ? 'missing-origin startup' : 'startup')
+    for (const packageName of ['curl', 'libcurl', 'nghttp2-libs']) {
+      await assert.rejects(() => docker(['exec', fixture.name, 'apk', 'info', '-e', packageName], { timeout: 10000 }),
+        (error) => error.code === 1, `Unneeded runtime package must be absent: ${packageName}`)
+    }
     const probe = ['exec', '--env', 'http_proxy=http://127.0.0.1:9', '--env', 'HTTP_PROXY=http://127.0.0.1:9',
       fixture.name, 'timeout', '-s', 'KILL', '4', 'wget', '-Y', 'off', '-T', '4', '-q', '-O', '/dev/null']
     await docker([...probe, 'http://127.0.0.1/healthz'], { timeout: 10000 })

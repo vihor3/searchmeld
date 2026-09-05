@@ -2,7 +2,7 @@
 
 Review date: **2026-09-06**. Historical vulnerable baseline: `1e10c565dc5443e5bafcc391a95563df51c08bad`. Shared-login baseline: `ad50edd2cb2754f28efb14486e5b2dcc3bc41753`. The user subsequently authorized PUB-01 through PUB-05 remediation, dependency repairs and upgrade validation.
 
-**Verification status:** the first full remediation run at `30e14c1` passed application, race, database, browser and historical-upgrade checks, but both final-image vulnerability gates failed. System-package remediation and an all-green matching-SHA run remain pending. All execution is on remote GitHub Actions; local work is editing, static review, Git/task bookkeeping and evidence retrieval. No production deployment or penetration test has occurred.
+**Verification status:** application, race, database, browser and historical-upgrade checks passed at `30e14c1` and `c484013`. System-package repairs removed the OpenSSL/curl/nghttp2 findings; the remaining BusyBox finding has a scoped applicability disposition below. Its CI integration and an all-green matching-SHA run remain pending. All execution is on remote GitHub Actions; local work is editing, static review, Git/task bookkeeping and evidence retrieval. No production deployment or penetration test has occurred.
 
 ## Findings and Disposition
 
@@ -95,12 +95,21 @@ No anonymous Key bootstrap. Existing password login with Cookie jar/proof, or th
 | Vite/esbuild | 7.3.6 / 0.28.2; no Vite-major or Vue/UI-library upgrade. |
 | nanoid/postcss | 3.3.18 / 8.5.28. |
 | Go libraries | pgx/v5 5.9.2 removes obsolete v4/protocol modules; chi5.3.2, x/crypto0.56.0, x/text0.41.0 and required x/sync0.22.0. Preserve startup Ping, parameterized SQL and persisted credentials. |
+| Runtime APKs | Upgrade installed same-branch packages, require OpenSSL libraries >=3.5.8-r0; remove curl/libcurl/nghttp2. Health probes reuse BusyBox with explicit deadlines and disabled proxies. Remove unreferenced split Dockerfiles with obsolete toolchains/unlocked installation. |
 
 Official sources: [Go policy](https://go.dev/doc/devel/release#policy), [Alpine support](https://alpinelinux.org/releases/), [Vite7.3.6](https://github.com/vitejs/vite/blob/v7.3.6/packages/vite/CHANGELOG.md), [pgx5.9.2](https://github.com/jackc/pgx/blob/v5.9.2/CHANGELOG.md). esbuild's [Windows-development-server advisory](https://github.com/evanw/esbuild/security/advisories/GHSA-g7r4-m6w7-qqqr) does not describe the final Linux runtime. Do not attribute npm counts to the withdrawn Deno advisory.
 
 Permanent [CI](../.github/workflows/ci.yml) audits committed npm dependencies including build packages, Go call reachability, and both final images' OS/Go packages. npm/image gates start at low severity; no blanket ignore-unfixed or audit-error suppression. Reports retain seven days. The temporary candidate workflow is deleted after import. Chunk-size warnings are performance notices, not vulnerabilities.
 
 The actual-source Go report at `30e14c1` has zero affected symbols and zero imported-package vulnerabilities. It separately lists module-only [GO-2026-5932](https://pkg.go.dev/vuln/GO-2026-5932), which affects the unimported OpenPGP packages in x/crypto, not the password-hashing package this project uses. This is an applicability distinction, not a scanner suppression or a claim that every package in the dependency module is safe.
+
+### BusyBox Applicability
+
+[CVE-2025-60876](https://security.alpinelinux.org/vuln/CVE-2025-60876) concerns attacker-controlled raw control characters in wget URL request targets. Alpine still lists BusyBox1.37.0-r20 as possibly vulnerable; no package fix is claimed. The unfiltered image reports at `c484013` contain only this CVE, matched to `busybox`, `busybox-binsh` and `ssl_client`.
+
+The shipped application is classified `not_affected`, because every wget invocation uses a literal loopback HTTP health URL, proxies are disabled, and bundled health handlers return 200/503 JSON without redirects. Backend request handlers do not spawn wget. The vulnerable URL cannot be controlled by a remote application caller. Arbitrary operator commands, modified Nginx/health handlers and new dynamic wget targets are **not covered**.
+
+The [OpenVEX template](../.github/security/busybox.vex.json) is limited to the exact x86_64 Alpine3.22.5 package PURLs at1.37.0-r20. CI binds it to an alias derived from the actual built image ID, verifies the scanned image identity and every filtered match, and retains the original match details in `ignoredMatches` plus the rendered VEX. No other CVE, package/version or architecture is exempted. The low-severity gate and unfixed-vulnerability checks remain enabled. Owner: **SearchMeld maintainers**. CI rejects this disposition starting **2026-10-06 UTC**; remove or re-review it earlier when a package fix or any assumption changes. This disposition is not a general endorsement of BusyBox wget or a zero-vulnerability image claim.
 
 ## Upgrade and Auth Evidence
 
