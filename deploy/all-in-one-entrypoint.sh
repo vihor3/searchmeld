@@ -37,15 +37,20 @@ normalize_one_proxy() {
 }
 
 psql_admin() {
-  su-exec postgres psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 "$@"
+  PGCONNECT_TIMEOUT=5 PGOPTIONS='-c statement_timeout=30000 -c lock_timeout=5000' \
+    su-exec postgres psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 "$@"
 }
 
 psql_admin_scalar() {
-  su-exec postgres psql -U "$POSTGRES_USER" -d postgres -tAc "$1" | tr -d '[:space:]'
+  scalar=$(psql_admin -tAc "$1") || return 1
+  printf '%s' "$scalar" | tr -d '[:space:]'
 }
 
 cleanup() {
   trap - INT TERM EXIT
+  if [ -n "${pwfile:-}" ]; then
+    rm -f "$pwfile"
+  fi
   for pid in ${nginx_pid:-} ${backend_pid:-} ${postgres_pid:-}; do
     if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null || true
@@ -113,8 +118,50 @@ select_database_mode() {
   esac
 }
 
+validate_embedded_pgdata() {
+  # This read-only preflight must precede mkdir, chown, initdb and server startup.
+  # Do not make the expected major an environment override that can bypass it.
+  postgres_version=$(postgres --version)
+  case "$postgres_version" in
+    'postgres (PostgreSQL) 16.'*) ;;
+    *)
+      log "embedded PostgreSQL binary must be major 16; PGDATA was not modified"
+      exit 1
+      ;;
+  esac
+
+  if { [ -e "$PGDATA" ] || [ -L "$PGDATA" ]; } && [ ! -d "$PGDATA" ]; then
+    log "PGDATA is not a directory; refusing to initialize it"
+    exit 1
+  fi
+  if [ -e "$PGDATA/PG_VERSION" ] || [ -L "$PGDATA/PG_VERSION" ]; then
+    if [ ! -f "$PGDATA/PG_VERSION" ] || [ -L "$PGDATA/PG_VERSION" ] || [ ! -r "$PGDATA/PG_VERSION" ]; then
+      log "PG_VERSION must be a readable regular file; PGDATA was not modified"
+      exit 1
+    fi
+    version_size=$(stat -c %s "$PGDATA/PG_VERSION")
+    if [ "$version_size" -lt 2 ] || [ "$version_size" -gt 3 ]; then
+      log "invalid PG_VERSION; PGDATA was not modified"
+      exit 1
+    fi
+    if ! printf '16\n' | cmp -s - "$PGDATA/PG_VERSION" &&
+      ! printf '16' | cmp -s - "$PGDATA/PG_VERSION"; then
+      log "incompatible PG_VERSION: this image requires PostgreSQL 16; PGDATA was not modified"
+      log "Keep a backup and use the matching PostgreSQL image to recover or dump/restore into a new volume. Never edit PG_VERSION to force an upgrade."
+      exit 1
+    fi
+  else
+    for entry in "$PGDATA"/* "$PGDATA"/.[!.]* "$PGDATA"/..?*; do
+      if [ -e "$entry" ] || [ -L "$entry" ]; then
+        log "PGDATA is not empty and has no PG_VERSION; refusing to initialize or change ownership"
+        exit 1
+      fi
+    done
+  fi
+}
+
 prepare_embedded_postgres() {
-  for binary in postgres initdb pg_isready psql su-exec; do
+  for binary in postgres initdb pg_isready psql su-exec timeout; do
     if ! command -v "$binary" >/dev/null 2>&1; then
       log "embedded PostgreSQL support is unavailable: missing $binary"
       exit 1
@@ -126,6 +173,7 @@ prepare_embedded_postgres() {
   : "${POSTGRES_USER:=one_search}"
   : "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required when using the embedded database}"
 
+  validate_embedded_pgdata
   mkdir -p "$PGDATA" /run/postgresql
   chown -R postgres:postgres "$PGDATA" /run/postgresql
 
@@ -134,20 +182,26 @@ prepare_embedded_postgres() {
     pwfile=$(mktemp)
     printf '%s\n' "$POSTGRES_PASSWORD" > "$pwfile"
     chown postgres:postgres "$pwfile"
-    su-exec postgres initdb \
+    if ! timeout -s TERM -k 5 120 su-exec postgres initdb \
       -D "$PGDATA" \
       --username="$POSTGRES_USER" \
       --pwfile="$pwfile" \
       --auth-local=trust \
       --auth-host=scram-sha-256 \
-      >/proc/1/fd/1 2>&1
+      >/proc/1/fd/1 2>&1; then
+      rm -f "$pwfile"
+      pwfile=
+      log "postgres initialization failed or exceeded its startup timeout"
+      exit 1
+    fi
     rm -f "$pwfile"
+    pwfile=
   fi
 }
 
 wait_for_backend() {
   attempts=0
-  while ! curl --noproxy '*' -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; do
+  while ! curl --noproxy '*' --connect-timeout 1 --max-time 1 -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; do
     if ! kill -0 "$backend_pid" 2>/dev/null; then
       log "backend exited before becoming healthy"
       exit 1
@@ -175,14 +229,24 @@ start_postgres() {
     >/proc/1/fd/1 2>&1 &
   postgres_pid=$!
 
-  until pg_isready -U "$POSTGRES_USER" >/dev/null 2>&1; do
+  wait_for_postgres
+  log "postgres is ready"
+}
+
+wait_for_postgres() {
+  attempts=0
+  until pg_isready -t 1 -U "$POSTGRES_USER" >/dev/null 2>&1; do
     if ! kill -0 "$postgres_pid" 2>/dev/null; then
       log "postgres exited during startup"
       exit 1
     fi
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 60 ]; then
+      log "postgres did not become ready in time"
+      exit 1
+    fi
     sleep 1
   done
-  log "postgres is ready"
 }
 
 ensure_database() {
@@ -194,7 +258,11 @@ ensure_database() {
   log "ensuring database and role"
   psql_admin -c "ALTER ROLE $app_user_ident WITH LOGIN PASSWORD '$app_pass_lit';"
 
-  if [ "$(psql_admin_scalar "SELECT 1 FROM pg_database WHERE datname = '$app_db_lit'")" != "1" ]; then
+  if ! database_exists=$(psql_admin_scalar "SELECT 1 FROM pg_database WHERE datname = '$app_db_lit'"); then
+    log "failed to check whether the application database exists"
+    exit 1
+  fi
+  if [ "$database_exists" != "1" ]; then
     psql_admin -c "CREATE DATABASE $app_db_ident OWNER $app_user_ident;"
   else
     psql_admin -c "ALTER DATABASE $app_db_ident OWNER TO $app_user_ident;"

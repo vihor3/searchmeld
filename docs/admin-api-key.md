@@ -697,13 +697,15 @@ curl -X POST "$BASE_URL/v1/compat/openai/responses-search" \
   }'
 ```
 
-### 6.7 查看 `/v1` Provider 和用量
+### 6.7 查看 Provider 配置和全站用量
+
+配置和全站统计仅通过管理接口提供。原 `/v1/providers` 和 `/v1/usage/summary` 已移除，不再向普通业务 Token 或关闭业务鉴权后的匿名请求暴露这些数据。
 
 ```bash
-curl "$BASE_URL/v1/providers" \
+curl "$BASE_URL/api/admin/providers" \
   -H "Authorization: Bearer $ADMIN_API_KEY"
 
-curl "$BASE_URL/v1/usage/summary" \
+curl "$BASE_URL/api/admin/usage/summary" \
   -H "Authorization: Bearer $ADMIN_API_KEY"
 ```
 

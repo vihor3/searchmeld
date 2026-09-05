@@ -33,13 +33,26 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '22'
+          node-version: '22.23.2'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install locked frontend dependencies
         working-directory: frontend
-        run: npm ci
+        run: npm ci --no-audit
+
+      - name: Audit all locked npm dependencies
+        working-directory: frontend
+        run: npm audit --audit-level=low --json > "$RUNNER_TEMP/npm-audit.json"
+
+      - name: Upload npm audit evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-audit-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/npm-audit.json
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Type check and build frontend
         working-directory: frontend
@@ -112,8 +125,8 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          # Match the Dockerfile builder, not go.mod's older module minimum.
-          go-version: '1.22.x'
+          # Match the supported Dockerfile builder.
+          go-version: '1.26.8'
           cache-dependency-path: backend/go.sum
 
       - name: Check Go formatting without rewriting source
@@ -121,6 +134,7 @@ jobs:
           unformatted=$(gofmt -l .)
           if [ -n "$unformatted" ]; then
             printf 'Go files need formatting:\n%s\n' "$unformatted" >&2
+            gofmt -d .
             exit 1
           fi
 
@@ -132,7 +146,22 @@ jobs:
           SEARCHMELD_TEST_DATABASE_URL: postgres://searchmeld_test:ci-only-password@127.0.0.1:${{ job.services.postgres.ports[5432] }}/searchmeld_test?sslmode=disable
         run: |
           : "${SEARCHMELD_TEST_DATABASE_URL:?CI requires an isolated test database}"
-          go test -v -count=1 -timeout=5m ./...
+          go test -race -v -count=1 -timeout=5m ./...
+
+      - name: Install the pinned Go vulnerability checker
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+      - name: Reject reachable Go vulnerabilities
+        run: govulncheck -show verbose ./... 2>&1 | tee "$RUNNER_TEMP/govulncheck.txt"
+
+      - name: Upload Go vulnerability evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-audit-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/govulncheck.txt
+          if-no-files-found: error
+          retention-days: 7
 
   shell-regressions:
     name: Frontend source and Alpine shell regressions
@@ -168,8 +197,9 @@ jobs:
           # Tests mock Docker and Git; the container receives no Docker socket or network.
           docker run --rm --network none \
             --name "searchmeld-shell-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --env GITHUB_ACTIONS=true \
             --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace,readonly" \
-            --workdir /workspace alpine:3.20 sh -eu -c '
+            --workdir /workspace alpine:3.22.5 sh -eu -c '
               for script in install.sh deploy/*.sh; do
                 sh -n "$script"
               done
@@ -185,7 +215,7 @@ jobs:
   images:
     name: Image build (${{ matrix.target }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -196,18 +226,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Build root image without publishing
+        id: build
+        timeout-minutes: 15
         run: docker build --pull --progress plain --target "$BUILD_TARGET" --tag "searchmeld:ci-$BUILD_TARGET" .
 
       - name: Set up Node for packaged browser integration
-        if: ${{ matrix.target == 'all-in-one' }}
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: '22'
+          node-version: '22.23.2'
 
-      - name: Install test-only Playwright for the existing all-in-one image
-        if: ${{ matrix.target == 'all-in-one' }}
+      - name: Pull the isolated external database fixture image
+        if: ${{ matrix.target == 'external' }}
+        run: docker pull postgres:16-alpine
+
+      - name: Install test-only Playwright for the packaged image
         timeout-minutes: 8
         env:
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/admin-cookie-browsers
@@ -219,11 +254,13 @@ jobs:
             install --with-deps chromium
 
       - name: Exercise packaged HTTP and HTTPS admin Cookies
-        if: ${{ matrix.target == 'all-in-one' }}
         id: cookies
         timeout-minutes: 12
         env:
-          COOKIE_CONTAINER_PREFIX: searchmeld-admin-cookie-${{ github.run_id }}-${{ github.run_attempt }}
+          COOKIE_TEST_IMAGE: searchmeld:ci-${{ matrix.target }}
+          COOKIE_TEST_DATABASE_MODE: ${{ matrix.target == 'external' && 'external' || 'embedded' }}
+          COOKIE_TEST_POSTGRES_IMAGE: postgres:16-alpine
+          COOKIE_CONTAINER_PREFIX: searchmeld-admin-cookie-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
           COOKIE_TEST_TEMP: ${{ runner.temp }}/admin-cookie-fixture
           NODE_PATH: ${{ runner.temp }}/admin-cookie-playwright/node_modules
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/admin-cookie-browsers
@@ -233,29 +270,88 @@ jobs:
           node deploy/admin_cookie_integration_test.cjs
 
       - name: Upload synthetic packaged-browser screenshots
-        if: ${{ matrix.target == 'all-in-one' && !cancelled() && (steps.cookies.outcome == 'success' || steps.cookies.outcome == 'failure') }}
+        if: ${{ !cancelled() && (steps.cookies.outcome == 'success' || steps.cookies.outcome == 'failure') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         timeout-minutes: 2
         with:
-          name: admin-cookie-${{ github.sha }}-${{ github.run_attempt }}
+          name: admin-cookie-${{ matrix.target }}-${{ github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/admin-cookie-artifacts/**/*.png
           if-no-files-found: ignore
           retention-days: 7
 
       - name: Remove packaged browser containers, volumes and temporary files
-        if: ${{ always() && matrix.target == 'all-in-one' }}
+        if: ${{ always() }}
         timeout-minutes: 3
         run: |
           test "${GITHUB_ACTIONS:-}" = true
           # Named fallback also runs when cancellation interrupts Node cleanup.
           for mode in http https; do
-            docker rm --force --volumes "searchmeld-admin-cookie-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$mode" >/dev/null 2>&1 || true
+            timeout --signal=KILL 10s docker rm --force --volumes "searchmeld-admin-cookie-$BUILD_TARGET-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$mode" >/dev/null 2>&1 || true
+            timeout --signal=KILL 10s docker rm --force --volumes "searchmeld-admin-cookie-$BUILD_TARGET-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$mode-postgres" >/dev/null 2>&1 || true
+            timeout --signal=KILL 10s docker network rm "searchmeld-admin-cookie-$BUILD_TARGET-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$mode-network" >/dev/null 2>&1 || true
           done
           rm -rf -- "$RUNNER_TEMP/admin-cookie-fixture" \
             "$RUNNER_TEMP/admin-cookie-playwright" "$RUNNER_TEMP/admin-cookie-browsers" \
             "$RUNNER_TEMP/admin-cookie-artifacts"
 
+      - name: Verify historical database upgrade and mismatch recovery
+        if: ${{ matrix.target == 'all-in-one' }}
+        timeout-minutes: 30
+        env:
+          UPGRADE_CONTAINER_PREFIX: searchmeld-db-upgrade-${{ github.run_id }}-${{ github.run_attempt }}
+          UPGRADE_TEST_IMAGE: searchmeld:ci-all-in-one
+        run: node deploy/database_upgrade_test.cjs
+
+      - name: Remove historical upgrade fixture resources
+        if: ${{ always() && matrix.target == 'all-in-one' }}
+        timeout-minutes: 3
+        run: |
+          test "${GITHUB_ACTIONS:-}" = true
+          prefix="searchmeld-db-upgrade-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          cleanup_failed=0
+          containers=$(timeout --signal=KILL 10s docker ps --all --quiet --filter "label=searchmeld.database-upgrade-fixture=$prefix") || cleanup_failed=1
+          for container in $containers; do
+            timeout --signal=KILL 10s docker rm --force --volumes "$container" >/dev/null 2>&1 || cleanup_failed=1
+          done
+          networks=$(timeout --signal=KILL 10s docker network ls --quiet --filter "label=searchmeld.database-upgrade-fixture=$prefix") || cleanup_failed=1
+          for network in $networks; do
+            timeout --signal=KILL 10s docker network rm "$network" >/dev/null 2>&1 || cleanup_failed=1
+          done
+          timeout --signal=KILL 10s docker volume rm "$prefix-data" "$prefix-backup" "$prefix-mismatch" >/dev/null 2>&1 || true
+          timeout --signal=KILL 30s docker buildx rm --force "$prefix" >/dev/null 2>&1 || true
+          timeout --signal=KILL 10s docker image rm --force "$prefix:baseline" >/dev/null 2>&1 || true
+          timeout --signal=KILL 10s docker image rm --force postgres:17.11-alpine3.23 >/dev/null 2>&1 || true
+          rm -rf -- "$RUNNER_TEMP/$prefix"
+          test "$cleanup_failed" -eq 0
+
+      - name: Audit packaged OS and Go dependencies
+        id: image-audit
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 10
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        with:
+          image: searchmeld:ci-${{ matrix.target }}
+          grype-version: v0.118.0
+          fail-build: true
+          severity-cutoff: low
+          only-fixed: false
+          output-format: json
+          output-file: ${{ runner.temp }}/image-audit.json
+
+      - name: Upload image vulnerability evidence
+        if: ${{ !cancelled() && (steps.image-audit.outcome == 'success' || steps.image-audit.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-audit-${{ matrix.target }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/image-audit.json
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Remove the test image
         if: ${{ always() }}
         timeout-minutes: 2
-        run: docker image rm --force "searchmeld:ci-$BUILD_TARGET" >/dev/null 2>&1 || true
+        run: |
+          docker image rm --force "searchmeld:ci-$BUILD_TARGET" >/dev/null 2>&1 || true
+          if [ "$BUILD_TARGET" = external ]; then
+            docker image rm --force postgres:16-alpine >/dev/null 2>&1 || true
+          fi

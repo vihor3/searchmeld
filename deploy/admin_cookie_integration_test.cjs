@@ -22,7 +22,11 @@ const desktop = { width: 1440, height: 1000 }
 const mobile = { width: 390, height: 844 }
 const target = '/providers?fixture=a%2Bb#shared'
 const prefix = process.env.COOKIE_CONTAINER_PREFIX
-assert.match(prefix || '', /^searchmeld-admin-cookie-[0-9]+-[0-9]+$/)
+assert.match(prefix || '', /^searchmeld-admin-cookie-(?:(?:external|all-in-one)-)?[0-9]+-[0-9]+$/)
+const databaseMode = process.env.COOKIE_TEST_DATABASE_MODE || 'embedded'
+assert.ok(['embedded', 'external'].includes(databaseMode), 'COOKIE_TEST_DATABASE_MODE must be embedded or external')
+const image = process.env.COOKIE_TEST_IMAGE || 'searchmeld:ci-all-in-one'
+const postgresImage = process.env.COOKIE_TEST_POSTGRES_IMAGE || 'postgres:16-alpine'
 assert.ok(process.env.RUNNER_TEMP, 'RUNNER_TEMP is required')
 assert.ok(process.env.COOKIE_TEST_TEMP, 'COOKIE_TEST_TEMP is required')
 assert.ok(process.env.ARTIFACT_DIR, 'ARTIFACT_DIR is required')
@@ -33,10 +37,12 @@ for (const directory of [temporary, artifacts]) {
 }
 
 const containers = new Set()
+const networks = new Set()
 const servers = new Set()
 const contexts = new Set()
 const gates = new Set()
 const secrets = new Set()
+const operations = new AbortController()
 let browser
 let cleanupPromise
 
@@ -69,17 +75,19 @@ async function bounded(promise, label, milliseconds = 15000) {
   }
 }
 
-async function docker(args) {
-  const { stdout } = await execute('docker', args, { timeout: 90000, maxBuffer: 1024 * 1024 })
+async function docker(args, { timeout = 90000, cleanup = false } = {}) {
+  const { stdout } = await execute('docker', args, {
+    timeout, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024, signal: cleanup ? undefined : operations.signal
+  })
   return stdout.trim()
 }
 
 async function inspectContainer(name) {
   // Never inspect Env, State.Health.Log or application logs: only lifecycle
   // status and published bindings are needed to diagnose this fixture.
-  const format = '{"status":{{json .State.Status}},"running":{{json .State.Running}},"exit_code":{{json .State.ExitCode}},"ports":{{json .NetworkSettings.Ports}}}'
+  const format = '{"id":{{json .Id}},"status":{{json .State.Status}},"running":{{json .State.Running}},"started_at":{{json .State.StartedAt}},"restart_count":{{json .RestartCount}},"exit_code":{{json .State.ExitCode}},"ports":{{json .NetworkSettings.Ports}}}'
   const { stdout } = await execute('docker', ['inspect', '--type', 'container', '--format', format, name], {
-    timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 64 * 1024
+    timeout: 5000, killSignal: 'SIGKILL', maxBuffer: 64 * 1024, signal: operations.signal
   })
   return JSON.parse(stdout)
 }
@@ -129,8 +137,16 @@ async function healthDiagnostics(fixture, phase, lastHealthError) {
   } catch (error) {
     state = { inspect_error: requestErrorCode(error) }
   }
-  console.error(`Packaged ${fixture.mode} ${phase} health diagnostics: ${JSON.stringify({
-    ...state, browser_origin: fixture.origin, upstream: fixture.upstream || null, last_health_error: lastHealthError
+  let databaseState
+  if (fixture.database) {
+    try {
+      databaseState = await inspectContainer(fixture.database.name)
+    } catch (error) {
+      databaseState = { inspect_error: requestErrorCode(error) }
+    }
+  }
+  console.error(`Packaged ${fixture.label} ${phase} health diagnostics: ${JSON.stringify({
+    ...state, database: databaseState, browser_origin: fixture.origin, upstream: fixture.upstream || null, last_health_error: lastHealthError
   })}`)
 }
 
@@ -146,7 +162,7 @@ async function waitHealthy(fixture, phase) {
     assert.ok(Number.isInteger(port) && port > 0 && port <= 65535, 'Valid published fixture port')
     const previousUpstream = fixture.upstream || null
     fixture.upstream = `http://127.0.0.1:${port}`
-    console.log(`Packaged ${fixture.mode} ${phase} mapping: ${JSON.stringify({
+    console.log(`Packaged ${fixture.label} ${phase} mapping: ${JSON.stringify({
       browser_origin: fixture.origin, previous_upstream: previousUpstream, upstream: fixture.upstream
     })}`)
 
@@ -162,7 +178,7 @@ async function waitHealthy(fixture, phase) {
       }
       await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(500, deadline - Date.now()))))
     }
-    throw new Error(`Packaged ${fixture.mode} instance did not become healthy within 120 seconds (${phase})`)
+    throw new Error(`Packaged ${fixture.label} instance did not become healthy within 120 seconds (${phase})`)
   } catch (error) {
     await healthDiagnostics(fixture, phase, lastHealthError)
     throw error
@@ -183,8 +199,79 @@ async function listen(server) {
   return server.address().port
 }
 
+async function writeEnvironment(path, environment) {
+  await writeFile(path, Object.entries(environment).map(([key, value]) => `${key}=${value}\n`).join(''), { mode: 0o600 })
+}
+
+async function startExternalDatabase(fixture, environment) {
+  fixture.database = { name: `${fixture.name}-postgres`, network: `${fixture.name}-network` }
+  const { name, network } = fixture.database
+  networks.add(network)
+  await docker(['network', 'create', '--internal', '--label', `searchmeld.admin-cookie-fixture=${prefix}`, network])
+  const environmentPath = join(temporary, `${fixture.mode}-postgres.env`)
+  await writeEnvironment(environmentPath, {
+    POSTGRES_DB: environment.POSTGRES_DB, POSTGRES_USER: environment.POSTGRES_USER, POSTGRES_PASSWORD: environment.POSTGRES_PASSWORD
+  })
+  containers.add(name)
+  await docker(['run', '--detach', '--pull', 'never', '--name', name,
+    '--label', `searchmeld.admin-cookie-fixture=${prefix}`, '--log-driver', 'none',
+    '--network', network, '--network-alias', 'cookie-postgres', '--env-file', environmentPath, postgresImage])
+
+  const url = new URL('postgresql://cookie-postgres:5432/cookie_fixture?sslmode=disable')
+  url.username = environment.POSTGRES_USER
+  url.password = environment.POSTGRES_PASSWORD
+  environment.DATABASE_URL = secret(url.href)
+  const deadline = Date.now() + 60000
+  while (Date.now() < deadline) {
+    const state = await inspectContainer(name)
+    assert.equal(state.running, true, 'External PostgreSQL must stay running during startup')
+    assert.ok(Object.values(state.ports || {}).every((bindings) => !bindings?.length), 'External PostgreSQL must not publish host ports')
+    try {
+      // The image's temporary initialization server is socket-only; require
+      // TCP readiness so it cannot race the application's migration startup.
+      await docker(['exec', name, 'pg_isready', '--host=127.0.0.1', '--username=cookie_fixture', '--dbname=cookie_fixture', '--timeout=2'], {
+        timeout: Math.max(1, Math.min(5000, deadline - Date.now()))
+      })
+      return
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(500, deadline - Date.now()))))
+    }
+  }
+  await healthDiagnostics(fixture, 'database startup', { error: 'DATABASE_NOT_READY' })
+  throw new Error('External PostgreSQL did not become ready within 60 seconds')
+}
+
+async function externalDatabaseSnapshot(fixture) {
+  if (!fixture.database) return null
+  const state = await inspectContainer(fixture.database.name)
+  assert.equal(state.running, true, 'External PostgreSQL must remain running')
+  const snapshot = JSON.parse(await docker(['exec', fixture.database.name, 'psql', '-X', '--no-password',
+    '--username=cookie_fixture', '--dbname=cookie_fixture', '--tuples-only', '--no-align', '--set=ON_ERROR_STOP=1',
+    '--command', `SELECT json_build_object(
+      'started_at', pg_postmaster_start_time(),
+      'admin_users', (SELECT count(*) FROM admin_users),
+      'admin_api_keys', (SELECT count(*) FROM admin_api_keys),
+      'api_tokens', (SELECT count(*) FROM api_tokens)
+    )`], { timeout: 5000 }))
+  assert.equal(snapshot.admin_users, 1, 'The application account must live in the external database')
+  assert.equal(snapshot.admin_api_keys, 1, 'The installed Key must live in the external database')
+  assert.equal(snapshot.api_tokens, 1, 'The ordinary Token must live in the external database')
+  return { id: state.id, started_at: state.started_at, restart_count: state.restart_count, database: snapshot }
+}
+
+async function removeFixture(fixture) {
+  await docker(['rm', '--force', '--volumes', fixture.name], { timeout: 10000 })
+  containers.delete(fixture.name)
+  if (fixture.database) {
+    await docker(['rm', '--force', '--volumes', fixture.database.name], { timeout: 10000 })
+    containers.delete(fixture.database.name)
+    await docker(['network', 'rm', fixture.database.network], { timeout: 10000 })
+    networks.delete(fixture.database.network)
+  }
+}
+
 async function startFixture(mode, tls) {
-  const fixture = { mode, name: `${prefix}-${mode}`, problems: [], observations: [], pages: [], pendingObservations: [] }
+  const fixture = { mode, label: `${databaseMode}-${mode}`, name: `${prefix}-${mode}`, problems: [], observations: [], pages: [], pendingObservations: [] }
   fixture.credentials = { username: 'ci-cookie-operator', password: secret(randomBytes(24).toString('hex')) }
   // Keep the browser's actual listening origin alive across container restarts.
   // Docker's dynamically published upstream is re-inspected after every start;
@@ -217,7 +304,7 @@ async function startFixture(mode, tls) {
   fixture.origin = `${mode}://127.0.0.1:${await listen(proxy)}`
   assert.ok(new URL(fixture.origin).port, 'Exercise a non-default Host port')
   const environment = {
-    APP_ENV: 'production', DATABASE_MODE: 'embedded', DATABASE_URL: '',
+    APP_ENV: 'production', DATABASE_MODE: databaseMode, DATABASE_URL: '',
     POSTGRES_DB: 'cookie_fixture', POSTGRES_USER: 'cookie_fixture',
     POSTGRES_PASSWORD: secret(randomBytes(24).toString('hex')),
     ENCRYPTION_KEY: secret(randomBytes(32).toString('hex')),
@@ -227,17 +314,23 @@ async function startFixture(mode, tls) {
     CORS_ALLOWED_ORIGINS: mode === 'https' ? `*,${fixture.origin}` : '*',
     HTTP_PROXY: '', HTTPS_PROXY: '', ALL_PROXY: '', http_proxy: '', https_proxy: '', all_proxy: ''
   }
+  if (databaseMode === 'external') await startExternalDatabase(fixture, environment)
   const environmentPath = join(temporary, `${mode}.env`)
   const origins = mode === 'https' ? ['', fixture.origin] : ['']
   for (const publicOrigin of origins) {
     environment.ADMIN_PUBLIC_ORIGIN = publicOrigin
-    await writeFile(environmentPath, Object.entries(environment).map(([key, value]) => `${key}=${value}\n`).join(''), { mode: 0o600 })
-    // The image's anonymous PostgreSQL volume belongs only to this fixture. It
-    // survives its restart assertion and is removed with docker rm --volumes.
+    await writeEnvironment(environmentPath, environment)
+    // Both modes retain their database across app restart. All anonymous
+    // database volumes belong to this fixture and are removed with --volumes.
     containers.add(fixture.name)
-    await docker(['run', '--detach', '--pull', 'never', '--name', fixture.name,
-      '--label', `searchmeld.admin-cookie-fixture=${prefix}`,
-      '--publish', '127.0.0.1::80', '--env-file', environmentPath, 'searchmeld:ci-all-in-one'])
+    await docker(['create', '--pull', 'never', '--name', fixture.name,
+      '--label', `searchmeld.admin-cookie-fixture=${prefix}`, '--log-driver', 'none',
+      ...(fixture.database ? ['--network', fixture.database.network] : []),
+      '--publish', '127.0.0.1::80', '--env-file', environmentPath, image])
+    // Internal-only networks do not reliably publish host ports. Attach the
+    // app (never PostgreSQL) to the existing bridge before starting it.
+    if (fixture.database) await docker(['network', 'connect', 'bridge', fixture.name])
+    await docker(['start', fixture.name])
     await waitHealthy(fixture, mode === 'https' && !publicOrigin ? 'missing-origin startup' : 'startup')
     if (mode === 'https' && !publicOrigin) {
       adminReply(await request(fixture.origin, '/api/admin/login', {
@@ -385,6 +478,67 @@ async function me(page, fixture, status = 200) {
   if (status === 200) assert.equal(typeof JSON.parse(reply.body).username, 'string')
 }
 
+async function searchValidation(fixture, headers, label) {
+  // Empty input reaches the retained business handler but returns before
+  // orchestration, so an accepted Key/Token cannot spend upstream credits.
+  const reply = await request(fixture.origin, '/v1/search', { method: 'POST', headers, body: {} })
+  assert.equal(reply.status, 400, label)
+  const body = JSON.parse(reply.body)
+  assert.equal(body.error.status, 400, `${label}: business validation envelope`)
+  assert.equal(body.error.message, 'query is required', `${label}: reached the search handler`)
+}
+
+async function removedPublicEndpoints(fixture, cookieHeaders, { key, token, session }) {
+  const admin = (path, options = {}) => request(fixture.origin, path, { ...options, headers: cookieHeaders })
+  const settings = JSON.parse(adminReply(await admin('/api/admin/settings'), 200, 'Read effective business auth setting').body)
+  assert.equal(settings.api_auth_required, true, 'Fixture business auth must initially be enabled in the database')
+  const credentials = [
+    ['anonymous', {}], ['Cookie', cookieHeaders],
+    ['session Bearer', { Authorization: `Bearer ${session}` }], ['session X-API-Key', { 'X-API-Key': session }],
+    ['Token Bearer', { Authorization: `Bearer ${token}` }], ['Token X-API-Key', { 'X-API-Key': token }],
+    ['Key Bearer', { Authorization: `Bearer ${key}` }], ['Key X-API-Key', { 'X-API-Key': key }],
+    ['invalid Key', { Authorization: 'Bearer oak_invalid_fixture' }]
+  ]
+  let settingsChanged = false
+  try {
+    for (const required of [true, false]) {
+      if (!required) {
+        settingsChanged = true
+        adminReply(await admin('/api/admin/settings', {
+          method: 'PUT', body: { ...settings, api_auth_required: false }
+        }), 200, 'Temporarily disable effective business auth')
+      }
+      const effective = JSON.parse(adminReply(await admin('/api/admin/settings'), 200, 'Probe effective business auth').body)
+      assert.equal(effective.api_auth_required, required)
+      if (required) {
+        assert.equal((await request(fixture.origin, '/v1/search', { method: 'POST', body: {} })).status, 401, 'Auth-on rejects anonymous business calls')
+      } else await searchValidation(fixture, {}, 'Auth-off reaches the retained business handler anonymously')
+      for (const path of ['/v1/providers', '/v1/usage/summary']) {
+        for (const [label, headers] of credentials) {
+          const reply = await request(fixture.origin, path, { headers })
+          assert.equal(reply.status, 404, `${path}: removed for ${label}, auth_required=${required}`)
+          assert.ok(reply.body === '404 page not found\n', `${path}: no configuration or usage payload in removed-route response`)
+        }
+      }
+      for (const headers of [cookieHeaders, { Authorization: `Bearer ${key}` }, { 'X-API-Key': key }]) {
+        const providers = adminReply(await request(fixture.origin, '/api/admin/providers', { headers }), 200, 'Admin providers remain available')
+        assert.ok(JSON.parse(providers.body).providers.length > 0, 'Admin provider configuration remains populated')
+        const usage = adminReply(await request(fixture.origin, '/api/admin/usage/summary', { headers }), 200, 'Admin usage remains available')
+        assert.equal(typeof JSON.parse(usage.body).requests_total, 'number', 'Admin instance usage retains its schema')
+      }
+      for (const path of ['/api/admin/providers', '/api/admin/usage/summary']) {
+        for (const headers of [proof, { Authorization: `Bearer ${token}` }]) {
+          adminReply(await request(fixture.origin, path, { headers }), 401, 'Business auth mode never opens admin metadata')
+        }
+      }
+    }
+  } finally {
+    if (settingsChanged) adminReply(await admin('/api/admin/settings', { method: 'PUT', body: settings }), 200, 'Restore business auth before remaining browser cases')
+  }
+  const restored = JSON.parse(adminReply(await admin('/api/admin/settings'), 200, 'Probe restored business auth').body)
+  assert.equal(restored.api_auth_required, true)
+}
+
 async function authBoundaries(fixture, page) {
   const cookie = await currentCookie(page.context(), fixture)
   const cookieHeaders = { ...proof, Cookie: `${cookieName}=${cookie.value}`, Origin: fixture.origin }
@@ -397,6 +551,8 @@ async function authBoundaries(fixture, page) {
   }), 201, 'ordinary Token provisioning')
   const token = secret(JSON.parse(tokenReply.body).raw_token)
   assert.ok(token.startsWith('osr_'))
+  await searchValidation(fixture, { Authorization: `Bearer ${token}` }, 'Ordinary search Token reaches business validation')
+  await removedPublicEndpoints(fixture, cookieHeaders, { key, token, session: cookie.value })
 
   for (const headers of [
     { Authorization: `Bearer ${cookie.value}` }, { 'X-API-Key': cookie.value },
@@ -413,7 +569,7 @@ async function authBoundaries(fixture, page) {
     adminReply(await request(fixture.origin, '/api/admin/me', {
       headers: { ...headers, Cookie: `${cookieName}=adm_invalid_fixture` }
     }), 200, 'Valid Key wins over stale Cookie')
-    assert.equal((await request(fixture.origin, '/v1/providers', { headers })).status, 200, 'Key business API')
+    await searchValidation(fixture, headers, 'Key business API')
     adminReply(await request(fixture.origin, '/api/admin/logout', {
       method: 'POST', headers: { ...headers, Cookie: cookieHeaders.Cookie }
     }), 200, 'Key logout is non-revoking and ignores incidental Cookie')
@@ -424,17 +580,20 @@ async function authBoundaries(fixture, page) {
   // Send the Cookie explicitly beyond its browser Path. Path omission alone
   // would not establish the backend's public credential boundary.
   const business = [
-    ['/v1/providers', 'GET'], ['/v1/usage/summary', 'GET'],
     ['/v1/search', 'POST'], ['/v1/extract', 'POST'],
     ['/v1/compat/tavily/search', 'POST'], ['/v1/compat/tavily/extract', 'POST'],
     ['/v1/compat/serper/search', 'POST'], ['/v1/compat/openai/responses-search', 'POST']
   ]
   for (const [path, method] of business) {
-    const reply = await request(fixture.origin, path, {
-      method, headers: cookieHeaders,
-      ...(method === 'GET' ? {} : { body: { query: 'ci-only', urls: ['https://example.invalid/article'] } })
-    })
-    assert.equal(reply.status, 401, `${path}: explicit session Cookie must not authorize business calls`)
+    for (const [kind, headers] of [
+      ['Cookie', cookieHeaders], ['session Bearer', { Authorization: `Bearer ${cookie.value}` }], ['session X-API-Key', { 'X-API-Key': cookie.value }]
+    ]) {
+      const reply = await request(fixture.origin, path, {
+        method, headers,
+        ...(method === 'GET' ? {} : { body: { query: 'ci-only', urls: ['https://example.invalid/article'] } })
+      })
+      assert.equal(reply.status, 401, `${path}: explicit ${kind} must not authorize business calls`)
+    }
   }
   const rpc = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'ci-no-such-tool', arguments: {} } }
   for (const path of ['/mcp', '/v1/mcp']) {
@@ -503,7 +662,7 @@ async function authBoundaries(fixture, page) {
   assert.equal(preflighted.blocked, true, 'Hostile custom-header fetch is rejected by CORS')
   await me(page, fixture)
   await hostile.close()
-  return key
+  return { key, token }
 }
 
 async function holdResponses(fixture, page, paths, status) {
@@ -613,7 +772,7 @@ async function exercise(fixture) {
   await first.goto(`${fixture.origin}${target}`)
   await atLogin(first)
   await login(first, fixture, { wrongPassword: true })
-  await screenshot(first, `${fixture.mode}-desktop-login-error`)
+  await screenshot(first, `${fixture.label}-desktop-login-error`)
   await login(first, fixture)
   await first.locator('.el-message--error').waitFor({ state: 'hidden' })
   await second.goto(`${fixture.origin}${target}`)
@@ -625,9 +784,9 @@ async function exercise(fixture) {
   await storageIsClean(first)
   await storageIsClean(second)
   assert.equal(await first.locator('.float-mark').evaluate((img) => img.complete && img.naturalWidth > 0), true, 'Packaged logo asset renders')
-  await screenshot(first, `${fixture.mode}-desktop-shared-login`)
+  await screenshot(first, `${fixture.label}-desktop-shared-login`)
   await second.setViewportSize(mobile)
-  await screenshot(second, `${fixture.mode}-mobile-shared-login`)
+  await screenshot(second, `${fixture.label}-mobile-shared-login`)
 
   const independent = await openContext(fixture, mobile)
   const anonymous = await independent.newPage()
@@ -637,7 +796,7 @@ async function exercise(fixture) {
   await me(first, fixture)
   await independent.close()
   contexts.delete(independent)
-  const key = await authBoundaries(fixture, first)
+  const { key, token } = await authBoundaries(fixture, first)
 
   const formerlyValid = await currentCookie(context, fixture)
   for (const page of [first, second]) {
@@ -654,7 +813,7 @@ async function exercise(fixture) {
     await atLogin(page)
     await storageIsClean(page)
   }
-  await screenshot(second, `${fixture.mode}-mobile-cookie-deleted`)
+  await screenshot(second, `${fixture.label}-mobile-cookie-deleted`)
   await login(first, fixture)
   await second.reload()
   await atProtected(second, fixture)
@@ -679,6 +838,7 @@ async function exercise(fixture) {
 
   const browserOrigin = fixture.origin
   const beforeRestart = await currentCookie(context, fixture)
+  const beforeDatabase = await externalDatabaseSnapshot(fixture)
   try {
     await docker(['restart', '--time', '5', fixture.name])
   } catch (error) {
@@ -686,6 +846,9 @@ async function exercise(fixture) {
     throw error
   }
   await waitHealthy(fixture, 'after restart')
+  if (fixture.database) {
+    assert.deepEqual(await externalDatabaseSnapshot(fixture), beforeDatabase, 'App restart must not replace/restart external PostgreSQL or lose persisted account/Keys')
+  }
   assert.equal(fixture.origin, browserOrigin, 'Restart must retain the browser public origin')
   assert.ok((await currentCookie(context, fixture)).value === beforeRestart.value, 'Restart rejection must use the existing Cookie jar')
   for (const page of [first, second]) {
@@ -695,7 +858,9 @@ async function exercise(fixture) {
     await atLogin(page)
   }
   adminReply(await request(fixture.origin, '/api/admin/me', { headers: { Authorization: `Bearer ${key}` } }), 200, 'Installed Key survives restart while memory sessions do not')
-  await screenshot(first, `${fixture.mode}-desktop-restarted-session`)
+  await searchValidation(fixture, { Authorization: `Bearer ${key}` }, 'Installed Key retains business access after restart')
+  await searchValidation(fixture, { Authorization: `Bearer ${token}` }, 'Persisted ordinary Token retains business access after restart')
+  await screenshot(first, `${fixture.label}-desktop-restarted-session`)
   await login(first, fixture)
   await second.reload()
   await atProtected(second, fixture)
@@ -709,23 +874,40 @@ async function exercise(fixture) {
   assert.deepEqual(fixture.problems, [], 'Unexpected browser/fixture errors')
   await context.close()
   contexts.delete(context)
-  await docker(['rm', '--force', '--volumes', fixture.name])
-  containers.delete(fixture.name)
-  console.log(`Packaged ${fixture.mode} Cookie, shared-tab, CSRF, Key and stale-response cases completed`)
+  await removeFixture(fixture)
+  console.log(`Packaged ${fixture.label} Cookie, shared-tab, CSRF, Key, removed-route and stale-response cases completed`)
 }
 
 async function cleanup() {
   if (cleanupPromise) return cleanupPromise
   cleanupPromise = (async () => {
+    operations.abort()
+    const failures = []
+    const step = async (label, action) => {
+      try {
+        await bounded(action(), label, 5000)
+      } catch {
+        failures.push(label)
+      }
+    }
     for (const gate of gates) gate.resolve()
-    for (const context of contexts) await bounded(context.close(), 'context cleanup', 5000).catch(() => {})
-    if (browser) await bounded(browser.close(), 'browser cleanup', 5000).catch(() => {})
+    for (const context of contexts) await step('context cleanup', () => context.close())
+    if (browser) await step('browser cleanup', () => browser.close())
     for (const server of servers) {
       server.closeAllConnections()
-      await bounded(new Promise((resolve) => server.close(resolve)), 'listener cleanup', 5000).catch(() => {})
+      await step('listener cleanup', () => new Promise((resolve) => server.close(resolve)))
     }
-    for (const name of containers) await docker(['rm', '--force', '--volumes', name]).catch(() => {})
-    await rm(temporary, { recursive: true, force: true })
+    for (const name of containers) {
+      await step(`container ${name}`, () => docker(['rm', '--force', '--volumes', name], { timeout: 5000, cleanup: true }))
+    }
+    for (const name of networks) {
+      await step(`network ${name}`, () => docker(['network', 'rm', name], { timeout: 5000, cleanup: true }))
+    }
+    await step('temporary file cleanup', () => rm(temporary, { recursive: true, force: true }))
+    if (failures.length) {
+      console.error(`Packaged fixture cleanup incomplete: ${failures.join(', ')}`)
+      process.exitCode = 1
+    }
   })()
   return cleanupPromise
 }
@@ -733,7 +915,7 @@ async function cleanup() {
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => {
     console.error(`Packaged fixture interrupted by ${signal}`)
-    const forcedExit = setTimeout(() => process.exit(1), 20000)
+    const forcedExit = setTimeout(() => process.exit(1), 90000)
     cleanup().finally(() => { clearTimeout(forcedExit); process.exit(1) })
   })
 }
@@ -755,7 +937,7 @@ async function main() {
     }
   } catch (error) {
     for (const [index, page] of (fixture?.pages || []).entries()) {
-      if (!page.isClosed()) await bounded(screenshot(page, `${fixture.mode}-failure-${index}`), 'failure screenshot', 5000).catch(() => {})
+      if (!page.isClosed()) await bounded(screenshot(page, `${fixture.label}-failure-${index}`), 'failure screenshot', 5000).catch(() => {})
     }
     throw error
   } finally {

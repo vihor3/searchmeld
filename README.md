@@ -52,6 +52,12 @@ cd searchmeld
 
 已有持久化密码、`ENCRYPTION_KEY`、内置 PostgreSQL Volume 和外部数据库连接不会在更新时被静默替换。
 
+### 数据库升级与恢复
+
+内置数据库固定为 **PostgreSQL 16**，不会跟随 Alpine 默认包自动升级大版本。启动前检查服务器版本和数据目录的 `PG_VERSION`；不同大版本、损坏的标记或非空但缺少标记的目录会被拒绝，不执行初始化或修改目录所有权。
+
+升级前保留旧镜像和完整 `.env`（尤其是 `ENCRYPTION_KEY`），停止应用并确认 PostgreSQL 已干净关闭后再复制数据库卷，且验证备份可以恢复；仅停止业务写入不足以安全复制运行中的数据库目录。普通应用升级继续使用原数据卷；不要删除或编辑 `PG_VERSION` 来强行启动。大版本不匹配时，用匹配的旧 PostgreSQL 恢复服务或导出数据，再向新的兼容卷恢复，确认账号、Key 和业务数据后再切换。不要让升级或回滚直接操作唯一的数据副本。
+
 自定义 DNS 只建议在 Docker DNS 间歇出现 `server misbehaving`、SERVFAIL 或超时时启用。Mihomo Fake-IP、企业内网和域名分流环境通常依赖宿主机 DNS，应保留默认关闭状态。启用后向导会要求填写两台不同的 IPv4/IPv6 DNS 地址，并为所有数据库部署方式叠加 `docker-compose.dns.yml`。
 
 ### 从 One Search 迁移
@@ -128,6 +134,8 @@ Cookie 不按 TCP 端口隔离，不要让不可信应用与管理台共享主�
 ## 使用外部 PostgreSQL
 
 后端原生读取 `DATABASE_URL`。`external` 镜像默认使用外部数据库，不会初始化本地数据目录或覆盖连接串；`all-in-one` 镜像默认仍使用内置数据库，避免升级时被 `.env` 中遗留的开发连接串意外切换。外部数据库要求 PostgreSQL 15+，因为迁移使用了 `UNIQUE NULLS NOT DISTINCT`。
+
+数据库驱动已从 pgx v4 升为 v5，普通连接串无需修改。若曾配置 `prefer_simple_protocol` 或 `statement_cache_mode`，启动会给出迁移错误，不会静默改变查询协议。默认使用扩展协议；需要 simple protocol 时显式设置 `default_query_exec_mode=simple_protocol`。旧 `statement_cache_mode=describe` 对应 `default_query_exec_mode=cache_describe` 及正数 `description_cache_capacity`；关闭缓存应使用 `default_query_exec_mode=describe_exec`，不要仅把默认模式的缓存容量设为 0。
 
 先创建项目专用账号和数据库，确保该账号拥有目标数据库及 schema，能够执行建表、索引和后续迁移：
 
@@ -264,6 +272,8 @@ curl -X POST http://localhost:5173/v1/extract \
 
 两个 Tavily 兼容接口除 `Authorization: Bearer` 和 `X-API-Key` 外，也接受旧版 Tavily 客户端使用的 JSON `api_key` 字段。请求头与 JSON 同时存在时优先使用请求头；该兼容形式不会应用到 `/v1/search`、`/v1/extract` 或其它接口。
 
+原生、兼容搜索和 MCP 搜索均执行普通 Token 的 `allowed_providers` 限制；省略 `providers` 不会绕过限制。平台完整配置和全站统计仅保留在 `/api/admin/providers`、`/api/admin/usage/summary`，原 `/v1/providers`、`/v1/usage/summary` 已移除；旧脚本应改用管理员 Key 调用管理接口。
+
 完整接口见 [docs/extract.md](docs/extract.md)、[docs/admin-api-key.md](docs/admin-api-key.md)、[docs/mcp.md](docs/mcp.md)。
 
 安全边界、源码审计发现及尚未解决的风险见 [安全审查报告](docs/security-review.md)。
@@ -336,7 +346,7 @@ enabled_tools = ["search", "extract"]
 | `ADMIN_PASSWORD` | — | 生产**必填** |
 | `ADMIN_PUBLIC_ORIGIN` | 空 | 管理台规范外部 HTTP(S) 源；直接 HTTP 可留空，HTTPS 反代必须填写（含非默认端口） |
 | `ENCRYPTION_KEY` | — | **必填**，≥32 字符，加密敏感 Key |
-| `API_AUTH_REQUIRED` | `true` | `/v1/*`、MCP 是否强制 Token |
+| `API_AUTH_REQUIRED` | `true` | 遗留环境字段；实际 `/v1/*`、MCP 鉴权以管理台保存的 `api_auth_required` 为准（默认开启），不能靠此环境值覆盖已存策略 |
 | `MCP_ENABLED` | `true` | 是否开启 MCP |
 
 ### 可选（一般不用改，需要时加到 `.env`）
@@ -372,7 +382,11 @@ enabled_tools = ["search", "extract"]
 - 可在明确授权后先提交、推送验证版本以触发 CI；只有对应远端检查通过后，才能标记验证完成。
 - 工作流只负责验证和构建，不自动发布生产镜像或部署；提交、推送和发布仍按明确授权执行。
 
-管理会话回归分为前端 mock 场景与真实打包集成：`deploy/admin_cookie_integration_test.cjs` 仅允许在 GitHub Actions 执行，复用 `all-in-one` 镜像构建作业，在隔离临时数据库、直接 HTTP 和临时 TLS 代理中验证 Cookie、独立标签页、Origin/CSRF 及旧响应竞态。精确 TTL 由后端测试覆盖，不通过生产测试端点加速过期。CI 仅保留 7 天的合成 PNG 截图，不上传 Cookie jar、凭据或追踪文件；清理临时容器、证书及浏览器资源。
+管理会话回归分为前端 mock 场景与真实打包集成：`deploy/admin_cookie_integration_test.cjs` 仅允许在 GitHub Actions 执行，覆盖 `all-in-one` 内置库和 `external` 独立 PostgreSQL，在直接 HTTP 和临时 TLS 代理中验证 Cookie、独立标签页、Origin/CSRF 及旧响应竞态。精确 TTL 由后端测试覆盖，不通过生产测试端点加速过期。
+
+`deploy/database_upgrade_test.cjs` 在隔离卷中从固定的旧代码提交构建历史镜像，验证新镜像保留旧账号、管理员 Key、业务 Token 和持久化数据，并检查不兼容数据库目录的拒绝与恢复。它不是生产自动迁移程序，不接触现网数据库。
+
+依赖检查覆盖完整 npm 锁文件、`govulncheck` 调用可达性和最终镜像的系统/Go 依赖。npm 和镜像从 low 级别开始阻断，不统一忽略未修复漏洞；下载或扫描失败也不能视为通过。前端和镜像均使用 `npm ci`，锁文件更新只在 Actions 生成并经代码审阅后提交。CI 保留 7 天的漏洞报告与合成 PNG，不上传 Cookie jar、数据库备份、凭据或追踪文件，并清理临时容器、卷、证书及浏览器资源。
 
 这条约束适用于开发人员和所有编码代理，并替代旧的本地 Docker 验证说明。现有部署入口未因此调整。
 

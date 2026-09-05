@@ -148,12 +148,16 @@ func TestMountedExtractRejections(t *testing.T) {
 						}
 					}
 
-					accepted := httptest.NewRequest(http.MethodGet, "/v1/providers", nil)
+					accepted := httptest.NewRequest(http.MethodPost, "/v1/search", strings.NewReader(`{}`))
 					accepted.Header.Set("Authorization", "Bearer extract-test-secret")
 					response = httptest.NewRecorder()
 					router.ServeHTTP(response, accepted)
-					if response.Code != http.StatusOK || store.usageMarks != 1 || len(store.inputs) != 1 {
-						t.Fatalf("later accepted request: status=%d usage marks=%d rejected logs=%d", response.Code, store.usageMarks, len(store.inputs))
+					wantStatus := http.StatusForbidden
+					if test.scope == "search" {
+						wantStatus = http.StatusBadRequest
+					}
+					if response.Code != wantStatus || store.usageMarks != 1 || len(store.inputs) != 1 {
+						t.Fatalf("later authenticated search: status=%d usage marks=%d rejected logs=%d", response.Code, store.usageMarks, len(store.inputs))
 					}
 				})
 			}

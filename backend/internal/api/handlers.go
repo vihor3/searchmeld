@@ -114,8 +114,6 @@ func (h *Handler) Mount(r chi.Router) {
 		r.With(tavilyBodyAPIKeyMiddleware, h.auth.requireAPIToken, h.requireExtractAPITokenScope(model.CompatFormatTavily)).Post("/compat/tavily/extract", h.tavilyExtract)
 		r.With(h.auth.requireAPITokenScope("search")).Post("/compat/serper/search", h.serperSearch)
 		r.With(h.auth.requireAPITokenScope("search")).Post("/compat/openai/responses-search", h.openAISearch)
-		r.With(h.auth.requireAPIToken).Get("/providers", h.providers)
-		r.With(h.auth.requireAPIToken).Get("/usage/summary", h.usageSummary)
 	})
 
 	r.Route("/api/admin", func(r chi.Router) {
@@ -259,6 +257,14 @@ func (h *Handler) tavilySearch(w http.ResponseWriter, r *http.Request) {
 	native := compat.TavilyToNative(req)
 	native.LimitExplicit = hasJSONField(body, "max_results")
 	native.ProvidersExplicit = hasJSONField(body, "providers")
+	if token, ok := APIToken(r.Context()); ok {
+		filtered, err := applyTokenProviders(native.Providers, token.AllowedProviders)
+		if err != nil {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		native.Providers = filtered
+	}
 	response, err := h.orchestrator.Search(r.Context(), native, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -347,6 +353,14 @@ func (h *Handler) serperSearch(w http.ResponseWriter, r *http.Request) {
 	native := compat.SerperToNative(req)
 	native.LimitExplicit = hasJSONField(body, "num")
 	native.ProvidersExplicit = hasJSONField(body, "providers")
+	if token, ok := APIToken(r.Context()); ok {
+		filtered, err := applyTokenProviders(native.Providers, token.AllowedProviders)
+		if err != nil {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		native.Providers = filtered
+	}
 	response, err := h.orchestrator.Search(r.Context(), native, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -378,6 +392,14 @@ func (h *Handler) openAISearch(w http.ResponseWriter, r *http.Request) {
 	native := compat.OpenAIToNative(req)
 	native.LimitExplicit = hasJSONField(body, "limit")
 	native.ProvidersExplicit = hasJSONField(body, "providers")
+	if token, ok := APIToken(r.Context()); ok {
+		filtered, err := applyTokenProviders(native.Providers, token.AllowedProviders)
+		if err != nil {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
+		native.Providers = filtered
+	}
 	response, err := h.orchestrator.Search(r.Context(), native, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -517,7 +539,7 @@ func extractErrorStatus(err error) int {
 	}
 }
 
-func (h *Handler) providers(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) adminProviders(w http.ResponseWriter, r *http.Request) {
 	providers, err := h.store.ListProviders(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -610,6 +632,10 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := decoder.Decode(new(interface{})); err != io.EOF {
 		writeError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	if len(req.Username) > maxLoginUsernameBytes {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("username must not exceed %d bytes", maxLoginUsernameBytes))
 		return
 	}
 	ip := clientIP(r)
@@ -739,10 +765,6 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 		"provider_series": providerSeries,
 		"health_series":   healthSeries,
 	})
-}
-
-func (h *Handler) adminProviders(w http.ResponseWriter, r *http.Request) {
-	h.providers(w, r)
 }
 
 func (h *Handler) updateProvider(w http.ResponseWriter, r *http.Request) {

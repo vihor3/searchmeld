@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -17,9 +18,16 @@ const (
 	mcpDefaultProtocolVersion = "2025-03-26"
 	maxMCPExtractTextRunes    = 16 * 1024
 	maxMCPExtractPreviewRunes = 512
+	maxMCPBatchRequests       = 32
+	maxMCPDiscoveryBytes      = 256 * 1024
 )
 
+// Leave room for the full 12 MiB bounded Extract payload and its envelope.
+const maxMCPResponseBytes = 16 * 1024 * 1024
+
 var mcpSupportedProtocolVersions = []string{mcpLatestProtocolVersion, mcpDefaultProtocolVersion, "2024-11-05"}
+
+var errMCPResponseTooLarge = errors.New("mcp response exceeds encoded size limit")
 
 type mcpRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -85,7 +93,13 @@ func (h *Handler) mcpDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) mcp(w http.ResponseWriter, r *http.Request) {
+	if mcpRequestCanceled(w, r) {
+		return
+	}
 	body, err := readBody(r)
+	if mcpRequestCanceled(w, r) {
+		return
+	}
 	if err != nil {
 		writeMCPError(w, http.StatusBadRequest, nil, -32700, "invalid body", nil)
 		return
@@ -102,14 +116,21 @@ func (h *Handler) mcp(w http.ResponseWriter, r *http.Request) {
 			writeMCPError(w, http.StatusBadRequest, nil, -32700, "parse error", err.Error())
 			return
 		}
+		if len(requests) == 0 || len(requests) > maxMCPBatchRequests {
+			writeMCPError(w, http.StatusBadRequest, nil, -32600, fmt.Sprintf("a JSON-RPC batch must contain between 1 and %d requests", maxMCPBatchRequests), nil)
+			return
+		}
+		if mcpRequestCanceled(w, r) {
+			return
+		}
 		if countMCPToolCalls(requests) > 1 {
-			writeMCPError(w, http.StatusBadRequest, firstMCPRequestID(trimmed), -32600, "a JSON-RPC batch may contain at most one tools/call", nil)
+			writeMCPError(w, http.StatusBadRequest, requests[0].ID, -32600, "a JSON-RPC batch may contain at most one tools/call", nil)
 			return
 		}
 		if h.mcpRequestsRequireAuth(requests) {
 			ctx, authStatus, authMessage, err := h.mcpAuthContext(r)
 			if err != nil {
-				writeMCPError(w, authStatus, firstMCPRequestID(trimmed), -32001, authMessage, nil)
+				writeMCPError(w, authStatus, requests[0].ID, -32001, authMessage, nil)
 				return
 			}
 			r = r.WithContext(ctx)
@@ -123,6 +144,9 @@ func (h *Handler) mcp(w http.ResponseWriter, r *http.Request) {
 		writeMCPError(w, http.StatusBadRequest, nil, -32700, "parse error", err.Error())
 		return
 	}
+	if mcpRequestCanceled(w, r) {
+		return
+	}
 	if h.mcpRequestsRequireAuth([]mcpRequest{req}) {
 		ctx, authStatus, authMessage, err := h.mcpAuthContext(r)
 		if err != nil {
@@ -132,11 +156,37 @@ func (h *Handler) mcp(w http.ResponseWriter, r *http.Request) {
 		r = r.WithContext(ctx)
 	}
 	response, ok := h.handleMCPRequest(r, req)
+	if mcpRequestCanceled(w, r) {
+		return
+	}
 	if !ok {
 		writeMCPAccepted(w)
 		return
 	}
-	writeMCPResponse(w, http.StatusOK, response)
+	payload, err := marshalMCPResponse(response, mcpResponseLimit([]mcpRequest{req})-1)
+	if mcpRequestCanceled(w, r) {
+		return
+	}
+	if err != nil {
+		writeMCPEncodingError(w, err)
+		return
+	}
+	writeMCPPayload(w, http.StatusOK, payload)
+}
+
+func mcpRequestCanceled(w http.ResponseWriter, r *http.Request) bool {
+	if r.Context().Err() == nil {
+		return false
+	}
+	writeMCPError(w, http.StatusRequestTimeout, nil, -32000, "request canceled", nil)
+	return true
+}
+
+func mcpResponseLimit(requests []mcpRequest) int {
+	if countMCPToolCalls(requests) > 0 {
+		return maxMCPResponseBytes
+	}
+	return maxMCPDiscoveryBytes
 }
 
 func countMCPToolCalls(requests []mcpRequest) int {
@@ -150,25 +200,53 @@ func countMCPToolCalls(requests []mcpRequest) int {
 }
 
 func (h *Handler) handleMCPBatch(w http.ResponseWriter, r *http.Request, requests []mcpRequest) {
-	if len(requests) == 0 {
-		writeMCPError(w, http.StatusBadRequest, nil, -32600, "empty batch is not allowed", nil)
+	if len(requests) == 0 || len(requests) > maxMCPBatchRequests {
+		writeMCPError(w, http.StatusBadRequest, nil, -32600, fmt.Sprintf("a JSON-RPC batch must contain between 1 and %d requests", maxMCPBatchRequests), nil)
 		return
 	}
-	responses := make([]mcpResponse, 0, len(requests))
+	limit := mcpResponseLimit(requests)
+	var payload bytes.Buffer
+	payload.WriteByte('[')
 	for _, req := range requests {
-		response, ok := h.handleMCPRequest(r, req)
-		if ok {
-			responses = append(responses, response)
+		if mcpRequestCanceled(w, r) {
+			return
 		}
+		response, ok := h.handleMCPRequest(r, req)
+		if mcpRequestCanceled(w, r) {
+			return
+		}
+		if !ok {
+			continue
+		}
+		if payload.Len() > 1 {
+			payload.WriteByte(',')
+		}
+		// Encode one response at a time, reserving the closing bracket/newline.
+		encoded, err := marshalMCPResponse(response, limit-payload.Len()-2)
+		if mcpRequestCanceled(w, r) {
+			return
+		}
+		if err != nil {
+			writeMCPEncodingError(w, err)
+			return
+		}
+		payload.Write(encoded)
 	}
-	if len(responses) == 0 {
+	if mcpRequestCanceled(w, r) {
+		return
+	}
+	if payload.Len() == 1 {
 		writeMCPAccepted(w)
 		return
 	}
-	writeMCPBatchResponse(w, http.StatusOK, responses)
+	payload.WriteByte(']')
+	writeMCPPayload(w, http.StatusOK, payload.Bytes())
 }
 
 func (h *Handler) handleMCPRequest(r *http.Request, req mcpRequest) (mcpResponse, bool) {
+	if r.Context().Err() != nil {
+		return newMCPError(req.ID, -32000, "request canceled", nil), true
+	}
 	if req.ID == nil {
 		h.handleMCPNotification(r, req)
 		return mcpResponse{}, false
@@ -616,33 +694,38 @@ func writeMCPAccepted(w http.ResponseWriter) {
 }
 
 func writeMCPResponse(w http.ResponseWriter, status int, response mcpResponse) {
+	payload, err := marshalMCPResponse(response, maxMCPDiscoveryBytes-1)
+	if err != nil {
+		writeMCPEncodingError(w, err)
+		return
+	}
+	writeMCPPayload(w, status, payload)
+}
+
+func marshalMCPResponse(response mcpResponse, limit int) ([]byte, error) {
+	payload, err := json.Marshal(response)
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) > limit {
+		return nil, errMCPResponseTooLarge
+	}
+	return payload, nil
+}
+
+func writeMCPEncodingError(w http.ResponseWriter, err error) {
+	status, code, message := http.StatusInternalServerError, -32603, "could not encode mcp response"
+	if errors.Is(err, errMCPResponseTooLarge) {
+		status, code, message = http.StatusRequestEntityTooLarge, -32000, errMCPResponseTooLarge.Error()
+	}
+	// A fixed error with a null ID cannot repeat an oversized caller-controlled ID.
+	payload, _ := json.Marshal(newMCPError(nil, code, message, nil))
+	writeMCPPayload(w, status, payload)
+}
+
+func writeMCPPayload(w http.ResponseWriter, status int, payload []byte) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Mcp-Protocol-Version", mcpLatestProtocolVersion)
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(response)
-}
-
-func writeMCPBatchResponse(w http.ResponseWriter, status int, responses []mcpResponse) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.Header().Set("Mcp-Protocol-Version", mcpLatestProtocolVersion)
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(responses)
-}
-
-func firstMCPRequestID(body []byte) json.RawMessage {
-	if len(body) == 0 {
-		return nil
-	}
-	if body[0] == '[' {
-		var requests []mcpRequest
-		if err := json.Unmarshal(body, &requests); err == nil && len(requests) > 0 {
-			return requests[0].ID
-		}
-		return nil
-	}
-	var req mcpRequest
-	if err := json.Unmarshal(body, &req); err == nil {
-		return req.ID
-	}
-	return nil
+	_, _ = w.Write(append(payload, '\n'))
 }

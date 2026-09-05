@@ -32,12 +32,14 @@ type adminAuthTestStore struct {
 	adminKeyErr  error
 	keyLookups   []string
 	tokenLookups []string
+	userLookups  []string
 	settings     model.RuntimeSettings
 	audits       []model.AuditLogInput
 	usageMarks   int
 }
 
 func (s *adminAuthTestStore) GetAdminByUsername(_ context.Context, username string) (model.AdminUser, error) {
+	s.userLookups = append(s.userLookups, username)
 	if username != s.user.Username {
 		return model.AdminUser{}, errors.New("admin not found")
 	}
@@ -592,7 +594,7 @@ func TestBrowserCredentialsDoNotAuthenticatePublicRoutes(t *testing.T) {
 	cookie := f.login(t)
 	for _, path := range []string{
 		"/v1/search", "/v1/extract", "/v1/compat/tavily/search", "/v1/compat/tavily/extract",
-		"/v1/compat/serper/search", "/v1/compat/openai/responses-search", "/v1/providers", "/v1/usage/summary",
+		"/v1/compat/serper/search", "/v1/compat/openai/responses-search",
 		"/mcp", "/mcp/", "/v1/mcp", "/v1/mcp/",
 	} {
 		for _, credential := range []string{"cookie only", "session bearer", "session api key", "session body key"} {
@@ -602,8 +604,6 @@ func TestBrowserCredentialsDoNotAuthenticatePublicRoutes(t *testing.T) {
 				mcp := strings.Contains(path, "mcp")
 				if mcp {
 					body = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{}}}`
-				} else if path == "/v1/providers" || path == "/v1/usage/summary" {
-					method = http.MethodGet
 				}
 				if credential == "session body key" && !mcp {
 					payload, err := json.Marshal(map[string]string{"api_key": cookie.Value})
@@ -638,10 +638,12 @@ func TestPublicProgrammaticCredentialsRemainIndependent(t *testing.T) {
 	cookie := f.login(t)
 	for _, token := range []string{adminTestKey, adminTestToken} {
 		for _, header := range []string{"Authorization", "X-API-Key"} {
-			for _, path := range []string{"/v1/providers", "/mcp"} {
-				r := adminTestRequest(http.MethodGet, path, "", cookie)
+			for _, path := range []string{"/v1/search", "/mcp"} {
+				r := adminTestRequest(http.MethodPost, path, `{}`, cookie)
+				wantStatus := http.StatusBadRequest
 				if path == "/mcp" {
 					r = adminTestRequest(http.MethodPost, path, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search","arguments":{}}}`, cookie)
+					wantStatus = http.StatusOK
 				}
 				r.Header.Del(adminBrowserHeader)
 				value := token
@@ -650,7 +652,10 @@ func TestPublicProgrammaticCredentialsRemainIndependent(t *testing.T) {
 				}
 				r.Header.Set(header, value)
 				before := f.store.usageMarks
-				adminTestResponse(t, f.server.Router(), r, http.StatusOK)
+				response := adminTestResponse(t, f.server.Router(), r, wantStatus)
+				if !strings.Contains(response.Body.String(), "query is required") {
+					t.Fatal("programmatic credential did not reach search validation")
+				}
 				wantMarks := before
 				if token == adminTestToken {
 					wantMarks++
@@ -662,7 +667,7 @@ func TestPublicProgrammaticCredentialsRemainIndependent(t *testing.T) {
 		}
 	}
 	f.store.settings.APIAuthRequired = false
-	adminTestResponse(t, f.server.Router(), adminTestRequest(http.MethodGet, "/v1/providers", "", nil), http.StatusOK)
+	adminTestResponse(t, f.server.Router(), adminTestRequest(http.MethodPost, "/v1/search", `{}`, nil), http.StatusBadRequest)
 	f.store.settings.APIAuthRequired = true
 	r := adminTestRequest(http.MethodPost, "/mcp", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, nil)
 	adminTestResponse(t, f.server.Router(), r, http.StatusOK)

@@ -82,9 +82,9 @@ Authorization: Bearer oak_xxx
 | `resources/list` | 返回空资源列表。 |
 | `prompts/list` | 返回空提示词列表。 |
 
-通知请求，即没有 `id` 的 JSON-RPC 请求，会返回 `204 No Content`。
+通知请求，即没有 `id` 的 JSON-RPC 请求，被接受后返回 `202 Accepted`，不带响应体。
 
-JSON-RPC batch 可以合并初始化、列表和通知类方法，但每个 batch 最多只能包含一个 `tools/call`。这样每次实际 Search / Extract 都会独立经过 Token RPM 和日月配额检查；需要调用多个工具时请发送多个 HTTP JSON-RPC 请求。
+JSON-RPC batch 可以合并初始化、列表和通知类方法，每批最多 32 项，最多包含一个 `tools/call`。这样每次实际 Search / Extract 都会独立经过 Token RPM 和日月配额检查；需要调用多个工具时请发送多个 HTTP JSON-RPC 请求。纯发现响应最多 256 KiB，含工具调用的响应最多 16 MiB（含 JSON 封装）；超出时返回 HTTP 413 / JSON-RPC `-32000`，不返回截断 JSON。请求取消返回 408 / `-32000`。这些响应限制不撤销已完成工具调用的用量记录。
 
 ## 5. 工具
 

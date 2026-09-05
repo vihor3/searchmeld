@@ -29,6 +29,11 @@ const (
 	adminKeyCredential    adminCredentialKind = "key"
 )
 
+const (
+	maxLoginUsernameBytes = 256
+	maxLoginWindows       = 4096
+)
+
 type adminCredential struct {
 	Kind         adminCredentialKind
 	SessionToken string
@@ -49,6 +54,7 @@ type AuthService struct {
 	loginWindows     map[string]loginWindow
 	sessionTTL       time.Duration
 	loginMaxAttempts int
+	loginMaxWindows  int
 	loginWindow      time.Duration
 	loginLockout     time.Duration
 	mu               sync.Mutex
@@ -90,12 +96,16 @@ func NewAuthService(store AuthStore, sessionTTL time.Duration, loginMaxAttempts 
 		loginWindows:     map[string]loginWindow{},
 		sessionTTL:       sessionTTL,
 		loginMaxAttempts: loginMaxAttempts,
+		loginMaxWindows:  maxLoginWindows,
 		loginWindow:      loginWindowDuration,
 		loginLockout:     loginLockout,
 	}
 }
 
 func (a *AuthService) Login(ctx context.Context, username, password, clientIP string) (string, time.Time, error) {
+	if len(username) > maxLoginUsernameBytes {
+		return "", time.Time{}, ErrInvalidCredentials
+	}
 	attemptKey := loginAttemptKey(username, clientIP)
 	if a.loginLocked(attemptKey) {
 		return "", time.Time{}, ErrLoginRateLimited
@@ -301,14 +311,30 @@ func (a *AuthService) loginLocked(key string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now()
-	window := a.loginWindows[key]
-	if window.LockedUntil.After(now) {
+	a.pruneLoginWindows(now)
+	if window, ok := a.loginWindows[key]; ok {
+		return window.LockedUntil.After(now)
+	}
+	if len(a.loginWindows) >= a.loginMaxWindows {
 		return true
 	}
-	if !window.LockedUntil.IsZero() && !window.LockedUntil.After(now) {
-		delete(a.loginWindows, key)
-	}
+	// Reserve capacity before account lookup so concurrent new names cannot
+	// bypass the bound while password verification is in flight.
+	a.loginWindows[key] = loginWindow{StartedAt: now}
 	return false
+}
+
+// Caller holds a.mu. Active lockouts outlive their original attempt window.
+func (a *AuthService) pruneLoginWindows(now time.Time) {
+	for key, window := range a.loginWindows {
+		if !window.LockedUntil.IsZero() {
+			if !window.LockedUntil.After(now) {
+				delete(a.loginWindows, key)
+			}
+		} else if !window.StartedAt.Add(a.loginWindow).After(now) {
+			delete(a.loginWindows, key)
+		}
+	}
 }
 
 func (a *AuthService) recordLoginFailure(key string) bool {
@@ -318,8 +344,12 @@ func (a *AuthService) recordLoginFailure(key string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now()
-	window := a.loginWindows[key]
-	if window.StartedAt.IsZero() || now.Sub(window.StartedAt) > a.loginWindow {
+	a.pruneLoginWindows(now)
+	window, exists := a.loginWindows[key]
+	if window.LockedUntil.After(now) || !exists && len(a.loginWindows) >= a.loginMaxWindows {
+		return true
+	}
+	if !exists {
 		window = loginWindow{StartedAt: now}
 	}
 	window.Count++

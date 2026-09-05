@@ -1,229 +1,123 @@
-# Public Interface Security Review
+# Security Review and Remediation
 
-Review date: **2026-09-06**. Initial baseline: **`1e10c565dc5443e5bafcc391a95563df51c08bad`**. The reviewed shared-login implementation was committed as **`d52e233b62c35f3c115266922727d85d46f28e10`**. The dated remote checkpoint below records its first CI result; later corrections require their own matching-SHA result.
+Review date: **2026-09-06**. Historical vulnerable baseline: `1e10c565dc5443e5bafcc391a95563df51c08bad`. Shared-login baseline: `ad50edd2cb2754f28efb14486e5b2dcc3bc41753`. The user subsequently authorized PUB-01 through PUB-05 remediation, dependency repairs and upgrade validation.
 
-The initial review was **static source review**, reusing interface, browser-auth and network/resource research. Final shared-login static integration review completed on 2026-09-06, including the backend/frontend diff, Go tests, mocked and packaged browser fixtures, deployment configuration and CI source. Subsequent execution occurred only in GitHub Actions as recorded below; no local tests, checks, builds, browsers, servers, probes, scanners or containers were run. Source findings without an associated remote assertion remain source-only. Links use repository-relative review-time line anchors; function names identify code when later edits move lines. Explicit baseline references describe the older commit, not the replacement code.
+**Verification status:** remediation source and fixtures are being integrated. Full matching-SHA CI, packaged image audits and upgrade/browser verification are pending. Earlier green auth or candidate-dependency runs are not final remediation acceptance. All execution is on remote GitHub Actions; local work is editing, static review, Git/task bookkeeping and evidence retrieval. No production deployment or penetration test has occurred.
 
-## Findings
+## Findings and Disposition
 
-Severity is engineering triage, not a CVSS score or a claim of production exploitation. Public reachability is not the same as anonymous authorization. API tokens do not establish a multi-tenant or caller-private data contract by themselves.
+Severity is engineering triage, not proof of production exploitation. Public reachability does not imply anonymous authorization.
 
-| Priority | Finding | Prerequisite and impact | Disposition |
-| --- | --- | --- | --- |
-| High | **PUB-01: Compatibility search bypasses the token provider allowlist** | A valid restricted search token and an enabled compatibility route can select an excluded usable provider or matching cached result. | **Open.** Separate remediation approval required. |
-| High, auth hardening | **AUTH-01: Baseline forwarding-header trust permits login-limit bucket selection** | A reachable baseline server accepts forged client-IP headers; varying them evades the same username/IP bucket and corrupts attribution. A valid password is still needed to log in. | Replacement reviewed; Go regressions passed at `d52e233`. Complete packaged verification was still pending at the remote checkpoint below. |
-| Medium, visibility-dependent | **PUB-02: Public provider metadata is full global configuration** | An accepted ordinary token, or anonymous caller with business auth off, can read operational fields for all providers. Secret disclosure requires actual secret-bearing settings/URLs. | **Open contract decision.** Informational if deliberately public; potentially High only with established usable-secret exposure. |
-| Medium, availability-dependent | **PUB-04: Anonymous MCP discovery batches amplify response construction** | Enabled, reachable MCP accepts repeated schema-list entries without a batch-count/output budget. Input bytes are bounded by the production body cap. | **Open.** Allocation/output growth is source-established; service degradation is unmeasured. |
-| Medium, availability-dependent | **PUB-05: Distinct login usernames accumulate retained rate-limit state** | Unauthenticated failures using distinct usernames allocate map entries even with a fixed, trustworthy client IP. | **Open**, independent of AUTH-01's IP hardening. No memory-pressure reproduction. |
-| Low; Medium if caller privacy is required | **PUB-03: Public usage summary is instance-wide** | An accepted token, or anonymous caller with auth off, can infer aggregate activity beyond its own requests. | **Open contract decision.** No established cross-tenant breach. |
-
-### PUB-01: Compatibility Search Allowlist Bypass
-
-`Handler.tavilySearch`, `serperSearch` and `openAISearch` map input and call `Orchestrator.Search` directly: [handlers.go:239](../backend/internal/api/handlers.go#L239), [handlers.go:327](../backend/internal/api/handlers.go#L327), [handlers.go:358](../backend/internal/api/handlers.go#L358). Their mappers preserve caller `providers` ([mapper.go:10](../backend/internal/compat/mapper.go#L10)). By contrast, native `runSearch` and MCP `handleMCPSearchTool` apply `applyTokenProviders` before execution ([handlers.go:389](../backend/internal/api/handlers.go#L389), [mcp.go:254](../backend/internal/api/mcp.go#L254)). The orchestrator receives a token ID for accounting, not its allowlist; global defaults, enabled-provider filtering and shared caching do not supply the missing authorization check ([orchestrator.go:66](../backend/internal/search/orchestrator.go#L66)).
-
-This requires effective business auth on, an enabled/under-quota token with `search` scope and a nonempty restrictive allowlist, and an enabled compatibility endpoint. Explicit excluded providers and omitted providers using global defaults are affected. Actual provider execution also needs usable configuration/keys; a matching cached result can avoid upstream execution. Impact is unauthorized provider use/results and possible upstream cost, not admin CRUD, an Extract-scope bypass or a direct provider-Key dump. Token quota/RPM admission still applies.
-
-**Proposal, not an implemented fix:** establish whether these aliases have required consumers; approve disabling/removing unused exposure first. Otherwise apply native-equivalent provider authorization before orchestration on all three routes, preserving compatibility envelopes. Remote regression must assert excluded provider call counts for both explicit and default-provider cases, not just HTTP status. Existing `TestMountedSearchRejectionsStillCount` does not cover allowed-scope compatibility provider denial ([auth_scope_test.go:187](../backend/internal/api/auth_scope_test.go#L187)).
-
-### AUTH-01: Baseline Client-IP Trust
-
-At the baseline, `NewServer` installed chi `middleware.RealIP` without checking the socket peer (`backend/internal/api/server.go:22`). The pinned [chi v5.0.10 RealIP implementation](https://github.com/go-chi/chi/blob/v5.0.10/middleware/realip.go) prioritizes `True-Client-IP`, then `X-Real-IP`, then the first XFF entry; the baseline packaged proxy did not remove `True-Client-IP` (`deploy/nginx.conf:29`). `Login` used the resulting address in its username/IP key. This establishes a bucket-selection path for a caller able to supply those headers, not a password bypass or an executed brute-force attack.
-
-The patch replaces that middleware with `trustedProxyIPMiddleware`: only an actual loopback peer may supply one valid `X-Real-IP`; other peers retain their socket address ([middleware.go:215](../backend/internal/api/middleware.go#L215), [server.go:17](../backend/internal/api/server.go#L17)). The proxy overwrites client-IP fields and removes `True-Client-IP`/`Forwarded` ([nginx.conf:18](../deploy/nginx.conf#L18)). **Owner: shared-login work.** The Go regressions for trusted/untrusted peers and forged-header lockout passed at `d52e233`; its packaged fixture stopped at restart health before the final spoofing sequence. Complete packaged closure requires a successful later run. Local loopback processes are inside this trust boundary; outer proxies otherwise appear as their own IP, not as a verified end user.
-
-### PUB-02: Global Provider Projection
-
-`Handler.providers` returns `Store.ListProviders` unchanged, and `adminProviders` delegates to the same handler ([handlers.go:520](../backend/internal/api/handlers.go#L520), [handlers.go:744](../backend/internal/api/handlers.go#L744)). The query filters neither token allowlist nor enabled state ([store.go:199](../backend/internal/db/store.go#L199)). `ProviderConfig` includes IDs/names, `base_url`, enabled state, priority/weight, timeout, arbitrary `settings`, and nonzero available-key counts ([search.go:106](../backend/internal/model/search.go#L106)). Supported settings include `proxy_url` and `extract_base_url` ([orchestrator.go:741](../backend/internal/search/orchestrator.go#L741), [orchestrator.go:831](../backend/internal/search/orchestrator.go#L831)).
-
-Any ordinary token accepted by quota/RPM admission can read these fields regardless of operation scope; auth-off makes them anonymous. Internal addresses and operational state may be nonpublic. Credentials embedded in settings or URLs would be returned unchanged, but no such deployed values were inspected. The query does **not** return provider-key plaintext/ciphertext from the key table. Execution allowlists do not by themselves promise metadata isolation.
-
-**Proposal:** first decide whether to retain this public endpoint and which fields/providers are intentionally visible. If retained, separate a minimal public capability projection from admin configuration. Use synthetic secret sentinels in remote projection tests after approval; keep the admin configuration view intact. Until that decision, this is unresolved exposure, not a confirmed credential leak.
-
-### PUB-04: MCP Discovery Amplification
-
-`mcp` parses a request slice before auth. `countMCPToolCalls` rejects more than one `tools/call`, but does not limit discovery entries. `handleMCPBatch` allocates/retains responses for the entire batch; each `tools/list` constructs both complete schemas again, and `writeMCPBatchResponse` has no output-byte cap ([mcp.go:87](../backend/internal/api/mcp.go#L87), [mcp.go:142](../backend/internal/api/mcp.go#L142), [mcp.go:152](../backend/internal/api/mcp.go#L152), [mcp.go:188](../backend/internal/api/mcp.go#L188), [mcp.go:625](../backend/internal/api/mcp.go#L625)). Discovery-only batches skip token auth, quotas, RPM and usage marks.
-
-The production body cap defaults to **1 MiB**, so a default request's entry count is indirectly finite; a nonpositive backend body-limit setting disables that bound. Packaged Nginx independently sets `client_max_body_size 1m`. Neither is a per-batch or response-allocation budget. Timeouts do not add a cancellation/budget check to the schema-construction loop. Availability impact depends on request volume and deployment capacity; no amplification ratio, memory peak or outage was measured.
-
-**Proposal:** retain anonymous discovery only where needed; separately approve a batch-entry ceiling, encoded-output budget and bounded cancellation-aware processing. Small remote batches of 1, 8 and 32 synthetic entries can document growth without stress testing. Mount `NewServer` for input-limit tests; handler-only MCP tests do not exercise the production body cap.
-
-### PUB-05: Login Window Cardinality
-
-`AuthService.Login` constructs `loginAttemptKey` before account lookup. Unknown users call `recordLoginFailure`, which stores even a first failure. `loginLocked` deletes only the currently requested key after its lockout expires; there is no global expiration sweep or retained-entry ceiling ([auth.go:98](../backend/internal/api/auth.go#L98), [auth.go:297](../backend/internal/api/auth.go#L297), [auth.go:314](../backend/internal/api/auth.go#L314), [auth.go:335](../backend/internal/api/auth.go#L335)). One failure for each distinct normalized username therefore persists independently of IP spoofing. Login has a request-byte cap, not a bounded username/map-cardinality policy.
-
-This needs a reachable login endpoint with login limiting enabled, but no account/password. Defaults are five failures in a five-minute window and a 15-minute lockout per username/IP pair, not a global request limit ([auth.go:73](../backend/internal/api/auth.go#L73)). A raw HTTP client can send `X-SearchMeld-Admin: 1`; that header protects the browser CSRF boundary and is not authentication. Retained memory and account-lookup/audit work may grow across requests. Runtime cost and deployment rate controls were not measured.
-
-**Proposal:** separately approve bounded username input and retained-window expiration/cardinality limits, with deliberate account/IP lockout semantics. A small remote unit fixture should inspect map cleanup and limits without generating load. AUTH-01 does not close this finding. Session/RPM maps are also process-local; session entries are lazily removed on validation/logout, not by a general sweep.
-
-### PUB-03: Global Usage Summary
-
-Public and admin routes both call `usageSummary`, which invokes `UsageSummary(ctx)` without a token parameter ([handlers.go:529](../backend/internal/api/handlers.go#L529)). Its query sums all `usage_daily` rows with null provider/key dimensions, without token, date or operation filtering ([store.go:1084](../backend/internal/db/store.go#L1084)). Token-attributed and null-token history can contribute.
-
-The result contains request/success/failure/cache/result totals and average latency, not queries, token identities or billing details ([search.go:180](../backend/internal/model/search.go#L180)). Polling can reveal activity changes when other recorded activity exists. No reviewed schema establishes tenant ownership, and per-token quota accounting is not proof of a caller-private telemetry promise.
-
-**Proposal:** decide between removing an unused public endpoint, intentional instance telemetry, or token self-service. Caller-only semantics would need explicit handling for admin Keys, auth-off callers, null-token history and time range, while preserving admin totals. Verify with distinct synthetic tokens/history in disposable remote PostgreSQL, not an empty fake-store result.
-
-## Reachable Interfaces
-
-These matrices describe source routing, not a deployment scan. The backend listens on its configured address; packaged Nginx publicly serves the SPA and forwards `/api/`, `/v1/`, `/healthz` and `/mcp` aliases. Network exposure remains operator-controlled. Route authorities: [Handler.Mount, handlers.go:102](../backend/internal/api/handlers.go#L102), [NewServer, server.go:17](../backend/internal/api/server.go#L17), [nginx.conf:29](../deploy/nginx.conf#L29).
-
-### Credential And Configuration Rules
-
-| Credential/mode | Business REST and authenticated MCP methods | Protected admin methods in shared-login patch |
+| Finding | Historical prerequisites and impact | Remediation |
 | --- | --- | --- |
-| No credential | Rejected when business auth is on; discovery remains public. | Rejected. |
-| Ordinary API token, normally `osr_` | Enabled/hash-matched token, quota/RPM admission, required scope and applicable provider restriction. `*` scope is supported, but is not admin privilege. | Rejected even with `*` scope. |
-| Admin API Key, `oak_` | Accepted before ordinary-token lookup; bypasses ordinary-token scopes, allowlists, quota/RPM and token identity. Provider/key operational limits still apply. | Full management access via `Authorization: Bearer` or `X-API-Key`; no browser-proof header needed after Key validation. Supplied browser Origin still must be trusted. |
-| Password session | Never an authentication source for business REST/MCP, whether manually sent as Cookie or old `adm_` header. | Valid server-side session Cookie plus browser proof. Old password-session Bearer/X-API-Key use is retired. |
-| Effective `RuntimeSettings.APIAuthRequired=false` | Skips credential validation, token identity, scopes, allowlists, token quotas and token RPM even if a credential is supplied. Compatibility toggles, input validation and provider/key controls still apply. | No change: management remains protected and password login remains available. |
+| **PUB-01 / High**: compatibility search bypassed provider restrictions | A valid restricted search Token could use excluded providers through explicit selection or global defaults, receiving unauthorized results or incurring cost. Scope/admission limits still applied; this was not admin access or a raw-Key leak. | All three compatibility handlers apply native-equivalent Token provider policy before cache/orchestration. Mounted tests assert excluded-provider/key/cache call counts, default/explicit selections, attribution and rejection accounting. |
+| **PUB-02 / Medium**, higher if settings contain usable secrets: global provider configuration | Ordinary Tokens, or anonymous callers with business auth off, could read internal URLs/settings and disabled providers. Embedded credentials would leak, but no deployed secret was inspected. | Delete `GET /v1/providers`; retain full configuration only at protected `/api/admin/providers`. No new public projection API. |
+| **PUB-03 / Low**, visibility-dependent: global usage summary | Ordinary Tokens or auth-off callers could infer instance activity from totals, not queries or Token identities. | Delete `GET /v1/usage/summary`; retain `/api/admin/usage/summary`. Cover auth-on/off, missing/business/admin credentials and unchanged admin reads. |
+| **PUB-04 / Medium**: anonymous MCP discovery amplification | Repeated schema-list entries amplified response construction despite the default 1 MiB input cap. Outage/peak-memory impact was not measured. | Maximum 32 batch requests; discovery response budget 256 KiB, tool-bearing response budget 16 MiB including framing. Incremental batch encoding, cancellation checks and bounded errors without oversized ID echo. |
+| **PUB-05 / Medium**: retained login-attempt state | Unauthenticated distinct usernames accumulated map entries without global bounds or unrelated-entry expiry, independently of IP spoofing. | Username maximum 256 bytes; at most 4096 username/IP windows reserved before lookup. Lazily prune the bounded map, preserve active lockouts and reject new entries at capacity with 429. No extra service/background cleaner. |
+| **AUTH-01 / Historical**: forged client-IP bucket selection | Unconditional forwarding-header trust let callers vary login-limit attribution; passwords were still required. | Trust only a real loopback peer's single valid X-Real-IP; Nginx overwrites/removes forwarded client fields. Go and real HTTP/HTTPS regressions passed at `ad50edd` and remain in CI. |
 
-**Auth on/off means the stored runtime setting.** `Store.RuntimeSettings` starts with auth **true**, then overlays DB `settings.runtime`; compatibility toggles start true ([store.go:134](../backend/internal/db/store.go#L134)). REST and MCP read that effective value ([auth.go:188](../backend/internal/api/auth.go#L188), [mcp.go:391](../backend/internal/api/mcp.go#L391)). `Config.APIAuthRequired` reads `API_AUTH_REQUIRED`, but no non-test composition reference was found applying that field to the store ([config.go:61](../backend/internal/config/config.go#L61), [main.go:79](../backend/cmd/server/main.go#L79)). This environment/documentation wiring needs follow-up; an `.env` value is not evidence of deployed auth mode.
+Source: [handlers](../backend/internal/api/handlers.go), [login limiter](../backend/internal/api/auth.go), [MCP](../backend/internal/api/mcp.go). Focused fixtures: [route policy](../backend/internal/api/security_routes_test.go), [login limits](../backend/internal/api/login_limits_test.go), existing auth/MCP suites and packaged browser tests. Source presence alone does not close executable acceptance.
 
-Business header parsing is unchanged: a case-insensitive `Bearer ` scheme wins over `X-API-Key`; selected values are trimmed. An invalid nonempty Bearer does not fall back to the other header. A recognized empty Bearer suppresses `X-API-Key`; other Authorization schemes fall through. Only the two Tavily routes can then use a top-level JSON `api_key` if no nonempty header credential was selected. No Cookie/query credential fallback exists ([middleware.go:314](../backend/internal/api/middleware.go#L314), [middleware.go:328](../backend/internal/api/middleware.go#L328), [middleware.go:339](../backend/internal/api/middleware.go#L339)). Prefixes alone never establish valid credentials; stored lookup is required.
+Login capacity rejection is fail-closed: active locks are never evicted to admit arbitrary names. Saturation may temporarily reject new login buckets until expiry; valid sessions and admin Keys are not revoked. These local controls are not distributed rate limits or a universal DoS guarantee.
 
-### Health, Static And Business HTTP
+## Public Interface Inventory
 
-All `/v1` operations below reject a browser session as an authentication credential when auth is on. With auth off they are anonymous, subject to the listed toggles/validation. `oak_` uses the Key rules above.
+Nginx serves the SPA and forwards `/api/`, `/v1/`, `/healthz` and MCP aliases. Reachability is operator-controlled. Authorities: [Handler.Mount](../backend/internal/api/handlers.go), [NewServer](../backend/internal/api/server.go), [Nginx](../deploy/nginx.conf).
 
-| Method/path | Anonymous/configuration boundary | Ordinary token requirement and operation |
-| --- | --- | --- |
-| `GET /healthz` | Intentionally anonymous; returns `ok` or `unhealthy` (200/503). | No credential/scope; bounded DB ping, no configuration dump. |
-| `GET`/`HEAD` SPA HTML, JS, CSS, icons and frontend route fallback | Intentionally public through Nginx `try_files`; no authenticated data is embedded by these mounts. | No API gate. The SPA's API calls have separate authorization. |
-| `POST /api/admin/login` | Retained password endpoint; no existing session/Key required. See browser boundary below. | Ordinary token is not a substitute for username/password. This is usable over HTTP by raw clients, not technically browser-only. |
-| `POST /v1/search` | Business auth switch. | `search`; native provider allowlist enforced. |
-| `POST /v1/extract` | Business auth switch; private-target policy also applies. | `extract`; Extract-capable provider allowlist enforced. |
-| `POST /v1/compat/tavily/search` | `CompatTavilyEnabled`; disabled handler returns 404 after applicable auth. | `search`; header or Tavily JSON credential; **PUB-01** provider gap. |
-| `POST /v1/compat/tavily/extract` | `CompatTavilyEnabled`; private-target policy. | `extract`; header or Tavily JSON credential; provider restriction enforced. |
-| `POST /v1/compat/serper/search` | `CompatSerperEnabled`. | `search`; headers only; **PUB-01** provider gap. |
-| `POST /v1/compat/openai/responses-search` | `CompatOpenAIEnabled`. | `search`; headers only; **PUB-01** provider gap. |
-| `GET /v1/providers` | Business auth switch. | No additional scope; global configuration projection, **PUB-02**. |
-| `GET /v1/usage/summary` | Business auth switch. | No additional scope; instance aggregate, **PUB-03**. |
-
-An empty token provider allowlist is unrestricted. A nonempty list rejects explicit excluded providers; native/MCP omitted-provider requests use the allowed list, with Extract additionally requiring Extract-capable providers ([handlers.go:1082](../backend/internal/api/handlers.go#L1082), [handlers.go:1103](../backend/internal/api/handlers.go#L1103)). Compatibility search is the exception described in PUB-01, not an intended blanket bypass.
-
-### Protected Admin HTTP
-
-Every path below is relative to **`/api/admin`** and is inside `requireAdmin`, regardless of business auth mode. All require a valid admin Key header or valid Cookie session plus browser proof; ordinary tokens and anonymous callers cannot authorize them. There is no narrower read-only/RBAC tier between these two admin credential kinds. All registered families/methods are listed ([handlers.go:121](../backend/internal/api/handlers.go#L121)).
-
-| Method/path | Data or effect |
+| Method/path | Authorization and disclosure |
 | --- | --- |
-| `GET /me`; `POST /logout` | Non-secret profile probe; revoke captured Cookie session only. Key-authorized logout is non-revoking and ignores an incidental Cookie. |
-| `GET /dashboard` | Instance usage, provider configuration/health, billing and series. |
-| `GET /providers`; `GET /providers/health`; `PATCH /providers/{name}` | Global provider configuration/health; update provider endpoint, settings and state. |
-| `GET /keys`; `POST /keys` | List masked provider-key data; create encrypted provider key. |
-| `GET /keys/{id}/secret` | Explicit provider-key/service-key plaintext reveal; audited. |
-| `PATCH /keys/{id}`; `DELETE /keys/{id}` | Provider-key configuration/state update or deletion. |
-| `POST /keys/{id}/test`; `POST /keys/{id}/quota` | Provider test and official quota query; can perform upstream work. |
-| `GET /tokens`; `POST /tokens` | List token metadata; create token and return its programmatic secret. |
-| `GET /tokens/{id}/secret` | Explicit token plaintext reveal; audited. |
-| `PATCH /tokens/{id}`; `DELETE /tokens/{id}` | Token state/scopes/providers/limits update or deletion. |
-| `GET /settings`; `PUT /settings` | Runtime policy, including business auth/private-target opt-outs. |
-| `GET /settings/admin-api-key`; `POST /settings/admin-api-key` | Key metadata; rotate the Key and return the new plaintext once. |
-| `GET /logs`; `GET /logs/{id}` | Request/response logs and provider-call details. |
-| `GET /usage/summary`; `GET /usage/billing` | Global aggregate and billing data. |
-| `GET /metrics`; `GET /audit-logs` | Instance metrics and administrative audit history. |
-| `POST /playground/search` | Administrative search execution without ordinary-token restrictions. |
+| `GET /healthz` | Anonymous 200/503 status; bounded DB ping, no configuration dump. |
+| `GET`/`HEAD` SPA HTML/JS/CSS/images and frontend route fallback | Public assets; protected data comes from separately authenticated APIs. No debug/pprof/Swagger mount. |
+| `POST /api/admin/login` | Retained username/password entry; JSON, trusted supplied Origin and browser proof. Raw HTTP clients can also use it; the proof header is not a secret/password substitute. |
+| `POST /v1/search` | Ordinary Token `search` scope and provider restrictions, or valid admin Key. |
+| `POST /v1/extract` | `extract` scope, Extract-capable allowed providers and URL/input/network policy. |
+| `POST /v1/compat/tavily/search` | Tavily toggle; search authorization and provider restrictions. |
+| `POST /v1/compat/tavily/extract` | Tavily toggle; Extract authorization and private-target policy. |
+| `POST /v1/compat/serper/search` | Serper toggle; search authorization and provider restrictions. |
+| `POST /v1/compat/openai/responses-search` | OpenAI toggle; search authorization and provider restrictions. |
+| `GET /v1/providers`, `GET /v1/usage/summary` | Removed; 404 even with admin Key. Use the protected management equivalents. |
 
-### MCP And Routing Edges
+Business auth is the persisted `RuntimeSettings.APIAuthRequired`, default true. Auth-off skips retained business REST/MCP credential/scope/provider/quota admission, never management auth. The legacy `API_AUTH_REQUIRED` environment field is not applied to stored settings in the reviewed composition: an `.env` value alone is not evidence of the active policy. Read authenticated runtime settings.
 
-MCP is mounted only when `MCP_ENABLED` enables it at startup. The raw backend and Compose fallback are false, while `.env.example` opts in; exposure is not universal. The configured `MCP_PATH` (fallback `/mcp`) and `/v1/mcp` are mounted with slash/non-slash aliases ([handlers.go:91](../backend/internal/api/handlers.go#L91), [mcp.go:49](../backend/internal/api/mcp.go#L49), [config.go:62](../backend/internal/config/config.go#L62)). A custom path outside Nginx's proxy locations needs corresponding routing; otherwise the packaged SPA may handle it. This is not an alternate admin bypass.
+Ordinary `osr_` Tokens must be enabled, valid and within configured admission limits. Empty provider allowlists are unrestricted; restrictive lists also control omitted-provider defaults. Admin `oak_` Keys intentionally bypass ordinary-Token admission, not provider/key operational controls. Password Cookies and old `adm_` headers never authorize business REST/MCP.
 
-| Transport/method | Auth on | Auth off / result |
-| --- | --- | --- |
-| `GET` at each MCP alias | Public metadata: protocol versions, tool names, auth hints and endpoint path. | Same. `Accept` containing `text/event-stream` returns 405; no SSE/session stream is allocated. |
-| `DELETE` at each MCP alias | No auth gate; always 405. | Same; not session logout/deletion. |
-| `POST initialize`, `ping`, `tools/list` | Intentionally public; supplied credentials do not trigger token admission/accounting. | Same static metadata/schemas, not PUB-02's stored configuration. |
-| `POST resources/list`, `resources/templates/list`, `prompts/list` | Intentionally public empty lists. | Same; no implemented `resources/read` capability. |
-| `POST notifications/initialized` without an ID | Public ignored notification; 202. | Same. With an ID it reaches unsupported-method handling, not a privileged operation. |
-| `POST tools/call` with tool `search` or `extract` and an ID | Header `oak_` or ordinary token admitted by quota/RPM; matching tool scope and provider allowlist for ordinary token. Cookie/body keys cannot authenticate. | Anonymous tool execution, still subject to validation/provider controls. |
-| Other nonempty JSON-RPC method | Auth required before unsupported-method dispatch; no extra scope grants an unimplemented method. | Method-not-found (`-32601`) for an ID; no hidden data operation. |
-| Empty method / malformed JSON / empty batch | Public validation/error path, not tool execution. Empty method with ID gives `-32600`. | Same validation. |
-| JSON-RPC batch | At most one `tools/call`; any auth-required entry authenticates the batch once. Discovery-only batches skip auth. | Same single-tool restriction, no credential checks. **PUB-04** remains. |
-| Any no-ID request | After applicable batch/auth prechecks, ignored rather than executed as a tool. | Single/all-notification replies are 202; mixed replies omit notifications. |
-| `OPTIONS /api/admin` or `/api/admin/...` | Patch's admin origin/preflight checks run before generic OPTIONS handling; allowed preflight gets 204, invalid gets 403. No admin data handler executes. | Business auth switch does not change this. |
-| `OPTIONS` elsewhere at backend | Generic CORS middleware returns 204 even for otherwise unknown paths; permissive configured origins do not authenticate a business request. | Same. Static/non-proxied paths remain Nginx behavior, not this API middleware. |
-| Unknown API path or unsupported HTTP method | Subject to middleware; otherwise chi 404/405, no fallback privileged handler. API HEAD is not separately registered. | Admin stays protected; non-API Nginx paths may serve SPA HTML instead. |
+Bearer takes precedence over X-API-Key; selected invalid credentials do not borrow another credential. Only the two Tavily routes accept top-level JSON `api_key` when no nonempty header credential was selected. There is no business Cookie/query-credential fallback.
 
-MCP dispatch authority: [mcp.go:171](../backend/internal/api/mcp.go#L171), [mcp.go:235](../backend/internal/api/mcp.go#L235), [mcp.go:318](../backend/internal/api/mcp.go#L318), [mcp.go:382](../backend/internal/api/mcp.go#L382). CORS/OPTIONS authority: [middleware.go:62](../backend/internal/api/middleware.go#L62), [middleware.go:101](../backend/internal/api/middleware.go#L101). Advertised MCP versions and JSON schemas are not proof of full protocol/schema validation; source returns 202 for notifications even where older documentation says 204.
+### MCP
 
-## Shared-Login Review Checkpoint
+When enabled, MCP is mounted at the configured path and `/v1/mcp`. Anonymous discovery is intentional and bounded; it never authorizes paid tool calls.
 
-The approved design retains password login and programmatic `oak_`/`osr_` clients. The baseline had server-checked, per-tab `adm_` headers, not Cookie authentication; deleting a Cookie could not remove that independent credential. Static integration review covered missing HTTPS-origin configuration, direct TLS in the Secure predicate, installer environment isolation and first-Key HTTP 201. The first remote run then exposed mobile login overflow and a post-restart fixture timeout. Narrow layout and test-harness corrections were statically reviewed; their runtime result must be read from their own CI revision.
-
-| Boundary | Approved contract and observed source | Required evidence / limits (see remote checkpoint) |
-| --- | --- | --- |
-| Password login | `POST /api/admin/login` accepts JSON username/password with `X-SearchMeld-Admin: 1`, sets the Cookie and returns only `{expires_at}`. Wrong credentials 401, lockout 429, malformed JSON 400, wrong media type 415, proof/origin failure 403 ([handlers.go:588](../backend/internal/api/handlers.go#L588)). | Exact mounted response/Cookie matrix, including invalid content and credential cases. Operational account-lookup errors still collapse to credential failures; do not claim every login infrastructure error is 500. |
-| Credential selection | Presence of Authorization or X-API-Key selects Key-only auth with existing parser precedence; duplicate/empty/invalid selected credentials fail without Cookie fallback. A validated Key alone bypasses browser proof. Otherwise server session validation and proof are required ([auth.go:141](../backend/internal/api/auth.go#L141), [auth.go:176](../backend/internal/api/auth.go#L176)). | Cookie plus good/bad/empty/duplicate header combinations, ordinary-token and old-session-header denial. |
-| Cookie lifetime | `searchmeld_admin_session`, host-only, Path `/api/admin`, HttpOnly, SameSite=Lax; no Max-Age/Expires. Server fixed TTL (default 24h), in-memory validation/revocation and restart loss remain authoritative ([handlers.go:588](../backend/internal/api/handlers.go#L588), [auth.go:283](../backend/internal/api/auth.go#L283)). | HTTP/HTTPS flags, fixed expiry/restart and independent-tab behavior. Browser session restore cannot extend server expiry. Path is not an authorization boundary; ports do not isolate Cookies. |
-| Logout and races | Logout revokes the credential captured in auth context. A Key-authorized call does not revoke an incidental Cookie. Logout/401 do not emit a clearing Cookie; a later login must survive old responses ([handlers.go:642](../backend/internal/api/handlers.go#L642)). | Real revocation and held-response races. Already authorized requests and previously rendered content are not erased by logout. |
-| Origin and CSRF | All Cookie-authenticated admin methods, including GET, plus login need the custom header. Supplied Origin must match the canonical origin or an exact valid `CORS_ALLOWED_ORIGINS` entry; null/malformed/untrusted origins fail. No Origin is allowed only with proof for Cookie/login. Admin ignores wildcard CORS and validates preflight before generic OPTIONS ([middleware.go:101](../backend/internal/api/middleware.go#L101), [middleware.go:198](../backend/internal/api/middleware.go#L198)). | Same-site hostile-origin reads/writes, trusted preflight and missing proof, plus originless Key CLI. Raw clients can supply proof and use login/Cookies; SameSite/header are CSRF controls, not a browser-only identity. |
-| Public origin/proxy | `ADMIN_PUBLIC_ORIGIN` is validated as one HTTP(S) origin; otherwise direct TLS and preserved Host determine origin. Missing configuration on plain backend HTTP rejects an allowlisted HTTPS Origin too. Secure is true for canonical HTTPS **or direct TLS**, including a configured HTTP origin. Both Compose modes pass the setting; the installer clears inherited overrides while preserving `.env`; Nginx preserves Host/port ([middleware.go:150](../backend/internal/api/middleware.go#L150), [middleware.go:170](../backend/internal/api/middleware.go#L170), [config.go:116](../backend/internal/config/config.go#L116), [docker-compose.yml:17](../docker-compose.yml#L17), [docker-compose.external-db.yml:16](../docker-compose.external-db.yml#L16), [install.sh:18](../install.sh#L18), [nginx.conf:18](../deploy/nginx.conf#L18)). | Direct-TLS/Origin Go tests and installer regressions passed at `d52e233`; packaged HTTPS was not reached in its failed run. A raw originless client's external scheme cannot be detected reliably; operators must configure the actual canonical origin rather than rely on forwarded headers. Direct HTTP remains supported but unencrypted. Do not co-host untrusted applications on the Cookie host. |
-| No-store | Admin middleware sets `Cache-Control: no-store`, `Pragma: no-cache`, and `Vary: Origin` before downstream admin handling, including login/me, errors and reveals ([middleware.go:119](../backend/internal/api/middleware.go#L119)). | Mounted headers and packaged proxy responses; not proof that rendered data or screenshots disappear. Public HTTP cache semantics were not changed. |
-| Frontend authority | Current `session.ts` deletes legacy storage credentials and holds transient probe/revision state; `apiFetch` sends Cookie credentials/proof, not restored Bearer credentials. Router uses fresh `/me`, checked internal redirects and bounded stale-revision recovery ([session.ts:7](../frontend/src/stores/session.ts#L7), [client.ts:277](../frontend/src/api/client.ts#L277), [router/index.ts:30](../frontend/src/router/index.ts#L30)). | Type/build and mocked browser checks passed at `d52e233`; mobile screenshot review nevertheless found overflow. The corrective revision requires its own layout/browser result. `/me` non401/malformed failures remain unknown/retryable; logout failures remain honest/retryable. No write/password replay. |
-
-Migration is intentional: existing browser users first reload already-open old pages to load the new JavaScript, then reauthenticate once. Re-entering a password in an old form is insufficient. Scripts reading login JSON `token` or sending password `adm_` via either header must migrate to Cookie-jar login plus proof, or an existing admin Key. Settings UI or authenticated HTTP Cookie-jar setup still creates the first Key; no new provisioning service, migration, Key replacement or password removal is required. See [Admin API Key](./admin-api-key.md) for the maintained setup contract. Key rotation affects Key clients, not browser sessions; browser logout does not revoke integration Keys.
-
-The old wildcard credentialed CORS policy was **not** evidence of an ambient-Cookie bypass when the server ignored Cookies. The new Cookie boundary requires its scoped replacement. Same-origin packaged UI is the primary contract; explicitly trusted same-site split origins are possible, but arbitrary cross-site embedding and SameSite=None are not added. Public REST/MCP still use header credentials and never consult the browser Cookie, even if a raw client sends it outside its Path. Go and packaged fixtures explicitly send the Cookie beyond its Path; those Go cases passed at `d52e233`, and packaged HTTP progressed past those assertions before the restart failure. This does not substitute for completing the packaged matrix.
-
-## Input, Network And Resource Boundaries
-
-These are source controls and conditional limits, not an availability or SSRF safety certification. Defaults may differ from operator runtime settings.
-
-| Area | Source-checked limit/control | Residual boundary |
-| --- | --- | --- |
-| Request bytes | Backend `http.MaxBytesReader`, default 1,048,576 bytes; packaged Nginx independently limits bodies to `1m` ([middleware.go:241](../backend/internal/api/middleware.go#L241), [config.go:67](../backend/internal/config/config.go#L67), [nginx.conf:7](../deploy/nginx.conf#L7)). | Nonpositive backend setting disables its cap. No universal per-client request/global concurrency bound follows from input bytes. Bodies are read/decoded before some method-specific work. |
-| Extract inputs and DNS | 1-20 absolute HTTP(S) URLs, at most 8192 bytes each, no userinfo; enum/numeric checks. Default policy rejects restricted host/IP forms. Distinct hostname resolutions share a 3s context; unsafe, empty or failed resolutions reject ([extract.go:201](../backend/internal/search/extract.go#L201), [extract.go:302](../backend/internal/search/extract.go#L302)). | `allow_private_extract_targets` is an admin-controlled global opt-out, not per-token permission. DNS work is count/time-bounded, but results are not pinned to the upstream target fetch. |
-| Actual target fetch | Firecrawl sends a URL in `/v2/scrape` JSON; Jina sends it in its configured Reader request path; Exa/Tavily also call configured provider APIs ([firecrawl.go:77](../backend/internal/provider/firecrawl.go#L77), [jina.go:108](../backend/internal/provider/jina.go#L108)). | The gateway does not inspect upstream target redirect hops/rebinding. Provider/self-hosted extractor egress must enforce the actual network boundary. See [Extract deployment boundary](./extract.md). No gateway SSRF exploit was reproduced. |
-| Provider HTTP | Shared transport clears ambient proxy use, applies operator proxy configuration and a default finite timeout; common response reads stop at 8 MiB ([helpers.go:34](../backend/internal/provider/helpers.go#L34), [helpers.go:124](../backend/internal/provider/helpers.go#L124)). | Configured base/extract URLs and proxies are trusted admin inputs, not public arbitrary base-URL parameters. Default HTTP redirect behavior is not an application egress policy. Read truncation is not secret redaction or a whole-request memory budget. |
-| Official quota requests | Default 20s context; common JSON response reads stop at 4 MiB, Jina text at 1 MiB. HTTP error excerpts retain up to 500 source bytes plus truncation/status text ([quota.go:54](../backend/internal/search/quota.go#L54), [quota.go:182](../backend/internal/search/quota.go#L182), [quota.go:419](../backend/internal/search/quota.go#L419)). | Admin quota/test routes and automatic refresh can do upstream work. These limits do not establish secret redaction or trusted-proxy/egress safety. |
-| Extract output/logs | 512 KiB content/result, 8 MiB aggregate content, 12 MiB native response JSON, 64 KiB raw/result, 64 images/result with byte limits, bounded metadata/failures, 4 MiB log JSON. Final bounding runs before logging/return ([extract.go:22](../backend/internal/search/extract.go#L22), [extract.go:146](../backend/internal/search/extract.go#L146)). | MCP text adds a 16 Ki-rune limit and 512-rune previews; full bounded data remains in `structuredContent` ([mcp.go:280](../backend/internal/api/mcp.go#L280)). Transport envelopes still add overhead; this is not PUB-04 protection. |
-| Search output/fan-out | Provider-specific request limits and final result slicing exist. `applyDefaults` does not impose a central maximum; Search provider entries are not deduplicated by enabled-provider filtering, and parallel work follows the list ([orchestrator.go:311](../backend/internal/search/orchestrator.go#L311), [orchestrator.go:542](../backend/internal/search/orchestrator.go#L542), [orchestrator.go:668](../backend/internal/search/orchestrator.go#L668)). | No Search-wide final JSON-byte budget equivalent to Extract's was established. MCP schema's advertised maximum 50 is not a runtime validator; Search is serialized into both text and `structuredContent`. Input bytes/key limits bound some work, not a dedicated fan-out budget. Separate hardening proposal, no load measurement. |
-| Time/cancellation | Default header/read/write/idle server timeouts are 10s/30s/1200s/60s. Runtime request default is 20s, adjusted by provider/retry requirements; provider calls use contexts. DB health ping and detached usage writes have 2s contexts ([config.go:66](../backend/internal/config/config.go#L66), [main.go:88](../backend/cmd/server/main.go#L88), [orchestrator.go:93](../backend/internal/search/orchestrator.go#L93), [orchestrator.go:190](../backend/internal/search/orchestrator.go#L190)). | 20s is not a universal wall-clock ceiling. Shared Search flights detach individual cancellation while retaining a deadline; accounting can continue after caller cancellation. Discovery construction has no per-entry context check. |
-| Quotas and concurrency | `FindAPIToken` reads daily/monthly usage at admission; writes occur after work. Token RPM is mutex-protected but process-local. Provider/key acquisition separately reserves local quota and active concurrency ([store.go:611](../backend/internal/db/store.go#L611), [store.go:928](../backend/internal/db/store.go#L928), [auth.go:339](../backend/internal/api/auth.go#L339), [manager.go:60](../backend/internal/keypool/manager.go#L60)). | Concurrent accepted token requests can overshoot remaining token quota; there is no token reservation spanning execution. This is a best-effort admission boundary unless strict budget guarantees are required, not unlimited anonymous quota evasion. Do not confuse it with existing provider-key reservations or claim distributed enforcement. |
-
-Ordinary tokens have enabled status, scopes, provider restrictions and configured quota/RPM, but no per-token expiry field in the reviewed model/lookup. Zero quota disables that quota; nonpositive token RPM disables its limiter. Admin Keys intentionally bypass ordinary-token admission; they do not disable provider-key controls. `usage_count`/last-used is an access marker, distinct from quota aggregates: REST normally marks once after lookup, including rate/scope rejection; narrowly flagged native/Tavily Extract scope/provider denials skip it and record metadata-only rejection logs. MCP marks before rate/scope checking; discovery does neither ([auth.go:188](../backend/internal/api/auth.go#L188), [handlers.go:446](../backend/internal/api/handlers.go#L446), [mcp.go:414](../backend/internal/api/mcp.go#L414)).
-
-## Secrets, Persistence And Delivery
-
-| Area | Observation | Limit of the conclusion |
-| --- | --- | --- |
-| Secret persistence/reveal | AES-GCM encryption, SHA-256 token lookup hashes and 32 random-byte tokens are centralized ([crypto.go:20](../backend/internal/security/crypto.go#L20)). Secret/hash/ciphertext fields are non-serializing or omitted/cleared in normal list responses; explicit admin creation/rotation/reveal endpoints intentionally return plaintext. Passwords use bcrypt. | Encryption-key strength and custody remain deployment responsibilities. Hints/aliases/prefixes are visible metadata. No-store does not make a deliberately revealed secret safe to publish. PUB-02's generic settings are a different serialization path. |
-| Upstream errors and raw content | `ClassifyHTTPError` truncates upstream body messages to 300 bytes, then summaries/errors/logs can carry them ([errors.go:35](../backend/internal/provider/errors.go#L35), [errors.go:73](../backend/internal/provider/errors.go#L73), [search.go:76](../backend/internal/model/search.go#L76)). Operational handlers also sometimes return `err.Error()`. | Truncation is not redaction. A provider reflecting credentials could propagate them to a caller/admin log, but no secret-bearing response was observed. Secret-sentinel taint tests and a reviewed response/error projection are proposed, not a proven Key leak or completed exhaustive taint audit. |
-| Request/audit logs | HTTP logging records method/path/status/latency/request ID, not auth headers or body. Admin audit records actor/action/metadata/IP. Tavily's top-level `api_key` is not part of the typed normalized request. Request logs intentionally contain query/URL/options and response/error content ([middleware.go:252](../backend/internal/api/middleware.go#L252), [handlers.go:1064](../backend/internal/api/handlers.go#L1064), [store.go:928](../backend/internal/db/store.go#L928)). | Arbitrary queries, URL parameters, options, aliases and upstream content can themselves contain secrets; no blanket redaction promise. Audit writes are best effort. Early origin/preflight rejection precedes HTTP logging in the current composition, so audit/stdout is not a complete record of every rejected request. |
-| Cache and retention | Search cache keys include normalized query/providers/mode/options, not token ID; invocation IDs are reassigned on replies. Extract is not cached. Log retention is runtime-configured with hourly cleanup ([orchestrator.go:950](../backend/internal/search/orchestrator.go#L950), [extract.go:79](../backend/internal/search/extract.go#L79), [main.go:180](../backend/cmd/server/main.go#L180)). | Shared caching is not private per-user storage. No cache ownership/isolation guarantee was established. Public response caching is not covered by admin no-store; deployed intermediate cache behavior was not inspected. |
-| SQL | Reviewed data values use placeholders. `getSearchLog` interpolates only a field selected by internal `id`/`request_id` callers, with the value still `$1` ([store.go:1018](../backend/internal/db/store.go#L1018), [store.go:1026](../backend/internal/db/store.go#L1026)). | No user-controlled SQL identifier injection path was found in that chain; this is not a whole-product SQL-injection certification. Disposable DB authorization/accounting evidence is still needed. |
-| Rendering and redirects | Reviewed Vue views use escaped interpolation/preformatted output; source search found no `v-html`/innerHTML sink. Playground/Logs links use `target="_blank"` with `noreferrer`. Login redirects parse URL and require a known internal nonpublic route ([PlaygroundView.vue:105](../frontend/src/views/PlaygroundView.vue#L105), [LogsView.vue:181](../frontend/src/views/LogsView.vue#L181), [router/index.ts:30](../frontend/src/router/index.ts#L30)). | Escaping text does not establish safe upstream link schemes; upstream content/links remain untrusted. No runtime XSS/navigation validation was performed. |
-| Static/health delivery | Root image copies frontend build output, not source or `.env`, into the web root. Nginx/backend add CSP, frame denial, nosniff and referrer controls. Health returns only status and uses a 2s DB ping; no pprof/Swagger/debug HTTP mount was found ([Dockerfile:21](../Dockerfile#L21), [nginx.conf:12](../deploy/nginx.conf#L12), [server.go:44](../backend/internal/api/server.go#L44)). | SPA/assets and health are intentional anonymous surfaces. Health polling costs DB work. No service-worker credential cache was found in frontend source; actual built/deployed artifacts and proxy caches were not inspected. |
-
-## Evidence And Follow-Up
-
-### Remote Checkpoint: 2026-09-06
-
-The user authorized validation-branch commit/push, not merge, image publication or deployment. [Run 33987112818](https://github.com/vihor3/searchmeld/actions/runs/33987112818) tested `d52e233b62c35f3c115266922727d85d46f28e10` and **failed overall**:
-
-| Job | Result |
+| Method | Boundary |
 | --- | --- |
-| Go format, vet and isolated PostgreSQL tests | Passed; includes the new admin credential, Cookie, TTL/revocation, origin/proof and forged-IP tests. |
-| Frontend type/build and mocked session regression | Passed; the completed functional matrix did not catch the mobile overflow visible in its PNG artifact. |
-| Frontend source and Alpine shell regressions | Passed, including installer cases and negative component fixtures. |
-| External image | Built successfully; packaged browser steps intentionally belong to the other target. |
-| All-in-one image and packaged browser | Image built. HTTP cases reached `exercise`'s post-restart health check, then timed out at 120 seconds. Restart recovery, post-restart Key persistence, final spoofing cases and all HTTPS cases were not verified. Cleanup completed. |
+| `GET` at each alias | Public protocol/tool/endpoint metadata. SSE Accept gives 405; no stream/session allocation. |
+| `DELETE` | 405; no session-deletion operation. |
+| `OPTIONS` | Public preflight, not authentication or tool execution. |
+| `POST initialize`, `ping`, `tools/list`, `resources/list`, `resources/templates/list`, `prompts/list` | Anonymous discovery, bounded output. |
+| `notifications/initialized` without ID | Ignored, 202. Notifications do not execute search/extraction. |
+| `tools/call` | Business Token/Key gate unless effective business auth is off; scope/provider policy for the actual tool. No Cookie auth. |
+| Unknown request methods | Existing auth policy, then method-not-found; no arbitrary dispatch. |
+| JSON-RPC array | 1-32 requests, at most one `tools/call`; required auth before execution. Discovery-only arrays use the smaller output budget. |
+| Malformed/empty JSON or invalid array size | Bounded validation error, no upstream work. Oversized encoded replies give 413; cancellation gives 408. |
 
-The failure log alone does not distinguish stale dynamic Docker port mapping from application restart failure. The corrective harness preserves a stable loopback HTTP/HTTPS browser origin, re-inspects its Docker upstream after restart, retains original-Cookie/Key assertions, and adds bounded state/port/error diagnostics without environments or application logs. Login layout corrections constrain the grid/card and assert against Playwright's configured viewport. These changes require a new run; no timeout increase, skipped restart assertion or production restart patch is the remedy.
+### Protected Management
 
-This is a **dated checkpoint**, not a live status badge. Evaluate later revisions using their exact SHA in [branch CI runs](https://github.com/vihor3/searchmeld/actions/workflows/ci.yml?query=branch%3Afix%2Fadmin-cookie-security); do not infer their success from this record. A complete successful matrix closes only its tested auth scope, not the unrelated open PUB findings or untested deployment/egress boundaries.
+Paths below are relative to `/api/admin`, requiring a live Cookie plus browser proof or a valid admin-Key header. Ordinary Tokens are rejected even with `*` scope. All management responses are no-store.
 
-| Remote-only evidence needed | Existing source / gap |
+| Methods/paths | Operation |
 | --- | --- |
-| Mounted route/credential matrix with credential-aware fakes | Extend/retain `backend/internal/api/auth_scope_test.go`, `extract_rejection_test.go` and `mcp_test.go`: every native/compat route, all MCP aliases/methods, auth-off, Cookie/old-session rejection on business paths, valid/invalid Key and header/body precedence. Empty/family-agnostic fake lookups cannot prove isolation. |
-| PUB-01 parity | Restricted token plus allowed/excluded fake providers; explicit and default-provider cases on all three compatibility search routes, zero denied upstream calls after an approved fix, and unchanged accounting/envelopes. No paid/live provider. |
-| PUB-02/03 visibility | First approve the public field/provider and usage contract. Then use synthetic configuration sentinels and distinct token/null-token records in disposable PostgreSQL. Existing rejected-request DB integration is not usage-isolation proof. |
-| PUB-04/05 bounds | Small discovery batches with encoded-size assertions under full server body middleware; small login-window cardinality/expiry fixtures. No public load loop or near-limit stress test is needed. |
-| Shared-login Go/config coverage | `admin_auth_test.go`, `admin_middleware_test.go` and `config_test.go` passed at `d52e233`: Cookie flags/no raw JSON token; fixed TTL/restart/revocation; captured logout; Key/invalid-header matrix; CSRF/preflight/origin/no-store; direct TLS and missing-proxy-origin cases; real versus forged IP buckets. Later revisions still need matching-SHA checks. |
-| Frontend and packaged integration | The approved mocked `deploy/admin_session_expiry_test.cjs` update and real `deploy/admin_cookie_integration_test.cjs` fixture must complement each other. Real backend/Cookies are needed for independent pages in one context, a separate negative context, reload, Cookie deletion with legacy storage seeded, logout, HTTP/HTTPS proxy behavior and hostile same-site origin rejection. |
-| Races/errors and delivery | Held old 401/logout responses across newer login, unknown probe failures, retryable logout, safe/unsafe redirects and no automatic replay. Backend TTL fixtures plus real invalid-session browser behavior are distinct evidence, not a test-only production expiry endpoint. Include synthetic desktop/mobile success/error PNGs with finite retention; no secret Cookie jars/traces/logs as artifacts. |
-| Broader conditional boundaries | If stricter contracts are approved, add bounded token-quota concurrency, Search budget, secret-sentinel error propagation and extractor egress fixtures in isolated Actions resources. No external/production scanning, local fallback or claim of protocol-wide/dependency audit coverage. |
+| `GET /me`; `POST /logout` | Session probe; revoke captured Cookie session only. Key logout does not revoke an incidental Cookie. |
+| `GET /dashboard`, `/metrics`, `/audit-logs` | Global management telemetry/audit. |
+| `GET /providers`, `/providers/health`; `PATCH /providers/{name}` | Full provider configuration/health and update. |
+| `GET /keys`; `POST /keys`; `PATCH`/`DELETE /keys/{id}` | Provider-Key lifecycle. |
+| `GET /keys/{id}/secret`; `POST /keys/{id}/test`, `/keys/{id}/quota` | Explicit secret reveal or upstream test/quota work. |
+| `GET /tokens`; `POST /tokens`; `PATCH`/`DELETE /tokens/{id}` | Business-Token lifecycle/scopes/providers/limits. |
+| `GET /tokens/{id}/secret` | Explicit Token reveal. |
+| `GET`/`PUT /settings` | Runtime policy. |
+| `GET`/`POST /settings/admin-api-key` | Key metadata or first creation/rotation. |
+| `GET /logs`, `/logs/{id}` | Request/provider-call detail. |
+| `GET /usage/summary`, `/usage/billing` | Global management totals/billing. |
+| `POST /playground/search` | Admin search. |
 
-The existing [GitHub Actions workflow](../.github/workflows/ci.yml) is the only execution boundary for Go format/vet/tests, frontend type/build/browser work and packaged image fixtures. The first run above used synthetic isolated data, loopback listeners, bounded cleanup and named-container fallback cleanup; artifacts were PNG-only with seven-day retention. Local work remained edits and static/log/PNG review. External-database browser deployment and old-release image/database upgrade fixtures are not part of this matrix; do not imply they were exercised.
+No anonymous Key bootstrap. Existing password login with Cookie jar/proof, or the authenticated UI, creates the first Key. See [admin API contract](./admin-api-key.md).
 
-Maintainers should update this report when routes, public visibility, authentication transports, proxy trust or resource policies change. Keep PUB-01/04/05 open until separately scoped remediation is approved and evidenced; resolve PUB-02/03's intended visibility explicitly. AUTH-01's complete packaged verification and parent runtime acceptance require the exact corrective commit's successful remote jobs, beyond the first-run checkpoint. Upstream egress, quota guarantees, effective auth configuration and error-secret propagation remain explicit follow-ups, not silently fixed findings or a blanket safety verdict.
+## Dependency Remediation
+
+[Initial Actions evidence](https://github.com/vihor3/searchmeld/actions/runs/33990094730) at `8c0076a` resolved npm's summary into esbuild (low), nanoid (high), postcss (high). It was not proof of two exploitable production services. Go reachability found x/text, pgx/v4 and pgproto3/v2 issues; two lacked fixes in the v4 chain.
+
+[Candidate generation](https://github.com/vihor3/searchmeld/actions/runs/33990495387) at `400aaef` produced reviewed manifests remotely. Full npm audit returned zero vulnerabilities and govulncheck zero affected vulnerabilities. This preliminary run mechanically converted pgx imports on the runner; it does not replace testing the actual migration. No local resolver/installation ran.
+
+| Dependency | Selected repair |
+| --- | --- |
+| Go 1.22 | Supported compiler1.26.8, matching CI; module minimum1.26.0 required by updated dependencies. |
+| Alpine 3.20 runtime | Supported3.22.5, retaining explicit `postgresql16` packages. Builders use supported Alpine3.23. |
+| Node/installation | Node22.23.2; image and CI require committed lockfiles through `npm ci`. |
+| Vite/esbuild | 7.3.6 / 0.28.2; no Vite-major or Vue/UI-library upgrade. |
+| nanoid/postcss | 3.3.18 / 8.5.28. |
+| Go libraries | pgx/v5 5.9.2 removes obsolete v4/protocol modules; chi5.3.2, x/crypto0.56.0, x/text0.41.0 and required x/sync0.22.0. Preserve startup Ping, parameterized SQL and persisted credentials. |
+
+Official sources: [Go policy](https://go.dev/doc/devel/release#policy), [Alpine support](https://alpinelinux.org/releases/), [Vite7.3.6](https://github.com/vitejs/vite/blob/v7.3.6/packages/vite/CHANGELOG.md), [pgx5.9.2](https://github.com/jackc/pgx/blob/v5.9.2/CHANGELOG.md). esbuild's [Windows-development-server advisory](https://github.com/evanw/esbuild/security/advisories/GHSA-g7r4-m6w7-qqqr) does not describe the final Linux runtime. Do not attribute npm counts to the withdrawn Deno advisory.
+
+Permanent [CI](../.github/workflows/ci.yml) audits committed npm dependencies including build packages, Go call reachability, and both final images' OS/Go packages. npm/image gates start at low severity; no blanket ignore-unfixed or audit-error suppression. Reports retain seven days. The temporary candidate workflow is deleted after import. Chunk-size warnings are performance notices, not vulnerabilities.
+
+## Upgrade and Auth Evidence
+
+Shared-login [run33988333263](https://github.com/vihor3/searchmeld/actions/runs/33988333263) passed five jobs at `ad50edd`: Go/PostgreSQL, frontend/mock browser, shell, external-image build and all-in-one real HTTP/HTTPS. This corrected the first-run restart-fixture and mobile-layout failures.
+
+Remediation adds [historical DB upgrade](../deploy/database_upgrade_test.cjs) and extends [real browser integration](../deploy/admin_cookie_integration_test.cjs) to external PostgreSQL. Old source is immutable `1e10c565dc5443e5bafcc391a95563df51c08bad`, not an invented release. Fixtures use synthetic accounts/Keys/data, disposable volumes and stable loopback HTTP/browser origins across Docker port changes. External PostgreSQL stays on an internal network without host publication; its application also joins the normal bridge to support loopback-only HTTP publication. Historical upgrade applications use a run-scoped normal bridge with loopback-only HTTP publication; providers are disabled and redirected to container loopback before synthetic provider secrets are created. These application networks are not an egress firewall. Upgrade helpers and PG17 containers use no network. Fixtures must prove credential/data preservation, incompatible PGDATA rejection before mutation, and recovery from a separate copy. No dumps, secrets or traces are artifacts.
+
+**Pending:** final remediation SHA and complete successful CI. Source fixtures are not passed upgrade/browser evidence.
+
+## Operational Boundaries
+
+These deployment/product contracts are distinct from the five findings and dependency/upgrade scope; they are not silently fixed or a blanket safety claim:
+
+- Sessions are process-local, default fixed TTL24h; restart revokes them. Independent browser profiles/multiple servers do not share a store. Upgrade reloads old JavaScript and requires one login; old `adm_` scripts move to Cookie-jar/proof or existing `oak_` headers.
+- HTTPS termination requires real `ADMIN_PUBLIC_ORIGIN`. Direct HTTP is unencrypted and for trusted local/internal use. Cookies are not port-isolated; untrusted apps must not share the host. Origin/proof is browser CSRF protection, not a password substitute.
+- Token quota reads precede later accounting, so concurrent work may overshoot remaining quota. RPM/key reservations are local. Shared search cache is not private per-user storage; no hard distributed spending/isolation guarantee.
+- Extract URL/DNS preflight is bounded, but upstream extractors perform target fetching/redirect resolution. Configure their egress boundary; preflight is not DNS pinning or universal SSRF protection. See [Extract deployment boundary](./extract.md).
+- Default input cap is1MiB; upstream reads and Extract content/logs are bounded. MCP now adds independent limits; Search fan-out/content still lacks Extract-equivalent global budgets. No load test/general availability certification.
+- Encryption/hashing and explicit admin reveal protect stored credentials. Arbitrary queries, URL parameters, settings and upstream errors may contain sensitive content; truncation is not redaction. Protect deployment keys/backups/log access; deployed secret-bearing payloads were not inspected.
+- Reviewed SQL uses parameters and Vue renders escaped text, but upstream links/content remain untrusted. Auth tests and scanners are not a whole-product SQL/XSS/security certification.
+
+Update this report when routes, versions, proxy trust, visibility or limits change. Keep source fixes, exact-SHA tested acceptance and deployment status distinct.
