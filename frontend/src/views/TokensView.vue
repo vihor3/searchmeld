@@ -88,14 +88,20 @@
 
     </template>
 
-    <el-dialog v-model="dialog" :title="editingToken ? '编辑接口令牌' : '新增接口令牌'" width="520px">
+    <el-dialog v-model="dialog" :title="editingToken ? '编辑接口令牌' : '新增接口令牌'" width="min(520px, calc(100% - 32px))">
       <el-form label-position="top">
         <el-form-item label="名称"><el-input v-model="form.name" /></el-form-item>
         <el-form-item label="接口权限">
-          <el-checkbox-group v-model="form.scopes" class="scope-options">
-            <el-checkbox-button value="search">search</el-checkbox-button>
-            <el-checkbox-button value="extract">extract</el-checkbox-button>
-          </el-checkbox-group>
+          <div class="scope-options" role="group" aria-label="接口权限">
+            <label class="scope-option" :class="{ 'is-selected': form.scopes.includes('search') }">
+              <input v-model="form.scopes" type="checkbox" value="search" />
+              <span>search</span>
+            </label>
+            <label class="scope-option" :class="{ 'is-selected': form.scopes.includes('extract') }">
+              <input v-model="form.scopes" type="checkbox" value="extract" />
+              <span>extract</span>
+            </label>
+          </div>
           <div class="form-hint">可同时选择两个权限。</div>
         </el-form-item>
         <el-form-item label="允许请求渠道">
@@ -307,7 +313,49 @@ onMounted(load)
   white-space: nowrap;
 }
 .provider-tags { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
-.scope-options { width: 100%; }
+.scope-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  width: 100%;
+}
+.scope-option {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 40px;
+  padding: 0 13px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card);
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 0.16s ease, background-color 0.16s ease, box-shadow 0.16s ease;
+}
+.scope-option:hover {
+  border-color: var(--primary);
+}
+.scope-option.is-selected {
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 8%, var(--card));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 18%, transparent);
+}
+.scope-option:focus-within {
+  outline: 2px solid color-mix(in srgb, var(--primary) 35%, transparent);
+  outline-offset: 2px;
+}
+.scope-option input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+.scope-option span {
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1;
+}
 .form-hint {
   width: 100%;
   margin-top: 6px;
@@ -335,5 +383,10 @@ onMounted(load)
 }
 .row-actions :deep(.el-button + .el-button) {
   margin-left: 0;
+}
+@media (max-width: 520px) {
+  .scope-options {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

@@ -18,10 +18,13 @@ var (
 	ErrLoginRateLimited   = errors.New("admin login rate limit exceeded")
 )
 
+const extractRejectedKey contextKey = "extract_rejected"
+
 type AuthStore interface {
 	GetAdminByUsername(ctx context.Context, username string) (model.AdminUser, error)
 	FindAdminAPIKey(ctx context.Context, token string) (model.AdminAPIKey, bool, error)
 	FindAPIToken(ctx context.Context, token string) (model.APIToken, error)
+	MarkAPITokenUsed(ctx context.Context, id int64) error
 	RuntimeSettings(ctx context.Context) (model.RuntimeSettings, error)
 }
 
@@ -176,14 +179,30 @@ func (a *AuthService) requireAPIToken(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, "invalid api token")
 			return
 		}
+		extractRejected := false
+		defer func() {
+			if !extractRejected {
+				a.markAPITokenUsed(apiToken.ID)
+			}
+		}()
 		if !a.allowToken(apiToken) {
 			writeError(w, http.StatusTooManyRequests, "api token rate limit exceeded")
 			return
 		}
 		ctx := context.WithValue(r.Context(), apiTokenIDKey, apiToken.ID)
 		ctx = context.WithValue(ctx, apiTokenKey, apiToken)
+		ctx = context.WithValue(ctx, extractRejectedKey, &extractRejected)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func (a *AuthService) markAPITokenUsed(id int64) {
+	if id <= 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = a.store.MarkAPITokenUsed(ctx, id)
 }
 
 func (a *AuthService) requireAPITokenScope(scope string) func(http.Handler) http.Handler {

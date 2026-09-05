@@ -43,6 +43,7 @@ type AppStore interface {
 	ListSearchLogs(ctx context.Context, limit int) ([]model.SearchLog, error)
 	GetSearchLog(ctx context.Context, id int64) (model.SearchLog, []model.ProviderCallLog, error)
 	GetSearchLogByRequestID(ctx context.Context, requestID string) (model.SearchLog, []model.ProviderCallLog, error)
+	RecordRejectedRequestLog(ctx context.Context, input model.SearchLogInput) error
 	UsageSummary(ctx context.Context) (model.UsageSummary, error)
 	UsageSummarySince(ctx context.Context, from time.Time) (model.UsageSummary, error)
 	BillingSummary(ctx context.Context, days int) (model.BillingSummary, error)
@@ -107,9 +108,9 @@ func (h *Handler) Mount(r chi.Router) {
 
 	r.Route("/v1", func(r chi.Router) {
 		r.With(h.auth.requireAPITokenScope("search")).Post("/search", h.search)
-		r.With(h.auth.requireAPITokenScope("extract")).Post("/extract", h.extract)
+		r.With(h.auth.requireAPIToken, h.requireExtractAPITokenScope(model.CompatFormatNative)).Post("/extract", h.extract)
 		r.With(h.auth.requireTavilyAPITokenScope("search")).Post("/compat/tavily/search", h.tavilySearch)
-		r.With(h.auth.requireTavilyAPITokenScope("extract")).Post("/compat/tavily/extract", h.tavilyExtract)
+		r.With(tavilyBodyAPIKeyMiddleware, h.auth.requireAPIToken, h.requireExtractAPITokenScope(model.CompatFormatTavily)).Post("/compat/tavily/extract", h.tavilyExtract)
 		r.With(h.auth.requireAPITokenScope("search")).Post("/compat/serper/search", h.serperSearch)
 		r.With(h.auth.requireAPITokenScope("search")).Post("/compat/openai/responses-search", h.openAISearch)
 		r.With(h.auth.requireAPIToken).Get("/providers", h.providers)
@@ -151,6 +152,23 @@ func (h *Handler) Mount(r chi.Router) {
 			r.Post("/playground/search", h.adminSearch)
 		})
 	})
+}
+
+func (h *Handler) requireExtractAPITokenScope(compatFormat model.CompatFormat) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			started := time.Now()
+			if token, ok := APIToken(r.Context()); ok && !apiTokenHasScope(token, "extract") {
+				message := "api token does not include extract scope"
+				h.recordRejectedExtract(r, compatFormat, message, time.Since(started))
+				// Preserve the pre-existing scope middleware envelope for both the
+				// native and Tavily-compatible routes.
+				writeError(w, http.StatusForbidden, message)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
@@ -249,6 +267,7 @@ func (h *Handler) tavilySearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) tavilyExtract(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
 	body, err := readBody(r)
 	if err != nil {
 		writeTavilyExtractError(w, http.StatusBadRequest, "invalid body")
@@ -282,13 +301,9 @@ func (h *Handler) tavilyExtract(w http.ResponseWriter, r *http.Request) {
 		writeTavilyExtractError(w, http.StatusNotFound, "tavily compatibility endpoint is disabled")
 		return
 	}
-	if token, ok := APIToken(r.Context()); ok {
-		filtered, err := applyTokenExtractProviders(native.Providers, token.AllowedProviders)
-		if err != nil {
-			writeTavilyExtractError(w, http.StatusForbidden, err.Error())
-			return
-		}
-		native.Providers = filtered
+	if err := h.authorizeExtractProviders(r, &native, started); err != nil {
+		writeTavilyExtractError(w, http.StatusForbidden, err.Error())
+		return
 	}
 	response, err := h.orchestrator.Extract(r.Context(), native, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
@@ -392,17 +407,14 @@ func (h *Handler) runSearch(w http.ResponseWriter, r *http.Request, req model.Se
 }
 
 func (h *Handler) runExtract(w http.ResponseWriter, r *http.Request, req model.ExtractRequest) {
+	started := time.Now()
 	if err := validateExtractRequest(req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if token, ok := APIToken(r.Context()); ok {
-		filtered, err := applyTokenExtractProviders(req.Providers, token.AllowedProviders)
-		if err != nil {
-			writeError(w, http.StatusForbidden, err.Error())
-			return
-		}
-		req.Providers = filtered
+	if err := h.authorizeExtractProviders(r, &req, started); err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
 	}
 	response, err := h.orchestrator.Extract(r.Context(), req, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
@@ -414,6 +426,51 @@ func (h *Handler) runExtract(w http.ResponseWriter, r *http.Request, req model.E
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *Handler) authorizeExtractProviders(r *http.Request, req *model.ExtractRequest, started time.Time) error {
+	token, ok := APIToken(r.Context())
+	if !ok {
+		return nil
+	}
+	filtered, err := applyTokenExtractProviders(req.Providers, token.AllowedProviders)
+	if err != nil {
+		h.recordRejectedExtract(r, req.CompatFormat, "api token provider allowlist rejected extract request", time.Since(started))
+		return err
+	}
+	req.Providers = filtered
+	return nil
+}
+
+func (h *Handler) recordRejectedExtract(r *http.Request, compatFormat model.CompatFormat, message string, latency time.Duration) {
+	if rejected, ok := r.Context().Value(extractRejectedKey).(*bool); ok {
+		*rejected = true
+	}
+	if h.store == nil {
+		return
+	}
+	input := model.SearchLogInput{
+		RequestID:    RequestID(r.Context()),
+		APITokenID:   APITokenID(r.Context()),
+		Operation:    "extract",
+		CompatFormat: string(compatFormat),
+		CachePolicy:  string(model.CachePolicyBypass),
+		Status:       "error",
+		ErrorMessage: message,
+		LatencyMS:    latency.Milliseconds(),
+		RequestJSON:  []byte("{}"),
+		ResponseJSON: []byte("{}"),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := h.store.RecordRejectedRequestLog(ctx, input); err != nil {
+		h.logError("rejected_request_log_failed", map[string]interface{}{
+			"error":         err.Error(),
+			"request_id":    input.RequestID,
+			"operation":     input.Operation,
+			"compat_format": input.CompatFormat,
+		})
+	}
 }
 
 func validateExtractRequest(req model.ExtractRequest) error {

@@ -123,6 +123,8 @@ Extract 默认不写搜索缓存，确保每次向上游获取当前页面内容
 
 批量请求允许部分成功：HTTP 请求本身成功时返回 `200`，逐 URL 的失败放在 `failed_results`。请求参数不合法时返回 `400`；普通 Token 缺少 `extract` scope 或请求未授权 Provider 时返回 `403`。所有 Provider 均出现系统性失败时不伪装成部分成功：无可用 Key / Provider 返回 `503`，上游认证或协议错误返回 `502`，限流或额度耗尽返回 `429`，整体超时返回 `504`。
 
+使用有效普通 Token 的 Extract 请求如果因为缺少 `extract` scope 或 Token 的 Provider 白名单而返回 `403`，会作为失败的 Extract 请求出现在管理台请求日志中，便于按 request ID 排查；这类授权阶段拒绝不会创建 Provider Call，也不会增加调用量、额度或账单用量。拒绝日志只保留请求 ID、Token ID、接口格式、固定拒绝原因、状态和耗时，不保存 URL、查询内容或请求体。缺失或无效凭据导致的 `401` 不写入持久化请求日志。
+
 ## Tavily Extract 兼容接口
 
 ```text

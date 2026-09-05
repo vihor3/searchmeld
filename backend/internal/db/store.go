@@ -621,8 +621,12 @@ func (s *Store) FindAPIToken(ctx context.Context, token string) (model.APIToken,
 	if err := row.Scan(&item.ID, &item.Name, &item.TokenHash, &item.TokenPrefix, &item.Scopes, &item.AllowedProviders, &item.Status, &item.RateLimitPerMin, &item.DailyQuota, &item.MonthlyQuota, &item.LastUsedAt, &item.UsageCount, &item.CreatedAt, &item.UpdatedAt); err != nil {
 		return model.APIToken{}, err
 	}
-	_, _ = s.pool.Exec(ctx, `UPDATE api_tokens SET last_used_at=now(), usage_count=usage_count+1 WHERE id=$1`, item.ID)
 	return item, nil
+}
+
+func (s *Store) MarkAPITokenUsed(ctx context.Context, id int64) error {
+	_, err := s.pool.Exec(ctx, `UPDATE api_tokens SET last_used_at=now(), usage_count=usage_count+1 WHERE id=$1`, id)
+	return err
 }
 
 func (s *Store) ListAPITokens(ctx context.Context) ([]model.APIToken, error) {
@@ -762,6 +766,17 @@ func (s *Store) DeleteAPIToken(ctx context.Context, id int64) error {
 }
 
 func (s *Store) RecordSearchLog(ctx context.Context, input model.SearchLogInput) error {
+	return s.recordRequestLog(ctx, input, true)
+}
+
+// RecordRejectedRequestLog persists an authenticated request rejected before
+// provider execution. It deliberately skips provider calls and all usage or
+// billing aggregates.
+func (s *Store) RecordRejectedRequestLog(ctx context.Context, input model.SearchLogInput) error {
+	return s.recordRequestLog(ctx, input, false)
+}
+
+func (s *Store) recordRequestLog(ctx context.Context, input model.SearchLogInput, recordAccounting bool) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -780,6 +795,10 @@ func (s *Store) RecordSearchLog(ctx context.Context, input model.SearchLogInput)
 	if len(responseJSON) == 0 {
 		responseJSON = []byte("{}")
 	}
+	providers := input.Providers
+	if providers == nil {
+		providers = []string{}
+	}
 	operation := strings.TrimSpace(input.Operation)
 	if operation == "" {
 		operation = "search"
@@ -788,8 +807,11 @@ func (s *Store) RecordSearchLog(ctx context.Context, input model.SearchLogInput)
 		INSERT INTO search_requests (request_id, api_token_id, operation, query, mode, compat_format, providers, cache_policy, cache_hit, result_count, status, error_message, latency_ms, request_json, response_json)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15::jsonb)
 		RETURNING id
-	`, input.RequestID, apiToken, operation, input.Query, input.Mode, input.CompatFormat, input.Providers, input.CachePolicy, input.CacheHit, input.ResultCount, input.Status, input.ErrorMessage, int(input.LatencyMS), string(requestJSON), string(responseJSON)).Scan(&searchRequestID); err != nil {
+	`, input.RequestID, apiToken, operation, input.Query, input.Mode, input.CompatFormat, providers, input.CachePolicy, input.CacheHit, input.ResultCount, input.Status, input.ErrorMessage, int(input.LatencyMS), string(requestJSON), string(responseJSON)).Scan(&searchRequestID); err != nil {
 		return err
+	}
+	if !recordAccounting {
+		return tx.Commit(ctx)
 	}
 	for _, call := range input.Calls {
 		var providerKey interface{}

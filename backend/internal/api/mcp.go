@@ -411,6 +411,7 @@ func (h *Handler) mcpAuthContext(r *http.Request) (context.Context, int, string,
 	if err != nil {
 		return r.Context(), http.StatusUnauthorized, "invalid api token", err
 	}
+	h.auth.markAPITokenUsed(apiToken.ID)
 	if !h.auth.allowToken(apiToken) {
 		return r.Context(), http.StatusTooManyRequests, "api token rate limit exceeded", fmt.Errorf("api token rate limit exceeded")
 	}
