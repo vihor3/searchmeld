@@ -8,6 +8,7 @@ const assert = require('node:assert/strict')
 const { spawn } = require('node:child_process')
 const { mkdir } = require('node:fs/promises')
 const { resolve } = require('node:path')
+const { stripVTControlCharacters } = require('node:util')
 const { chromium } = require('playwright')
 
 assert.ok(process.env.FRONTEND_DIR, 'FRONTEND_DIR is required')
@@ -621,7 +622,7 @@ async function main() {
   const startupError = new Promise((_, reject) => server.once('error', reject))
   for (const stream of [server.stdout, server.stderr]) stream.on('data', (chunk) => {
     output = `${output}${chunk}`.slice(-16000)
-    if (output.includes(`${origin}/`)) ready.resolve()
+    if (stripVTControlCharacters(output).includes(`${origin}/`)) ready.resolve()
   })
   const interrupted = deferred()
   const stop = () => interrupted.resolve()
