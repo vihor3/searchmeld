@@ -1,0 +1,454 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CI: 'true'
+
+jobs:
+  frontend:
+    name: Frontend build and session regression
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      VITE_API_BASE: ''
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22.23.2'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Verify browser cleanup error precedence
+        timeout-minutes: 2
+        run: node --test deploy/admin_session_expiry_cleanup_test.cjs
+
+      - name: Install locked frontend dependencies
+        working-directory: frontend
+        run: npm ci --no-audit
+
+      - name: Audit all locked npm dependencies
+        working-directory: frontend
+        run: npm audit --audit-level=low --json > "$RUNNER_TEMP/npm-audit.json"
+
+      - name: Upload npm audit evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-audit-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/npm-audit.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Type check and build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Install test-only Playwright and matching Chromium
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/admin-session-browsers
+        run: |
+          npm install --prefix "$RUNNER_TEMP/admin-session-playwright" \
+            --no-save --no-package-lock --ignore-scripts --no-audit --no-fund playwright@1.63.0
+          node "$RUNNER_TEMP/admin-session-playwright/node_modules/playwright/cli.js" \
+            install --with-deps chromium
+
+      - name: Exercise admin session recovery in Chromium
+        id: browser
+        timeout-minutes: 10
+        env:
+          FRONTEND_DIR: ${{ github.workspace }}/frontend
+          NODE_PATH: ${{ runner.temp }}/admin-session-playwright/node_modules
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/admin-session-browsers
+          ARTIFACT_DIR: ${{ runner.temp }}/admin-session-artifacts
+        run: node deploy/admin_session_expiry_test.cjs
+
+      - name: Upload browser screenshots
+        if: ${{ !cancelled() && (steps.browser.outcome == 'success' || steps.browser.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 2
+        with:
+          name: admin-session-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/admin-session-artifacts/**/*.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove temporary browser resources
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: |
+          rm -rf -- "$RUNNER_TEMP/admin-session-playwright" \
+            "$RUNNER_TEMP/admin-session-browsers" "$RUNNER_TEMP/admin-session-artifacts"
+
+  backend:
+    name: Go format, vet and PostgreSQL tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      GOFLAGS: -mod=readonly
+      GOTOOLCHAIN: local
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: searchmeld_test
+          POSTGRES_USER: searchmeld_test
+          POSTGRES_PASSWORD: ci-only-password
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U searchmeld_test -d searchmeld_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # Match the supported Dockerfile builder.
+          go-version: '1.26.8'
+          cache-dependency-path: backend/go.sum
+
+      - name: Check Go formatting without rewriting source
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            printf 'Go files need formatting:\n%s\n' "$unformatted" >&2
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: Vet Go packages
+        run: go vet ./...
+
+      - name: Run Go tests with the isolated database
+        env:
+          SEARCHMELD_TEST_DATABASE_URL: postgres://searchmeld_test:ci-only-password@127.0.0.1:${{ job.services.postgres.ports[5432] }}/searchmeld_test?sslmode=disable
+        run: |
+          : "${SEARCHMELD_TEST_DATABASE_URL:?CI requires an isolated test database}"
+          go test -race -v -count=1 -timeout=5m ./...
+
+      - name: Install the pinned Go vulnerability checker
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+      - name: Reject reachable Go vulnerabilities
+        run: govulncheck -show verbose ./... 2>&1 | tee "$RUNNER_TEMP/govulncheck.txt"
+
+      - name: Upload Go vulnerability evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: go-audit-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/govulncheck.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  shell-regressions:
+    name: Frontend source and Alpine shell regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check frontend registration and token scopes
+        run: |
+          sh deploy/frontend_component_registration_test.sh
+          sh deploy/token_scope_selector_test.sh
+
+      - name: Verify Compose health probes
+        env:
+          POSTGRES_PASSWORD: ci-only-password
+          DATABASE_URL: postgres://ci-only:ci-only@database.invalid/ci-only
+          ENCRYPTION_KEY: ci-only-encryption-key-not-for-deployment
+        run: |
+          for compose_file in docker-compose.yml docker-compose.external-db.yml; do
+            docker compose --env-file /dev/null -f "$compose_file" config --format json |
+              jq -e '.services.app.healthcheck.test == ["CMD", "timeout", "-s", "KILL", "4", "wget", "-Y", "off", "-T", "4", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]' >/dev/null
+          done
+
+      - name: Prove missing component registrations are rejected
+        run: |
+          fixture=$(mktemp -d "$RUNNER_TEMP/component-registration.XXXXXX")
+          trap 'rm -rf -- "$fixture"' EXIT
+          cp -R frontend/src "$fixture/src"
+          for component in ElButton ElInput; do
+            sed "/^[[:space:]]*${component},$/d" frontend/src/main.ts > "$fixture/src/main.ts"
+            if FRONTEND_DIR="$fixture" sh deploy/frontend_component_registration_test.sh > "$fixture/output" 2>&1; then
+              printf 'Missing %s registration was not detected\n' "$component" >&2
+              exit 1
+            fi
+            cat "$fixture/output"
+            grep -Fq "Element Plus template component is not registered: $component " "$fixture/output"
+          done
+
+      - name: Check shell syntax and run installer and entrypoint regressions
+        run: |
+          # Tests mock Docker and Git; the container receives no Docker socket or network.
+          docker run --rm --network none \
+            --name "searchmeld-shell-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --env GITHUB_ACTIONS=true \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace,readonly" \
+            --workdir /workspace alpine:3.22.5 sh -eu -c '
+              for script in install.sh deploy/*.sh; do
+                sh -n "$script"
+              done
+              sh deploy/install_test.sh
+              sh deploy/all-in-one-entrypoint_test.sh
+            '
+
+      - name: Remove the shell test container
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: docker rm --force "searchmeld-shell-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >/dev/null 2>&1 || true
+
+  images:
+    name: Image build (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [external, all-in-one]
+    env:
+      BUILD_TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Build root image without publishing
+        id: build
+        timeout-minutes: 15
+        run: docker build --pull --progress plain --target "$BUILD_TARGET" --tag "searchmeld:ci-$BUILD_TARGET" .
+
+      - name: Set up Node for packaged browser integration
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22.23.2'
+
+      - name: Pull the isolated external database fixture image
+        if: ${{ matrix.target == 'external' }}
+        run: docker pull postgres:16-alpine
+
+      - name: Install test-only Playwright for the packaged image
+        timeout-minutes: 8
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/admin-cookie-browsers
+        run: |
+          test "${GITHUB_ACTIONS:-}" = true
+          npm install --prefix "$RUNNER_TEMP/admin-cookie-playwright" \
+            --no-save --no-package-lock --ignore-scripts --no-audit --no-fund playwright@1.63.0
+          node "$RUNNER_TEMP/admin-cookie-playwright/node_modules/playwright/cli.js" \
+            install --with-deps chromium
+
+      - name: Exercise packaged HTTP and HTTPS admin Cookies
+        id: cookies
+        timeout-minutes: 12
+        env:
+          COOKIE_TEST_IMAGE: searchmeld:ci-${{ matrix.target }}
+          COOKIE_TEST_DATABASE_MODE: ${{ matrix.target == 'external' && 'external' || 'embedded' }}
+          COOKIE_TEST_POSTGRES_IMAGE: postgres:16-alpine
+          COOKIE_CONTAINER_PREFIX: searchmeld-admin-cookie-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          COOKIE_TEST_TEMP: ${{ runner.temp }}/admin-cookie-fixture
+          NODE_PATH: ${{ runner.temp }}/admin-cookie-playwright/node_modules
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/admin-cookie-browsers
+          ARTIFACT_DIR: ${{ runner.temp }}/admin-cookie-artifacts
+        run: |
+          test "${GITHUB_ACTIONS:-}" = true
+          node deploy/admin_cookie_integration_test.cjs
+
+      - name: Upload synthetic packaged-browser screenshots
+        if: ${{ !cancelled() && (steps.cookies.outcome == 'success' || steps.cookies.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 2
+        with:
+          name: admin-cookie-${{ matrix.target }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/admin-cookie-artifacts/**/*.png
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove packaged browser containers, volumes and temporary files
+        if: ${{ always() }}
+        timeout-minutes: 3
+        run: |
+          test "${GITHUB_ACTIONS:-}" = true
+          # Named fallback also runs when cancellation interrupts Node cleanup.
+          for mode in http https; do
+            timeout --signal=KILL 10s docker rm --force --volumes "searchmeld-admin-cookie-$BUILD_TARGET-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$mode" >/dev/null 2>&1 || true
+            timeout --signal=KILL 10s docker rm --force --volumes "searchmeld-admin-cookie-$BUILD_TARGET-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$mode-postgres" >/dev/null 2>&1 || true
+            timeout --signal=KILL 10s docker network rm "searchmeld-admin-cookie-$BUILD_TARGET-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$mode-network" >/dev/null 2>&1 || true
+          done
+          rm -rf -- "$RUNNER_TEMP/admin-cookie-fixture" \
+            "$RUNNER_TEMP/admin-cookie-playwright" "$RUNNER_TEMP/admin-cookie-browsers" \
+            "$RUNNER_TEMP/admin-cookie-artifacts"
+
+      - name: Verify historical database upgrade and mismatch recovery
+        if: ${{ matrix.target == 'all-in-one' }}
+        timeout-minutes: 30
+        env:
+          UPGRADE_CONTAINER_PREFIX: searchmeld-db-upgrade-${{ github.run_id }}-${{ github.run_attempt }}
+          UPGRADE_TEST_IMAGE: searchmeld:ci-all-in-one
+        run: node deploy/database_upgrade_test.cjs
+
+      - name: Remove historical upgrade fixture resources
+        if: ${{ always() && matrix.target == 'all-in-one' }}
+        timeout-minutes: 3
+        run: |
+          test "${GITHUB_ACTIONS:-}" = true
+          prefix="searchmeld-db-upgrade-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          cleanup_failed=0
+          containers=$(timeout --signal=KILL 10s docker ps --all --quiet --filter "label=searchmeld.database-upgrade-fixture=$prefix") || cleanup_failed=1
+          for container in $containers; do
+            timeout --signal=KILL 10s docker rm --force --volumes "$container" >/dev/null 2>&1 || cleanup_failed=1
+          done
+          networks=$(timeout --signal=KILL 10s docker network ls --quiet --filter "label=searchmeld.database-upgrade-fixture=$prefix") || cleanup_failed=1
+          for network in $networks; do
+            timeout --signal=KILL 10s docker network rm "$network" >/dev/null 2>&1 || cleanup_failed=1
+          done
+          timeout --signal=KILL 10s docker volume rm "$prefix-data" "$prefix-backup" "$prefix-mismatch" >/dev/null 2>&1 || true
+          timeout --signal=KILL 30s docker buildx rm --force "$prefix" >/dev/null 2>&1 || true
+          timeout --signal=KILL 10s docker image rm --force "$prefix:baseline" >/dev/null 2>&1 || true
+          timeout --signal=KILL 10s docker image rm --force postgres:17.11-alpine3.23 >/dev/null 2>&1 || true
+          rm -rf -- "$RUNNER_TEMP/$prefix"
+          test "$cleanup_failed" -eq 0
+
+      - name: Bind the reviewed BusyBox disposition to this image
+        id: audit-policy
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        timeout-minutes: 2
+        env:
+          BUSYBOX_REVIEW_BEFORE: '2026-10-06'
+        run: |
+          review_date=$(date -u +%F)
+          [[ "$review_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+          if [[ "$review_date" < "$BUSYBOX_REVIEW_BEFORE" ]]; then
+            image_id=$(docker image inspect --format '{{.Id}}' "searchmeld:ci-$BUILD_TARGET")
+            [[ "$image_id" =~ ^sha256:[a-f0-9]{64}$ ]]
+            audit_image="searchmeld:audit-${image_id#sha256:}"
+            printf 'image=%s\n' "$audit_image" >> "$GITHUB_OUTPUT"
+            printf 'image_id=%s\n' "$image_id" >> "$GITHUB_OUTPUT"
+            docker tag "$image_id" "$audit_image"
+            timestamp=$(date -u +%FT%TZ)
+            jq -e -s --arg product "pkg:oci/searchmeld?tag=audit-${image_id#sha256:}" \
+              --arg timestamp "$timestamp" '
+                if length != 1 or (.[0] | type != "object") then
+                  error("Expected one VEX template object")
+                else
+                  .[0] | .timestamp = $timestamp | .statements[0].products[0]."@id" = $product
+                end
+              ' \
+              .github/security/busybox.vex.json > "$RUNNER_TEMP/image-vex.json"
+          else
+            printf 'BusyBox applicability review expired; remove or re-review the disposition.\n' >&2
+            exit 1
+          fi
+
+      - name: Audit packaged OS and Go dependencies
+        id: image-audit
+        if: ${{ !cancelled() && steps.audit-policy.outcome == 'success' }}
+        timeout-minutes: 10
+        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7
+        with:
+          image: ${{ steps.audit-policy.outputs.image }}
+          vex: ${{ runner.temp }}/image-vex.json
+          grype-version: v0.118.0
+          fail-build: true
+          severity-cutoff: low
+          only-fixed: false
+          output-format: json
+          output-file: ${{ runner.temp }}/image-audit.json
+
+      - name: Validate image audit evidence and disposition scope
+        if: ${{ !cancelled() && steps.audit-policy.outcome == 'success' }}
+        env:
+          AUDIT_IMAGE: ${{ steps.audit-policy.outputs.image }}
+          AUDIT_IMAGE_ID: ${{ steps.audit-policy.outputs.image_id }}
+        run: |
+          test -s "$RUNNER_TEMP/image-vex.json"
+          test -s "$RUNNER_TEMP/image-audit.json"
+          validate_audit() {
+            jq -e -s --arg image_id "$AUDIT_IMAGE_ID" --arg image "$AUDIT_IMAGE" \
+              --slurpfile vex "$RUNNER_TEMP/image-vex.json" '
+                length == 1 and ($vex | length == 1) and
+                (.[0] |
+                  .source.type == "image" and
+                  .source.target.imageID == $image_id and
+                  (.source.target.tags | type == "array" and index($image) != null) and
+                  (.matches | type == "array") and
+                  (if has("ignoredMatches") then (.ignoredMatches | type == "array") else true end) and
+                  all((.ignoredMatches // [])[];
+                    .vulnerability.id == "CVE-2025-60876" and
+                    (.artifact.purl | type == "string") and
+                    (.artifact.purl as $purl |
+                      any($vex[0].statements[0].products[0].subcomponents[]; ."@id" == $purl))))
+              ' "$1" >/dev/null
+          }
+          validate_audit "$RUNNER_TEMP/image-audit.json"
+          fixture="$RUNNER_TEMP/image-audit-negative.json"
+          trap 'rm -f -- "$fixture"' EXIT
+          for mutation in \
+            'empty' \
+            '., .' \
+            '.source.target.imageID = "sha256:wrong-image"' \
+            '.ignoredMatches = {}' \
+            '.ignoredMatches = false' \
+            '.ignoredMatches = [{vulnerability: {id: "CVE-unreviewed"}, artifact: {purl: $vex[0].statements[0].products[0].subcomponents[0]."@id"}}]' \
+            '.ignoredMatches = [{vulnerability: {id: "CVE-2025-60876"}, artifact: {purl: "pkg:apk/alpine/busybox@1.37.0-r21?arch=x86_64&distro=alpine-3.22.5"}}]'; do
+            jq --slurpfile vex "$RUNNER_TEMP/image-vex.json" "$mutation" "$RUNNER_TEMP/image-audit.json" > "$fixture"
+            if validate_audit "$fixture"; then
+              printf 'Malformed or out-of-scope audit evidence was accepted.\n' >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload image vulnerability evidence
+        if: ${{ !cancelled() && (steps.image-audit.outcome == 'success' || steps.image-audit.outcome == 'failure') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-audit-${{ matrix.target }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/image-audit.json
+            ${{ runner.temp }}/image-vex.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove the test image
+        if: ${{ always() }}
+        timeout-minutes: 2
+        env:
+          AUDIT_IMAGE: ${{ steps.audit-policy.outputs.image }}
+        run: |
+          if [ -n "$AUDIT_IMAGE" ]; then
+            timeout --signal=KILL 10s docker image rm --force "$AUDIT_IMAGE" >/dev/null 2>&1 || true
+          fi
+          timeout --signal=KILL 10s docker image rm --force "searchmeld:ci-$BUILD_TARGET" >/dev/null 2>&1 || true
+          if [ "$BUILD_TARGET" = external ]; then
+            timeout --signal=KILL 10s docker image rm --force postgres:16-alpine >/dev/null 2>&1 || true
+          fi

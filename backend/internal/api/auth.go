@@ -20,6 +20,25 @@ var (
 
 const extractRejectedKey contextKey = "extract_rejected"
 
+const adminCredentialKey contextKey = "admin_credential"
+
+type adminCredentialKind string
+
+const (
+	adminCookieCredential adminCredentialKind = "cookie"
+	adminKeyCredential    adminCredentialKind = "key"
+)
+
+const (
+	maxLoginUsernameBytes = 256
+	maxLoginWindows       = 4096
+)
+
+type adminCredential struct {
+	Kind         adminCredentialKind
+	SessionToken string
+}
+
 type AuthStore interface {
 	GetAdminByUsername(ctx context.Context, username string) (model.AdminUser, error)
 	FindAdminAPIKey(ctx context.Context, token string) (model.AdminAPIKey, bool, error)
@@ -35,6 +54,7 @@ type AuthService struct {
 	loginWindows     map[string]loginWindow
 	sessionTTL       time.Duration
 	loginMaxAttempts int
+	loginMaxWindows  int
 	loginWindow      time.Duration
 	loginLockout     time.Duration
 	mu               sync.Mutex
@@ -56,6 +76,9 @@ type loginWindow struct {
 	LockedUntil time.Time
 }
 
+// NewAuthService creates process-local auth state with fixed-TTL sessions and
+// at most maxLoginWindows login buckets when limiting is enabled. Nonpositive
+// durations and zero attempts use defaults; negative attempts disable the limiter.
 func NewAuthService(store AuthStore, sessionTTL time.Duration, loginMaxAttempts int, loginWindowDuration, loginLockout time.Duration) *AuthService {
 	if sessionTTL <= 0 {
 		sessionTTL = 24 * time.Hour
@@ -76,12 +99,20 @@ func NewAuthService(store AuthStore, sessionTTL time.Duration, loginMaxAttempts 
 		loginWindows:     map[string]loginWindow{},
 		sessionTTL:       sessionTTL,
 		loginMaxAttempts: loginMaxAttempts,
+		loginMaxWindows:  maxLoginWindows,
 		loginWindow:      loginWindowDuration,
 		loginLockout:     loginLockout,
 	}
 }
 
+// Login rejects overlong raw usernames before limiter/store access, then creates
+// a fixed-TTL in-memory session after password verification. Account lookup and
+// password failures map to ErrInvalidCredentials or ErrLoginRateLimited;
+// token-generation errors propagate. Success clears the username/IP login bucket.
 func (a *AuthService) Login(ctx context.Context, username, password, clientIP string) (string, time.Time, error) {
+	if len(username) > maxLoginUsernameBytes {
+		return "", time.Time{}, ErrInvalidCredentials
+	}
 	attemptKey := loginAttemptKey(username, clientIP)
 	if a.loginLocked(attemptKey) {
 		return "", time.Time{}, ErrLoginRateLimited
@@ -124,28 +155,58 @@ func (a *AuthService) Logout(token string) bool {
 	return true
 }
 
+// requireAdmin validates a supplied header credential as an admin Key without
+// Cookie fallback. With no supplied header it requires a live session Cookie and
+// browser proof, including reads. It captures the credential for scoped logout
+// and reports Key lookup failures as a generic 500 without exposing store errors.
 func (a *AuthService) requireAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := bearerToken(r)
-		if token != "" && a.validSession(token) {
-			ctx := context.WithValue(r.Context(), adminActorKey, "admin")
+		if token, supplied := adminHeaderCredential(r); supplied {
+			if !strings.HasPrefix(token, "oak_") {
+				writeError(w, http.StatusUnauthorized, "admin login required")
+				return
+			}
+			adminKey, ok, err := a.store.FindAdminAPIKey(r.Context(), token)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "could not validate admin api key")
+				return
+			}
+			if !ok {
+				writeError(w, http.StatusUnauthorized, "admin login required")
+				return
+			}
+			ctx := context.WithValue(r.Context(), adminActorKey, adminAPIKeyActor(adminKey))
+			ctx = context.WithValue(ctx, adminCredentialKey, adminCredential{Kind: adminKeyCredential})
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
-		if token != "" {
-			adminKey, ok, err := a.store.FindAdminAPIKey(r.Context(), token)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err.Error())
-				return
-			}
-			if ok {
-				ctx := context.WithValue(r.Context(), adminActorKey, adminAPIKeyActor(adminKey))
-				next.ServeHTTP(w, r.WithContext(ctx))
-				return
-			}
+		cookie, err := r.Cookie(adminSessionCookieName)
+		if err != nil || !a.validSession(cookie.Value) {
+			writeError(w, http.StatusUnauthorized, "admin login required")
+			return
 		}
-		writeError(w, http.StatusUnauthorized, "admin login required")
+		if !requireAdminBrowserProof(w, r) {
+			return
+		}
+		ctx := context.WithValue(r.Context(), adminActorKey, "admin")
+		ctx = context.WithValue(ctx, adminCredentialKey, adminCredential{Kind: adminCookieCredential, SessionToken: cookie.Value})
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// adminHeaderCredential reports supplied auth headers even when empty or invalid.
+// Repeated values return an empty supplied credential; otherwise bearerToken
+// selects Bearer before X-API-Key. The presence flag prevents Cookie fallback.
+func adminHeaderCredential(r *http.Request) (string, bool) {
+	authorization, hasAuthorization := r.Header["Authorization"]
+	apiKey, hasAPIKey := r.Header[http.CanonicalHeaderKey("X-API-Key")]
+	if !hasAuthorization && !hasAPIKey {
+		return "", false
+	}
+	if len(authorization) > 1 || len(apiKey) > 1 {
+		return "", true
+	}
+	return bearerToken(r), true
 }
 
 func (a *AuthService) requireAPIToken(next http.Handler) http.Handler {
@@ -257,6 +318,9 @@ func (a *AuthService) validSession(token string) bool {
 	return true
 }
 
+// loginLocked prunes expired state under a.mu, then reports an active lockout or
+// lack of room for a new bucket. An admitted new username/IP bucket is reserved
+// before account lookup; a disabled limiter returns false without retaining state.
 func (a *AuthService) loginLocked(key string) bool {
 	if a.loginMaxAttempts < 0 {
 		return false
@@ -264,16 +328,35 @@ func (a *AuthService) loginLocked(key string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now()
-	window := a.loginWindows[key]
-	if window.LockedUntil.After(now) {
+	a.pruneLoginWindows(now)
+	if window, ok := a.loginWindows[key]; ok {
+		return window.LockedUntil.After(now)
+	}
+	if len(a.loginWindows) >= a.loginMaxWindows {
 		return true
 	}
-	if !window.LockedUntil.IsZero() && !window.LockedUntil.After(now) {
-		delete(a.loginWindows, key)
-	}
+	// Reserve capacity before account lookup so concurrent new names cannot
+	// bypass the bound while password verification is in flight.
+	a.loginWindows[key] = loginWindow{StartedAt: now}
 	return false
 }
 
+// Caller holds a.mu. Active lockouts outlive their original attempt window.
+func (a *AuthService) pruneLoginWindows(now time.Time) {
+	for key, window := range a.loginWindows {
+		if !window.LockedUntil.IsZero() {
+			if !window.LockedUntil.After(now) {
+				delete(a.loginWindows, key)
+			}
+		} else if !window.StartedAt.Add(a.loginWindow).After(now) {
+			delete(a.loginWindows, key)
+		}
+	}
+}
+
+// recordLoginFailure counts failures under a.mu and starts a lockout at the
+// configured threshold. Existing locks and new names at capacity return true
+// without resetting a lock or adding a bucket; negative limits skip tracking.
 func (a *AuthService) recordLoginFailure(key string) bool {
 	if a.loginMaxAttempts < 0 {
 		return false
@@ -281,8 +364,12 @@ func (a *AuthService) recordLoginFailure(key string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	now := time.Now()
-	window := a.loginWindows[key]
-	if window.StartedAt.IsZero() || now.Sub(window.StartedAt) > a.loginWindow {
+	a.pruneLoginWindows(now)
+	window, exists := a.loginWindows[key]
+	if window.LockedUntil.After(now) || !exists && len(a.loginWindows) >= a.loginMaxWindows {
+		return true
+	}
+	if !exists {
 		window = loginWindow{StartedAt: now}
 	}
 	window.Count++

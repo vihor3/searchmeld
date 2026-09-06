@@ -15,24 +15,35 @@
 
 <script setup lang="ts">
 import { reactive, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus/es/components/message/index'
 import { api } from '../api/client'
+import { loginRedirect } from '../router'
 import { useSessionStore } from '../stores/session'
 
+const route = useRoute()
 const router = useRouter()
 const session = useSessionStore()
 const loading = ref(false)
 const form = reactive({ username: '', password: '' })
 
+/**
+ * Submit once per pending attempt; only current-revision results may report errors
+ * or continue to a validated return target and its server guard. Clear the password
+ * after a successful current response; never persist or automatically replay it.
+ */
 async function login() {
+  if (loading.value) return
   loading.value = true
+  let revision = session.advanceRevision()
   try {
-    const result = await api.login(form.username, form.password)
-    session.setToken(result.token)
-    router.push('/playground')
+    await api.login(form.username, form.password)
+    if (revision !== session.revision) return
+    revision = session.advanceRevision()
+    form.password = ''
+    await router.replace(loginRedirect(route.query.redirect))
   } catch (error) {
-    ElMessage.error((error as Error).message)
+    if (revision === session.revision) ElMessage.error(error instanceof Error ? error.message : '登录失败')
   } finally {
     loading.value = false
   }
@@ -40,8 +51,8 @@ async function login() {
 </script>
 
 <style scoped>
-.login-page { min-height: 100vh; display: grid; place-items: center; padding: 24px; }
-.login-card { width: 390px; text-align: center; }
+.login-page { min-height: 100vh; display: grid; grid-template-columns: minmax(0, 1fr); place-items: center; padding: 24px; }
+.login-card { width: 100%; max-width: 390px; min-width: 0; text-align: center; }
 .login-logo {
   width: 52px; height: 52px; display: block; margin: 0 auto 12px;
   border-radius: 14px; object-fit: cover;

@@ -2,6 +2,18 @@ import { useSessionStore } from '../stores/session'
 
 const API_BASE = import.meta.env.VITE_API_BASE || ''
 
+export interface AdminProfile {
+  username: string
+}
+
+export class ApiError extends Error {
+  /** Keep HTTP status available for auth decisions even when the error body is absent. */
+  constructor(public readonly status: number, message: string) {
+    super(message)
+    this.name = 'ApiError'
+  }
+}
+
 export interface UsageSummary {
   requests_total: number
   requests_success: number
@@ -263,24 +275,69 @@ export interface ProviderCallLog {
   usage?: Array<{ unit: string; quantity: number; cost_usd?: number; metadata?: Record<string, unknown> }>
 }
 
+/**
+ * Read JSON with Cookie credentials, browser proof and no-store for admin paths.
+ * Current-revision protected 401s request recovery before body parsing, then reject;
+ * login/logout/me and stale responses do not trigger that recovery. Never replay
+ * a failed request. HTTP failures retain status in ApiError even without JSON;
+ * network errors and invalid success JSON propagate. Successful payload validation
+ * belongs to the caller.
+ */
 export async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
   const session = useSessionStore()
+  const requestRevision = session.revision
+  const { pathname } = new URL(path, window.location.origin)
+  const adminRequest = pathname.startsWith('/api/admin/')
   const headers = new Headers(options.headers || {})
   headers.set('Content-Type', 'application/json')
-  if (session.token) {
-    headers.set('Authorization', `Bearer ${session.token}`)
-  }
-  const response = await fetch(`${API_BASE}${path}`, { ...options, headers })
+  if (adminRequest) headers.set('X-SearchMeld-Admin', '1')
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    headers,
+    credentials: adminRequest ? 'include' : options.credentials,
+    cache: adminRequest ? 'no-store' : options.cache
+  })
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({}))
-    throw new Error(payload?.error?.message || response.statusText)
+    if (response.status === 401 && adminRequest && requestRevision === session.revision &&
+      !['/api/admin/login', '/api/admin/logout', '/api/admin/me'].includes(pathname)) {
+      // Probe/navigation precedes error-body parsing; never replay the rejected request.
+      const { recheckSession } = await import('../router')
+      await recheckSession(requestRevision)
+    }
+    const payload: unknown = await response.json().catch(() => null)
+    let message = response.statusText || `HTTP ${response.status}`
+    if (payload && typeof payload === 'object' && 'error' in payload) {
+      const detail = payload.error
+      if (detail && typeof detail === 'object' && 'message' in detail && typeof detail.message === 'string' && detail.message) {
+        message = detail.message
+      }
+    }
+    throw new ApiError(response.status, message)
   }
   return response.json() as Promise<T>
 }
 
 export const api = {
-  login: (username: string, password: string) => apiFetch<{ token: string; expires_at: string }>('/api/admin/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
-  logout: () => apiFetch('/api/admin/logout', { method: 'POST' }),
+  /** Post credentials for a server-issued Cookie; JSON returns expiry, not a bearer token. */
+  login: (username: string, password: string) => apiFetch<{ expires_at: string }>('/api/admin/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
+  /**
+   * Probe the current Cookie; only HTTP 401 means anonymous. Malformed profiles
+   * and all other failures reject so callers retain an unknown, retryable state.
+   */
+  me: async (): Promise<AdminProfile | null> => {
+    try {
+      const payload = await apiFetch<unknown>('/api/admin/me')
+      if (!payload || typeof payload !== 'object' || !('username' in payload) || typeof payload.username !== 'string' || !payload.username.trim()) {
+        throw new Error('\u767b\u5f55\u72b6\u6001\u54cd\u5e94\u65e0\u6548\uff0c\u8bf7\u91cd\u8bd5')
+      }
+      return { username: payload.username }
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) return null
+      throw error
+    }
+  },
+  /** Request server-side Cookie-session revocation; leave failures, including 401, to the caller. */
+  logout: () => apiFetch<{ status: string }>('/api/admin/logout', { method: 'POST' }),
   dashboard: (range: DashboardRangeKey | string = '14d') => apiFetch<{
     range?: DashboardRangeMeta
     usage: UsageSummary

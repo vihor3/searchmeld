@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vihor3/searchmeld/backend/internal/model"
 	"github.com/vihor3/searchmeld/backend/internal/security"
 )

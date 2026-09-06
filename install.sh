@@ -18,7 +18,7 @@ health_timeout=180
 unset \
   APP_ENV POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD DATABASE_URL \
   DATABASE_URL_FILE DATABASE_MODE DATABASE_DOCKER_NETWORK RUN_MIGRATIONS \
-  ADMIN_USERNAME ADMIN_PASSWORD ENCRYPTION_KEY API_AUTH_REQUIRED MCP_ENABLED \
+  ADMIN_USERNAME ADMIN_PASSWORD ADMIN_PUBLIC_ORIGIN ENCRYPTION_KEY API_AUTH_REQUIRED MCP_ENABLED \
   MCP_PATH CORS_ALLOWED_ORIGINS HOST_PORT TZ SEARCHMELD_INSTALL_MODE \
   SEARCHMELD_USE_SHARED_DB_NETWORK SEARCHMELD_USE_CUSTOM_DNS \
   SEARCHMELD_DNS_PRIMARY SEARCHMELD_DNS_SECONDARY SEARCHMELD_HTTP_PROXY \
@@ -884,7 +884,7 @@ wait_until_healthy() {
   attempt=0
   log "等待 SearchMeld 健康检查通过……"
   while [ "$attempt" -lt "$health_timeout" ]; do
-    if run_compose exec -T app curl --noproxy '*' -fsS http://127.0.0.1/healthz >/dev/null 2>&1; then
+    if run_compose exec -T app timeout -s KILL 4 wget -Y off -T 4 -q -O /dev/null http://127.0.0.1/healthz >/dev/null 2>&1; then
       return
     fi
     attempt=$((attempt + 1))
