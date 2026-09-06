@@ -99,6 +99,8 @@ func (h *Handler) EnableMCP(path string) {
 	}
 }
 
+// Mount registers scoped business routes and protected management routes; global
+// provider configuration and usage remain available only through management.
 func (h *Handler) Mount(r chi.Router) {
 	if h.mcpEnabled {
 		h.mountMCP(r, h.mcpPath)
@@ -234,6 +236,8 @@ func (h *Handler) adminSearch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
+// tavilySearch maps enabled Tavily requests through Token provider policy before
+// orchestration, retaining Tavily success responses and native HTTP errors.
 func (h *Handler) tavilySearch(w http.ResponseWriter, r *http.Request) {
 	settings, err := h.store.RuntimeSettings(r.Context())
 	if err != nil {
@@ -257,13 +261,8 @@ func (h *Handler) tavilySearch(w http.ResponseWriter, r *http.Request) {
 	native := compat.TavilyToNative(req)
 	native.LimitExplicit = hasJSONField(body, "max_results")
 	native.ProvidersExplicit = hasJSONField(body, "providers")
-	if token, ok := APIToken(r.Context()); ok {
-		filtered, err := applyTokenProviders(native.Providers, token.AllowedProviders)
-		if err != nil {
-			writeError(w, http.StatusForbidden, err.Error())
-			return
-		}
-		native.Providers = filtered
+	if !requireSearchTokenProviders(w, r, &native) {
+		return
 	}
 	response, err := h.orchestrator.Search(r.Context(), native, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
@@ -330,6 +329,8 @@ func writeTavilyExtractError(w http.ResponseWriter, status int, message string) 
 	})
 }
 
+// serperSearch checks endpoint availability and Token provider policy before
+// orchestration, preserving Serper input mapping and its organic-results envelope.
 func (h *Handler) serperSearch(w http.ResponseWriter, r *http.Request) {
 	settings, err := h.store.RuntimeSettings(r.Context())
 	if err != nil {
@@ -353,13 +354,8 @@ func (h *Handler) serperSearch(w http.ResponseWriter, r *http.Request) {
 	native := compat.SerperToNative(req)
 	native.LimitExplicit = hasJSONField(body, "num")
 	native.ProvidersExplicit = hasJSONField(body, "providers")
-	if token, ok := APIToken(r.Context()); ok {
-		filtered, err := applyTokenProviders(native.Providers, token.AllowedProviders)
-		if err != nil {
-			writeError(w, http.StatusForbidden, err.Error())
-			return
-		}
-		native.Providers = filtered
+	if !requireSearchTokenProviders(w, r, &native) {
+		return
 	}
 	response, err := h.orchestrator.Search(r.Context(), native, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
@@ -369,6 +365,8 @@ func (h *Handler) serperSearch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, compat.SerperFromNative(req, response))
 }
 
+// openAISearch applies Token provider policy after OpenAI input normalization and
+// returns the mapped response with the request identity supplied to orchestration.
 func (h *Handler) openAISearch(w http.ResponseWriter, r *http.Request) {
 	settings, err := h.store.RuntimeSettings(r.Context())
 	if err != nil {
@@ -392,13 +390,8 @@ func (h *Handler) openAISearch(w http.ResponseWriter, r *http.Request) {
 	native := compat.OpenAIToNative(req)
 	native.LimitExplicit = hasJSONField(body, "limit")
 	native.ProvidersExplicit = hasJSONField(body, "providers")
-	if token, ok := APIToken(r.Context()); ok {
-		filtered, err := applyTokenProviders(native.Providers, token.AllowedProviders)
-		if err != nil {
-			writeError(w, http.StatusForbidden, err.Error())
-			return
-		}
-		native.Providers = filtered
+	if !requireSearchTokenProviders(w, r, &native) {
+		return
 	}
 	response, err := h.orchestrator.Search(r.Context(), native, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
@@ -408,18 +401,15 @@ func (h *Handler) openAISearch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, compat.OpenAIFromNative(response))
 }
 
+// runSearch rejects an empty native query before Token provider policy, then
+// preserves request and Token attribution when invoking search orchestration.
 func (h *Handler) runSearch(w http.ResponseWriter, r *http.Request, req model.SearchRequest) {
 	if req.Query == "" {
 		writeError(w, http.StatusBadRequest, "query is required")
 		return
 	}
-	if token, ok := APIToken(r.Context()); ok {
-		filtered, err := applyTokenProviders(req.Providers, token.AllowedProviders)
-		if err != nil {
-			writeError(w, http.StatusForbidden, err.Error())
-			return
-		}
-		req.Providers = filtered
+	if !requireSearchTokenProviders(w, r, &req) {
+		return
 	}
 	response, err := h.orchestrator.Search(r.Context(), req, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
@@ -427,6 +417,23 @@ func (h *Handler) runSearch(w http.ResponseWriter, r *http.Request, req model.Se
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// requireSearchTokenProviders applies only the authenticated Token's provider
+// policy, writing a 403 and returning false on denial. Without a Token it leaves
+// req unchanged; credential selection and usage admission belong to middleware.
+func requireSearchTokenProviders(w http.ResponseWriter, r *http.Request, req *model.SearchRequest) bool {
+	token, ok := APIToken(r.Context())
+	if !ok {
+		return true
+	}
+	filtered, err := applyTokenProviders(req.Providers, token.AllowedProviders)
+	if err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return false
+	}
+	req.Providers = filtered
+	return true
 }
 
 func (h *Handler) runExtract(w http.ResponseWriter, r *http.Request, req model.ExtractRequest) {
@@ -539,6 +546,8 @@ func extractErrorStatus(err error) int {
 	}
 }
 
+// adminProviders returns the full provider configuration for the protected
+// management route; callers must retain the admin authentication middleware.
 func (h *Handler) adminProviders(w http.ResponseWriter, r *http.Request) {
 	providers, err := h.store.ListProviders(r.Context())
 	if err != nil {
@@ -607,6 +616,8 @@ func (h *Handler) auditLogs(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"logs": items})
 }
 
+// login checks browser proof, JSON framing and raw username size before
+// authentication, then issues the session only as an HttpOnly Cookie.
 func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 	if !requireAdminBrowserProof(w, r) {
 		return
@@ -665,6 +676,8 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"expires_at": expiresAt})
 }
 
+// logout revokes only the captured Cookie-authenticated session and audits the
+// outcome. Key-authenticated calls neither revoke incidental Cookies nor clear them.
 func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
 	credential, _ := r.Context().Value(adminCredentialKey).(adminCredential)
 	loggedOut := false

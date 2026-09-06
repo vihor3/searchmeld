@@ -209,8 +209,6 @@ curl "$BASE_URL/api/admin/dashboard" \
 | `POST` | `/v1/compat/tavily/extract` | 可以 | Tavily-like 兼容抽取接口。 |
 | `POST` | `/v1/compat/serper/search` | 可以 | Serper-like 兼容搜索接口。 |
 | `POST` | `/v1/compat/openai/responses-search` | 可以 | OpenAI-like 兼容搜索接口。 |
-| `GET` | `/v1/providers` | 可以 | 获取 Provider 配置列表。 |
-| `GET` | `/v1/usage/summary` | 可以 | 获取用量汇总。 |
 
 与普通 `osr_` API Token 不同，管理员 API Key 不受 scopes 或 `allowed_providers` 限制，也不会作为 `api_token_id` 写入用量归属。普通 Token 调用 `/v1/search` 需要 `search` scope；调用 `/v1/extract`、`/v1/compat/tavily/extract` 或 MCP `extract` 必须显式包含 `extract` scope。
 

@@ -37,6 +37,10 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+      - name: Verify browser cleanup error precedence
+        timeout-minutes: 2
+        run: node --test deploy/admin_session_expiry_cleanup_test.cjs
+
       - name: Install locked frontend dependencies
         working-directory: frontend
         run: npm ci --no-audit

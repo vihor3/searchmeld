@@ -9,10 +9,6 @@ const { spawn } = require('node:child_process')
 const { mkdir } = require('node:fs/promises')
 const { resolve } = require('node:path')
 const { stripVTControlCharacters } = require('node:util')
-const { chromium } = require('playwright')
-
-assert.ok(process.env.FRONTEND_DIR, 'FRONTEND_DIR is required')
-assert.equal(process.env.VITE_API_BASE, '', 'Browser fixtures require an empty VITE_API_BASE')
 
 const origin = 'http://127.0.0.1:4173'
 const sessionA = 'synthetic-admin-session-A'
@@ -24,38 +20,46 @@ const tokenKeys = ['searchmeld-admin-token', 'one-search-admin-token']
 const desktop = { width: 1440, height: 1000 }
 const mobile = { width: 390, height: 844 }
 const contexts = new Set()
+/** Builds a Playwright JSON reply with an explicit HTTP status. */
 const json = (body, status = 200) => ({ status, contentType: 'application/json', body: JSON.stringify(body) })
+/** Uses the admin API error envelope so rejection assertions exercise body parsing. */
 const failure = (status = 401, message = 'admin login required') => json({ error: { message, status } }, status)
+/** Issues a synthetic Cookie without exposing a session token in the login JSON. */
 const loginReply = (session) => ({
   ...json({ expires_at: '2099-01-01T00:00:00Z' }),
   issueSession: session,
   headers: { 'Set-Cookie': `${cookieName}=${session}; Path=/api/admin; HttpOnly; SameSite=Lax` }
 })
 
+/** Creates a manually released gate for deterministic request and lifecycle ordering. */
 function deferred() {
   let resolve
-  const promise = new Promise((done) => { resolve = done })
+  const promise = new Promise(/** Exposes fulfillment without a timer or a separate reject callback. */ (done) => { resolve = done })
   return { promise, resolve }
 }
 
+/** Limits the wait and clears its timer; it does not cancel the underlying operation. */
 async function bounded(promise, label, milliseconds = 15000) {
   let timer
   try {
     return await Promise.race([
       promise,
-      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`Timed out: ${label}`)), milliseconds) })
+      new Promise(/** Rejects with the operation label when the finite wait expires. */ (_, reject) => {
+        timer = setTimeout(/** Leaves the stalled operation identifiable in CI output. */ () => reject(new Error(`Timed out: ${label}`)), milliseconds)
+      })
     ])
   } finally {
     clearTimeout(timer)
   }
 }
 
+/** Separates deliberately induced API errors from unexpected page/network failures. */
 function observeErrors(app, page) {
-  page.on('pageerror', (error) => {
+  page.on('pageerror', /** Accepts only messages explicitly expected by the active browser case. */ (error) => {
     if (app.expectedErrors.has(error.message)) app.diagnostics.push(error.message)
     else app.problems.push(`pageerror: ${error.message}`)
   })
-  page.on('console', (message) => {
+  page.on('console', /** Correlates failed-resource messages with recorded mocked request failures. */ (message) => {
     if (message.type() !== 'error') return
     if (message.text().startsWith('Failed to load resource:') && app.requests.some((request) => request.failed && request.url === message.location().url)) {
       app.diagnostics.push(message.text())
@@ -65,6 +69,10 @@ function observeErrors(app, page) {
   })
 }
 
+/**
+ * Opens an isolated synthetic Cookie jar, mocks API responses and rejects external
+ * requests. Tracks the context immediately so partial setup can still be cleaned up.
+ */
 async function openApp(browser, { session = '', legacy = false, viewport = desktop } = {}) {
   const context = await browser.newContext({ viewport, serviceWorkers: 'block', reducedMotion: 'reduce' })
   contexts.add(context)
@@ -90,14 +98,14 @@ async function openApp(browser, { session = '', legacy = false, viewport = deskt
   }))
 
   observeErrors(app, page)
-  await context.routeWebSocket('**/*', async (socket) => {
+  await context.routeWebSocket('**/*', /** Allows Vite's local socket while reporting unexpected external connections. */ async (socket) => {
     if (new URL(socket.url()).origin === origin.replace('http:', 'ws:')) socket.connectToServer()
     else {
       app.problems.push(`Unexpected external WebSocket: ${socket.url()}`)
       await socket.close()
     }
   })
-  await context.route('**/*', async (route) => {
+  await context.route('**/*', /** Enforces browser credential transport and consumes one-shot synthetic API overrides. */ async (route) => {
     const request = route.request()
     const url = new URL(request.url())
     try {
@@ -133,13 +141,13 @@ async function openApp(browser, { session = '', legacy = false, viewport = deskt
       await route.continue()
     } catch (error) {
       app.problems.push(error.message)
-      await route.abort().catch(() => {})
+      await route.abort().catch(/** The recorded routing failure remains authoritative if abort also fails. */ () => {})
     }
   })
 
   // Seed once on an inert same-origin document, never from a reload-time init script.
   await page.goto(`${origin}/__session_fixture__`)
-  await page.evaluate(({ session, legacy, tokenKeys }) => {
+  await page.evaluate(/** Seeds legacy storage once so reload cannot silently repopulate cleared credentials. */ ({ session, legacy, tokenKeys }) => {
     if (legacy) {
       for (const key of tokenKeys) sessionStorage.setItem(key, session || 'synthetic-legacy-session')
       for (const key of tokenKeys) localStorage.setItem(key, 'synthetic-old-local-copy')
@@ -148,15 +156,17 @@ async function openApp(browser, { session = '', legacy = false, viewport = deskt
   return app
 }
 
+/** Instruments the real store/router to count probes and recovery navigation without replacing auth logic. */
 async function observe(app) {
-  await app.page.evaluate(async () => {
+  await app.page.evaluate(/** Installs per-document observation after each full load or reload. */ async () => {
     const [{ default: router }, { useSessionStore }, { apiFetch }] = await Promise.all([
       import('/src/router/index.ts'), import('/src/stores/session.ts'), import('/src/api/client.ts')
     ])
     window.authProbe = { router, session: useSessionStore(), apiFetch, transitions: [], replacements: [], checkCalls: 0 }
-    window.authProbe.session.$onAction(({ name }) => { if (name === 'check') window.authProbe.checkCalls += 1 })
-    router.afterEach((to, _from, failure) => { if (!failure) window.authProbe.transitions.push(to.fullPath) })
+    window.authProbe.session.$onAction(/** Counts probe attempts, including calls sharing one pending request. */ ({ name }) => { if (name === 'check') window.authProbe.checkCalls += 1 })
+    router.afterEach(/** Counts only completed navigation, not canceled or superseded guards. */ (to, _from, failure) => { if (!failure) window.authProbe.transitions.push(to.fullPath) })
     const replace = router.replace.bind(router)
+    /** Records replacement targets while preserving the real router's returned promise. */
     router.replace = (to) => {
       window.authProbe.replacements.push(router.resolve(to).fullPath)
       return replace(to)
@@ -164,10 +174,11 @@ async function observe(app) {
   })
 }
 
+/** Awaits both browser and router URLs, then disables Logs polling for deterministic requests. */
 async function at(app, path) {
   const expected = new URL(path, origin).href
   await app.page.waitForURL(expected)
-  await app.page.waitForFunction((expected) => new URL(window.authProbe.router.currentRoute.value.fullPath, location.origin).href === expected, expected)
+  await app.page.waitForFunction(/** Waits for the router state as well as the browser URL before asserting a destination. */ (expected) => new URL(window.authProbe.router.currentRoute.value.fullPath, location.origin).href === expected, expected)
   if (new URL(path, origin).pathname === '/logs') {
     // Element Plus puts the switch role on a zero-sized input; click its visible wrapper.
     const toggle = app.page.locator('.logs-actions .el-switch')
@@ -177,20 +188,23 @@ async function at(app, path) {
   }
 }
 
+/** Loads a fresh document and reinstalls observation of its real session/router modules. */
 async function visit(app, path) {
   await app.page.goto(`${origin}${path}`)
   await observe(app)
 }
 
+/** Performs client-side navigation and waits for the canonical internal destination. */
 async function navigate(app, path) {
   await app.page.evaluate((path) => window.authProbe.router.push(path), path)
   await at(app, path)
 }
 
+/** Holds exactly one matching API reply after recording arrival; later requests use normal routing. */
 function hold(app, key, reply) {
   const seen = deferred()
   const release = deferred()
-  app.overrides.set(key, async (request) => {
+  app.overrides.set(key, /** Removes the override before waiting so concurrent follow-up requests are not also held. */ async (request) => {
     app.overrides.delete(key)
     seen.resolve(request)
     await release.promise
@@ -199,8 +213,9 @@ function hold(app, key, reply) {
   return { seen: seen.promise, release: release.resolve }
 }
 
+/** Asserts legacy credentials and synthetic form/request secrets are absent from both storage areas. */
 async function storageClean(app) {
-  const state = await app.page.evaluate(() => ({
+  const state = await app.page.evaluate(/** Snapshots storage and checks that the transient store has no token API. */ () => ({
     hasToken: 'token' in window.authProbe.session || 'setToken' in window.authProbe.session,
     session: { ...sessionStorage }, local: { ...localStorage }
   }))
@@ -214,6 +229,7 @@ async function storageClean(app) {
   }
 }
 
+/** Verifies storage cleanup and the synthetic jar's expected Cookie value and transport attributes. */
 async function sessionIs(app, session) {
   await storageClean(app)
   const cookie = (await app.context.cookies(`${origin}/api/admin/me`)).find((cookie) => cookie.name === cookieName)
@@ -225,21 +241,23 @@ async function sessionIs(app, session) {
   }
 }
 
+/** Reintroduces obsolete stored tokens so subsequent auth operations must clear them again. */
 async function legacyCopies(app) {
-  await app.page.evaluate(({ keys, session }) => {
+  await app.page.evaluate(/** Seeds both legacy key names without modifying the Cookie jar. */ ({ keys, session }) => {
     for (const key of keys) sessionStorage.setItem(key, session)
     for (const key of keys) localStorage.setItem(key, session)
   }, { keys: tokenKeys, session: sessionA })
 }
 
+/** Checks anonymous login state, exact return target and viewport-bounded layout without hidden overflow. */
 async function onLogin(app, redirect) {
   await app.page.locator('.login-card').waitFor()
   const viewport = app.page.viewportSize()
   assert.ok(viewport, 'Login layout requires an explicit browser viewport')
-  const layout = await app.page.evaluate(() => ({
+  const layout = await app.page.evaluate(/** Measures both scroll widths and element bounds instead of relying on screenshot dimensions alone. */ () => ({
     viewport: document.documentElement.clientWidth,
     windowWidth: window.innerWidth,
-    elements: ['html', 'body', '#app', '.login-page', '.login-card'].map((selector) => {
+    elements: ['html', 'body', '#app', '.login-page', '.login-card'].map(/** Requires every layout boundary used by the login overflow regression. */ (selector) => {
       const element = document.querySelector(selector)
       if (!element) throw new Error(`Missing login layout element: ${selector}`)
       const bounds = element.getBoundingClientRect()
@@ -259,6 +277,7 @@ async function onLogin(app, redirect) {
   assert.equal(await app.page.evaluate(() => window.authProbe.session.profile), null)
 }
 
+/** Submits synthetic credentials once, checks pending-state deduplication and verifies the issued Cookie. */
 async function login(app, target, session = sessionB) {
   const attempts = app.requests.filter((request) => request.key === 'POST /api/admin/login').length
   const response = hold(app, 'POST /api/admin/login', loginReply(session))
@@ -277,33 +296,38 @@ async function login(app, target, session = sessionB) {
   assert.equal(app.requests.filter((request) => request.key === 'POST /api/admin/login').length, attempts + 1)
 }
 
+/** Starts real apiFetch calls without waiting for held responses or replaying failed requests. */
 async function startRequests(app, requests) {
-  await app.page.evaluate((requests) => {
+  await app.page.evaluate(/** Keeps every settlement observable while allowing concurrent recovery. */ (requests) => {
     window.authProbe.pending = Promise.allSettled(requests.map(({ path, options }) => window.authProbe.apiFetch(path, options)))
   }, requests.map((request) => typeof request === 'string' ? { path: request } : request))
 }
 
+/** Requires each pending API request to preserve its expected rejection message within a finite wait. */
 async function rejected(app, messages) {
-  const results = await bounded(app.page.evaluate(async () => (await window.authProbe.pending).map((result) => ({
+  const results = await bounded(app.page.evaluate(/** Awaits all original requests so late recovery cannot escape the rejection assertions. */ async () => (await window.authProbe.pending).map((result) => ({
     status: result.status, message: result.status === 'rejected' ? result.reason.message : undefined
   }))), 'request rejection')
   assert.deepEqual(results, messages.map((message) => ({ status: 'rejected', message })))
 }
 
+/** Proves concurrent expiration caused one replacement and one completed login navigation. */
 async function oneExpiry(app) {
-  const counts = await app.page.evaluate(() => ({
+  const counts = await app.page.evaluate(/** Counts navigation effects independently of HTTP request counts. */ () => ({
     replacements: window.authProbe.replacements.length,
     logins: window.authProbe.transitions.filter((path) => path.startsWith('/login?')).length
   }))
   assert.deepEqual(counts, { replacements: 1, logins: 1 })
 }
 
+/** Writes a synthetic full-page PNG only when Actions supplies an artifact directory. */
 async function screenshot(app, name) {
   if (!process.env.ARTIFACT_DIR) return
   await mkdir(process.env.ARTIFACT_DIR, { recursive: true })
   await app.page.screenshot({ path: resolve(process.env.ARTIFACT_DIR, `${name}.png`), fullPage: true })
 }
 
+/** Closes a completed case, releases its tracked context and fails on unexpected browser diagnostics. */
 async function closeApp(app) {
   await bounded(app.context.close(), 'context cleanup', 5000)
   contexts.delete(app.context)
@@ -311,6 +335,7 @@ async function closeApp(app) {
   console.log(`Browser case completed (${app.diagnostics.length} intentional error diagnostics)`)
 }
 
+/** Exercises login, expiry and return navigation on each viewport, retaining screenshots and history behavior. */
 async function roundTrip(browser, viewport, name) {
   const app = await openApp(browser, { viewport })
   const target = '/logs?probe=a%2Bb#row-7'
@@ -323,7 +348,7 @@ async function roundTrip(browser, viewport, name) {
   await navigate(app, '/tokens')
   await navigate(app, target)
   await app.page.locator('.logs-actions button[title="\u5237\u65b0"]:not(.is-loading)').waitFor()
-  await app.page.evaluate(() => { window.authProbe.replacements = []; window.authProbe.transitions = [] })
+  await app.page.evaluate(/** Excludes setup navigation from the single-expiry recovery counts. */ () => { window.authProbe.replacements = []; window.authProbe.transitions = [] })
   await legacyCopies(app)
   app.expectedErrors.add('admin login required')
   const refresh = hold(app, 'GET /api/admin/logs', failure())
@@ -344,6 +369,7 @@ async function roundTrip(browser, viewport, name) {
   await closeApp(app)
 }
 
+/** Requires initial protected-request 401 recovery for JSON, empty and HTML response bodies without replay. */
 async function entryExpiry(browser) {
   for (const reply of [failure(), { status: 401, body: '' }, { status: 401, contentType: 'text/html', body: '<h1>Unauthorized</h1>' }]) {
     const app = await openApp(browser, { session: sessionA })
@@ -366,6 +392,7 @@ async function entryExpiry(browser) {
   }
 }
 
+/** Checks simultaneous and staggered 401 replies share one recovery navigation without replaying requests. */
 async function parallelExpiry(browser) {
   for (const staggered of [false, true]) {
     const app = await openApp(browser, { session: sessionA })
@@ -392,6 +419,7 @@ async function parallelExpiry(browser) {
   }
 }
 
+/** Keeps newer login intact after an old request fails, while still expiring a later current-session request. */
 async function lateResponse(browser) {
   const app = await openApp(browser, { session: sessionA })
   await visit(app, '/providers')
@@ -421,22 +449,25 @@ async function lateResponse(browser) {
   await closeApp(app)
 }
 
+/** Proves recovery starts before error-body parsing and a released old body cannot clear newer auth state. */
 async function bodyRace(browser) {
   const app = await openApp(browser, { session: sessionA })
   await visit(app, '/tokens')
   await app.page.locator('.token-table').waitFor()
   app.overrides.set('GET /api/admin/logs', failure())
   // Split the response headers/body await boundary without replacing apiFetch's auth logic.
-  await app.page.evaluate(() => {
+  await app.page.evaluate(/** Delays only JSON consumption for the marked response while keeping the real fetch path. */ () => {
     const fetch = window.fetch
+    /** Restores fetch after installing the one-shot response-body gate. */
     window.fetch = async (...args) => {
       const response = await fetch(...args)
       if (String(args[0]).includes('probe=body-race')) {
         window.fetch = fetch
         const read = response.json.bind(response)
+        /** Exposes a release gate after headers have already triggered apiFetch recovery. */
         response.json = async () => {
           window.authProbe.bodyStarted = true
-          await new Promise((resolve) => { window.authProbe.releaseBody = resolve })
+          await new Promise(/** Holds body parsing until the newer login has completed. */ (resolve) => { window.authProbe.releaseBody = resolve })
           return read()
         }
       }
@@ -456,6 +487,7 @@ async function bodyRace(browser) {
   await closeApp(app)
 }
 
+/** Treats login 401 as a form error, clears the password on reload and permits one later successful retry. */
 async function wrongPassword(browser) {
   const app = await openApp(browser)
   const target = '/tokens?probe=password#retry'
@@ -478,6 +510,7 @@ async function wrongPassword(browser) {
   await closeApp(app)
 }
 
+/** Preserves session state for non-expiry failures and proves failed search writes are never replayed. */
 async function otherErrors(browser) {
   const app = await openApp(browser, { session: sessionA })
   const target = '/playground?probe=errors#search'
@@ -534,6 +567,7 @@ async function otherErrors(browser) {
   await closeApp(app)
 }
 
+/** Distinguishes confirmed logout from retryable failures while retaining late-request and legacy-storage checks. */
 async function manualLogout(browser) {
   for (const status of [200, 401, 403, 500, 'network']) {
     const app = await openApp(browser, { session: sessionA, legacy: true })
@@ -582,6 +616,7 @@ async function manualLogout(browser) {
   }
 }
 
+/** Waits for a held logout to settle after expiry or reauthentication and verifies only current navigation survives. */
 async function logoutAcrossExpiry(browser) {
   for (const status of [200, 401, 'network']) {
     for (const reauthenticate of [false, true]) {
@@ -589,9 +624,10 @@ async function logoutAcrossExpiry(browser) {
       const target = '/tokens?probe=pending-logout#list'
       await visit(app, target)
       await app.page.locator('.token-table').waitFor()
-      await app.page.evaluate(async () => {
+      await app.page.evaluate(/** Captures the original logout promise so assertions cannot race its late callbacks. */ async () => {
         const { api } = await import('/src/api/client.ts')
         const logout = api.logout
+        /** Instruments one invocation and returns the unmodified API promise to App. */
         api.logout = () => {
           window.authProbe.logoutPending = logout()
           api.logout = logout
@@ -618,7 +654,7 @@ async function logoutAcrossExpiry(browser) {
 
       logout.release()
       // App registered its await first; the unchanged API promise includes response-body parsing.
-      const message = await bounded(app.page.evaluate(async () => {
+      const message = await bounded(app.page.evaluate(/** Waits through body parsing before checking whether newer auth was disturbed. */ async () => {
         if (!window.authProbe.logoutPending) throw new Error('No pending logout was recorded')
         try {
           await window.authProbe.logoutPending
@@ -649,6 +685,7 @@ async function logoutAcrossExpiry(browser) {
   }
 }
 
+/** Checks form submission and authenticated-login guards agree on safe destinations and invalid-target fallback. */
 async function returnTargets(browser) {
   const app = await openApp(browser)
   await visit(app, '/login')
@@ -668,17 +705,18 @@ async function returnTargets(browser) {
   ]
   for (const [redirect, expected] of targets) {
     await app.context.clearCookies()
-    await app.page.evaluate((redirect) => window.authProbe.router.replace({ path: '/login', query: { redirect } }), redirect)
+    await app.page.evaluate(/** Passes raw invalid and valid query values through the actual login guard. */ (redirect) => window.authProbe.router.replace({ path: '/login', query: { redirect } }), redirect)
     await app.page.locator('.login-card').waitFor()
     await login(app, expected)
     // The authenticated-login guard must use the same validation as form submission.
-    await app.page.evaluate((redirect) => window.authProbe.router.push({ path: '/login', query: { redirect } }), redirect)
+    await app.page.evaluate(/** Tests the same raw return target with an already authenticated Cookie. */ (redirect) => window.authProbe.router.push({ path: '/login', query: { redirect } }), redirect)
     await at(app, expected)
     await sessionIs(app, sessionB)
   }
   await closeApp(app)
 }
 
+/** Opens an independent page sharing the existing jar, request fixtures and diagnostic collection. */
 async function newTab(app, path) {
   const page = await app.context.newPage()
   observeErrors(app, page)
@@ -687,12 +725,14 @@ async function newTab(app, path) {
   return tab
 }
 
+/** Requires fresh route probes across tabs/reloads and proves legacy storage cannot replace a deleted Cookie. */
 async function freshTabs(browser) {
   const target = '/tokens?probe=shared#list'
   const app = await openApp(browser, { legacy: true })
   await visit(app, target)
   await onLogin(app, target)
   await login(app, target, sessionA)
+  /** Counts actual /me requests rather than store calls that may share a pending probe. */
   const checks = () => app.requests.filter((request) => request.key === 'GET /api/admin/me').length
   let count = checks()
   const tab = await newTab(app, '/providers')
@@ -741,6 +781,7 @@ async function freshTabs(browser) {
   await closeApp(app)
 }
 
+/** Keeps invalid or failed probes in retryable unknown state at bootstrap and during desktop/mobile navigation. */
 async function probeErrors(browser) {
   const replies = [
     ...[403, 429, 500].map((status) => failure(status, `probe-${status}`)),
@@ -774,10 +815,10 @@ async function probeErrors(browser) {
     await visit(app, '/tokens')
     await app.page.locator('.token-table').waitFor()
     const probe = hold(app, 'GET /api/admin/me', failure(503, 'probe-unavailable'))
-    await app.page.evaluate(() => { window.authProbe.navigation = window.authProbe.router.push('/providers?probe=retry#keys') })
+    await app.page.evaluate(/** Starts navigation without awaiting the deliberately held route-entry probe. */ () => { window.authProbe.navigation = window.authProbe.router.push('/providers?probe=retry#keys') })
     await probe.seen
     probe.release()
-    await app.page.evaluate(() => window.authProbe.navigation)
+    await app.page.evaluate(/** Awaits the failed guard before asserting that the previous page stayed mounted. */ () => window.authProbe.navigation)
     await at(app, '/tokens')
     await app.page.locator('.session-error').getByText('probe-unavailable', { exact: true }).waitFor()
     assert.equal(await app.page.locator('.token-table').count(), 1)
@@ -792,6 +833,7 @@ async function probeErrors(browser) {
   }
 }
 
+/** Checks only pending same-revision probes are reused and stale probe results cannot overwrite newer login. */
 async function pendingProbes(browser) {
   const app = await openApp(browser, { session: sessionA })
   await visit(app, '/tokens')
@@ -799,13 +841,13 @@ async function pendingProbes(browser) {
   const count = app.requests.filter((request) => request.key === 'GET /api/admin/me').length
   const checkCalls = await app.page.evaluate(() => window.authProbe.checkCalls)
   const pending = hold(app, 'GET /api/admin/me', json({ username: credentials.username }))
-  await app.page.evaluate(() => { window.authProbe.firstNavigation = window.authProbe.router.push('/providers') })
+  await app.page.evaluate(/** Starts the first guard whose current-session probe will remain pending. */ () => { window.authProbe.firstNavigation = window.authProbe.router.push('/providers') })
   await pending.seen
-  await app.page.evaluate(() => { window.authProbe.secondNavigation = window.authProbe.router.push('/logs') })
-  await app.page.waitForFunction((minimum) => window.authProbe.checkCalls >= minimum, checkCalls + 2)
+  await app.page.evaluate(/** Supersedes the first destination while its same-revision probe is still reusable. */ () => { window.authProbe.secondNavigation = window.authProbe.router.push('/logs') })
+  await app.page.waitForFunction(/** Requires both guards to request a check before releasing their shared HTTP probe. */ (minimum) => window.authProbe.checkCalls >= minimum, checkCalls + 2)
   assert.equal(app.requests.filter((request) => request.key === 'GET /api/admin/me').length, count + 1)
   pending.release()
-  await app.page.evaluate(() => Promise.all([window.authProbe.firstNavigation, window.authProbe.secondNavigation]))
+  await app.page.evaluate(/** Settles both guards before checking that only the newer destination mounted. */ () => Promise.all([window.authProbe.firstNavigation, window.authProbe.secondNavigation]))
   await at(app, '/logs')
   assert.equal(app.requests.some((request) => request.key === 'GET /api/admin/providers'), false)
   await navigate(app, '/tokens')
@@ -817,11 +859,11 @@ async function pendingProbes(browser) {
     await visit(app, '/tokens')
     await app.page.locator('.token-table').waitFor()
     const old = hold(app, 'GET /api/admin/me', reply)
-    await app.page.evaluate(() => { window.authProbe.oldNavigation = window.authProbe.router.push('/providers') })
+    await app.page.evaluate(/** Captures the guard that will become stale across an auth revision change. */ () => { window.authProbe.oldNavigation = window.authProbe.router.push('/providers') })
     await old.seen
     app.overrides.set('POST /api/admin/login', loginReply(sessionB))
     // Exercise the same in-tab auth-operation boundary while the old guard is pending.
-    await app.page.evaluate(async (credentials) => {
+    await app.page.evaluate(/** Advances the same in-tab revision boundaries as real login while an old guard is pending. */ async (credentials) => {
       const { api } = await import('/src/api/client.ts')
       window.authProbe.session.advanceRevision()
       await api.login(credentials.username, credentials.password)
@@ -830,7 +872,7 @@ async function pendingProbes(browser) {
     }, credentials)
     await at(app, '/tokens?probe=new-session')
     old.release()
-    await app.page.evaluate(() => window.authProbe.oldNavigation)
+    await app.page.evaluate(/** Settles the stale guard before checking the new session and destination survived. */ () => window.authProbe.oldNavigation)
     await at(app, '/tokens?probe=new-session')
     await sessionIs(app, sessionB)
     assert.equal(await app.page.locator('.session-error, .login-card').count(), 0)
@@ -839,6 +881,7 @@ async function pendingProbes(browser) {
   }
 }
 
+/** Preserves the original 401 while an unavailable recovery probe leaves a retryable gate without request replay. */
 async function expiryProbeError(browser) {
   const app = await openApp(browser, { session: sessionA })
   const target = '/tokens?probe=expiry-check#list'
@@ -860,6 +903,7 @@ async function expiryProbeError(browser) {
   await closeApp(app)
 }
 
+/** Ensures a held old request/logout cannot erase another tab's newer Cookie or briefly expose a password form. */
 async function crossTabLateResponses(browser) {
   for (const kind of ['request', 'logout', 'logout-401', 'logout-network']) {
     const app = await openApp(browser, { session: sessionA })
@@ -876,9 +920,9 @@ async function crossTabLateResponses(browser) {
     const tab = await newTab(app, '/login?redirect=%2Fproviders')
     await onLogin(tab, '/providers')
     await login(tab, '/providers')
-    await app.page.evaluate(() => {
+    await app.page.evaluate(/** Records transient login rendering that a final DOM snapshot would miss. */ () => {
       window.authProbe.loginShown = false
-      window.authProbe.loginObserver = new MutationObserver(() => {
+      window.authProbe.loginObserver = new MutationObserver(/** Observes the whole late-response window for an unwanted login form. */ () => {
         if (document.querySelector('.login-card')) window.authProbe.loginShown = true
       })
       window.authProbe.loginObserver.observe(document.body, { childList: true, subtree: true })
@@ -894,7 +938,7 @@ async function crossTabLateResponses(browser) {
       await at(app, '/playground')
       await app.page.locator('.search-input input').waitFor()
     }
-    assert.equal(await app.page.evaluate(() => {
+    assert.equal(await app.page.evaluate(/** Releases the observer before reporting whether login was ever rendered. */ () => {
       window.authProbe.loginObserver.disconnect()
       return window.authProbe.loginShown
     }), false)
@@ -906,91 +950,175 @@ async function crossTabLateResponses(browser) {
   }
 }
 
-async function main() {
-  const frontend = resolve(process.env.FRONTEND_DIR)
-  const server = spawn(process.execPath, [resolve(frontend, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', '4173', '--strictPort'], {
-    cwd: frontend, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, VITE_API_BASE: '', BROWSER: 'none', FORCE_COLOR: '0' }
-  })
+/** Runs every existing browser case in order with its own deadline. */
+async function browserCases(browser) {
+  await bounded(roundTrip(browser, desktop, 'desktop'), 'desktop round trip', 45000)
+  await bounded(roundTrip(browser, mobile, 'mobile'), 'mobile round trip', 45000)
+  await bounded(entryExpiry(browser), 'entry/error-body expiry', 45000)
+  await bounded(parallelExpiry(browser), 'parallel expiry', 45000)
+  await bounded(lateResponse(browser), 'old/new session ordering', 45000)
+  await bounded(bodyRace(browser), 'error-body ordering', 45000)
+  await bounded(wrongPassword(browser), 'wrong password', 45000)
+  await bounded(otherErrors(browser), 'non-expiry errors', 45000)
+  await bounded(manualLogout(browser), 'logout/migration', 60000)
+  await bounded(logoutAcrossExpiry(browser), 'pending logout across expiry', 60000)
+  await bounded(returnTargets(browser), 'return target matrix', 120000)
+  await bounded(freshTabs(browser), 'fresh tabs and Cookie deletion', 60000)
+  await bounded(probeErrors(browser), 'bootstrap and navigation probe errors', 90000)
+  await bounded(pendingProbes(browser), 'pending and stale probes', 60000)
+  await bounded(expiryProbeError(browser), 'expiry probe error ordering', 45000)
+  await bounded(crossTabLateResponses(browser), 'cross-tab late responses', 60000)
+}
+
+/**
+ * Owns Vite/browser startup, diagnostics and bounded teardown for the CI matrix.
+ * Rethrows the original primary value, even when falsy; cleanup-only failures
+ * reject with AggregateError. Injected fixture operations exercise this same
+ * lifecycle without processes or browsers, not a separate arbitration model.
+ */
+async function runBrowserHarness({
+  startServer, chromium, runCases = browserCases, activeContexts = contexts,
+  takeScreenshot = screenshot, processControl = process, wait = bounded, logger = console
+}) {
   let output = ''
+  let server
   let browserServer
   let browser
+  let hasPrimary = false
+  let primaryError
+  const cleanupErrors = []
+  const diagnosticErrors = []
   const ready = deferred()
-  const exited = new Promise((done) => server.once('close', done))
-  const startupError = new Promise((_, reject) => server.once('error', reject))
-  for (const stream of [server.stdout, server.stderr]) stream.on('data', (chunk) => {
+  const exited = deferred()
+  const startupError = deferred()
+  const interrupted = deferred()
+  /** Retains bounded raw startup output while matching ANSI-free readiness. */
+  const onOutput = (chunk) => {
     output = `${output}${chunk}`.slice(-16000)
     if (stripVTControlCharacters(output).includes(`${origin}/`)) ready.resolve()
-  })
-  const interrupted = deferred()
+  }
+  /** Settles the exit wait after Vite and its stdio handles have closed. */
+  const onExit = () => exited.resolve()
+  /** Preserves a spawn error for the startup race without an unhandled rejection. */
+  const onStartupError = (error) => startupError.resolve(error)
+  /** Records an interrupt so the browser matrix rejects through normal teardown. */
   const stop = () => interrupted.resolve()
-  process.once('SIGINT', stop)
-  process.once('SIGTERM', stop)
-  process.once('SIGHUP', stop)
+  /** Signals the detached Vite process group; an already absent group is harmless. */
   const killServer = (signal) => {
     if (!server.pid) return
-    try { process.kill(-server.pid, signal) } catch (error) { if (error.code !== 'ESRCH') throw error }
+    try { processControl.kill(-server.pid, signal) } catch (error) { if (error?.code !== 'ESRCH') throw error }
   }
-  const cleanupErrors = []
+  /** Collects synchronous throws and rejections so later teardown still runs. */
+  async function collect(errors, operation) {
+    try {
+      await operation()
+      return true
+    } catch (error) {
+      errors.push(error)
+      return false
+    }
+  }
+
   try {
-    await bounded(Promise.race([ready.promise, startupError, exited.then(() => { throw new Error(`Vite exited before readiness:\n${output}`) })]), 'Vite readiness', 45000)
+    processControl.once('SIGINT', stop)
+    processControl.once('SIGTERM', stop)
+    processControl.once('SIGHUP', stop)
+    server = startServer()
+    server.once('close', onExit)
+    server.once('error', onStartupError)
+    for (const stream of [server.stdout, server.stderr]) stream.on('data', onOutput)
+    await wait(Promise.race([
+      ready.promise,
+      startupError.promise.then(/** Rethrows the exact error emitted during spawn. */ (error) => { throw error }),
+      exited.promise.then(/** Makes premature Vite exit a primary startup failure. */ () => { throw new Error(`Vite exited before readiness:\n${output}`) })
+    ]), 'Vite readiness', 45000)
     browserServer = await chromium.launchServer({
       headless: true, host: '127.0.0.1', timeout: 30000,
       handleSIGINT: false, handleSIGTERM: false, handleSIGHUP: false
     })
     browser = await chromium.connect(browserServer.wsEndpoint(), { timeout: 30000 })
-    const cases = async () => {
-      await bounded(roundTrip(browser, desktop, 'desktop'), 'desktop round trip', 45000)
-      await bounded(roundTrip(browser, mobile, 'mobile'), 'mobile round trip', 45000)
-      await bounded(entryExpiry(browser), 'entry/error-body expiry', 45000)
-      await bounded(parallelExpiry(browser), 'parallel expiry', 45000)
-      await bounded(lateResponse(browser), 'old/new session ordering', 45000)
-      await bounded(bodyRace(browser), 'error-body ordering', 45000)
-      await bounded(wrongPassword(browser), 'wrong password', 45000)
-      await bounded(otherErrors(browser), 'non-expiry errors', 45000)
-      await bounded(manualLogout(browser), 'logout/migration', 60000)
-      await bounded(logoutAcrossExpiry(browser), 'pending logout across expiry', 60000)
-      await bounded(returnTargets(browser), 'return target matrix', 120000)
-      await bounded(freshTabs(browser), 'fresh tabs and Cookie deletion', 60000)
-      await bounded(probeErrors(browser), 'bootstrap and navigation probe errors', 90000)
-      await bounded(pendingProbes(browser), 'pending and stale probes', 60000)
-      await bounded(expiryProbeError(browser), 'expiry probe error ordering', 45000)
-      await bounded(crossTabLateResponses(browser), 'cross-tab late responses', 60000)
-    }
-    await bounded(Promise.race([cases(), interrupted.promise.then(() => { throw new Error('Browser checks interrupted') })]), 'browser matrix', 360000)
+    await wait(Promise.race([
+      runCases(browser),
+      interrupted.promise.then(/** Converts process signals into the primary matrix failure. */ () => { throw new Error('Browser checks interrupted') })
+    ]), 'browser matrix', 360000)
   } catch (error) {
-    console.error(output)
-    if (browser) for (const context of contexts) {
-      const page = context.pages()[0]
-      if (page && !page.isClosed()) await bounded(screenshot({ page }, 'failure'), 'failure screenshot', 5000).catch(() => {})
+    hasPrimary = true
+    primaryError = error
+    await collect(diagnosticErrors, /** Keeps startup logging from replacing the primary error. */ () => logger.error(output))
+    if (browser) for (const context of activeContexts) {
+      await collect(diagnosticErrors, /** Attempts each failed case's screenshot independently. */ async () => {
+        const page = context.pages()[0]
+        if (page && !page.isClosed()) await wait(takeScreenshot({ page }, 'failure'), 'failure screenshot', 5000)
+      })
     }
-    throw error
-  } finally {
-    for (const context of contexts) {
-      await bounded(context.close(), 'context cleanup', 5000).catch((error) => cleanupErrors.push(error))
-    }
-    if (browser) await bounded(browser.close(), 'browser disconnect', 5000).catch((error) => cleanupErrors.push(error))
-    if (browserServer) {
-      try {
-        await bounded(browserServer.close(), 'browser process cleanup', 5000)
-      } catch (error) {
-        cleanupErrors.push(error)
-        await bounded(browserServer.kill(), 'browser process kill', 5000).catch((error) => cleanupErrors.push(error))
-      }
-    }
-    killServer('SIGTERM')
-    try {
-      await bounded(exited, 'Vite cleanup', 5000)
-    } catch {
-      killServer('SIGKILL')
-      await bounded(exited, 'Vite kill', 5000).catch((error) => cleanupErrors.push(error))
-    }
-    process.removeListener('SIGINT', stop)
-    process.removeListener('SIGTERM', stop)
-    process.removeListener('SIGHUP', stop)
-    if (cleanupErrors.length) throw new AggregateError(cleanupErrors, 'Browser/server cleanup failed')
   }
-  console.log('Admin session expiry browser matrix passed')
+
+  for (const context of activeContexts) {
+    await collect(cleanupErrors, /** Includes a synchronous context.close failure in the aggregate. */ () => wait(context.close(), 'context cleanup', 5000))
+  }
+  if (browser) await collect(cleanupErrors, /** Disconnects the client even if a context failed to close. */ () => wait(browser.close(), 'browser disconnect', 5000))
+  if (browserServer) {
+    const closed = await collect(cleanupErrors, /** Bounds graceful browser-process teardown. */ () => wait(browserServer.close(), 'browser process cleanup', 5000))
+    if (!closed) {
+      await collect(cleanupErrors, /** Retains forced browser termination after close failure. */ () => wait(browserServer.kill(), 'browser process kill', 5000))
+    }
+  }
+  if (server) {
+    await collect(cleanupErrors, /** Signal failures must not skip the exit wait or forced kill. */ () => killServer('SIGTERM'))
+    try {
+      await wait(exited.promise, 'Vite cleanup', 5000)
+    } catch {
+      await collect(cleanupErrors, /** Attempts SIGKILL even if SIGTERM failed synchronously. */ () => killServer('SIGKILL'))
+      await collect(cleanupErrors, /** A failed forced-exit wait leaves cleanup incomplete. */ () => wait(exited.promise, 'Vite kill', 5000))
+    }
+    for (const stream of [server.stdout, server.stderr]) {
+      await collect(cleanupErrors, /** Releases output observers after both exit attempts. */ () => stream.removeListener('data', onOutput))
+    }
+    await collect(cleanupErrors, /** Releases the one-shot exit observer even after incomplete cleanup. */ () => server.removeListener('close', onExit))
+    await collect(cleanupErrors, /** Releases the startup-error observer after process teardown. */ () => server.removeListener('error', onStartupError))
+  }
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    await collect(cleanupErrors, /** Attempts every signal-listener removal independently. */ () => processControl.removeListener(signal, stop))
+  }
+
+  if (hasPrimary) {
+    if (cleanupErrors.length) {
+      await collect(diagnosticErrors, /** Reports cleanup separately without changing failure precedence. */ () => {
+        return logger.error(new AggregateError(cleanupErrors, 'Browser/server cleanup failed'))
+      })
+    }
+    if (diagnosticErrors.length) {
+      await collect([], /** Diagnostic reporting itself remains best effort. */ () => {
+        return logger.error(new AggregateError(diagnosticErrors, 'Browser failure diagnostics failed'))
+      })
+    }
+    throw primaryError
+  }
+  if (cleanupErrors.length) throw new AggregateError(cleanupErrors, 'Browser/server cleanup failed')
+  logger.log('Admin session expiry browser matrix passed')
 }
 
-main().catch((error) => { console.error(error); process.exit(1) })
+/** Loads real browser dependencies only for the Actions CLI entry point. */
+async function main() {
+  assert.ok(process.env.FRONTEND_DIR, 'FRONTEND_DIR is required')
+  assert.equal(process.env.VITE_API_BASE, '', 'Browser fixtures require an empty VITE_API_BASE')
+  const { chromium } = require('playwright')
+  const frontend = resolve(process.env.FRONTEND_DIR)
+  await runBrowserHarness({
+    chromium,
+    /** Starts Vite in a detached group so teardown can reach its descendants. */
+    startServer: () => spawn(process.execPath, [resolve(frontend, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', '4173', '--strictPort'], {
+      cwd: frontend, detached: true, stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, VITE_API_BASE: '', BROWSER: 'none', FORCE_COLOR: '0' }
+    })
+  })
+}
+
+module.exports = { runBrowserHarness }
+
+if (require.main === module) {
+  main().catch(/** Prints the selected primary or cleanup failure and exits nonzero. */ (error) => {
+    try { console.error(error) } catch { /* A broken diagnostic sink must not prevent failure exit. */ }
+    process.exit(1)
+  })
+}

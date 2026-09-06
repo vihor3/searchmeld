@@ -13,6 +13,9 @@ import (
 	"github.com/vihor3/searchmeld/backend/internal/model"
 )
 
+// TestMountedExtractRejections preserves denial envelopes and redacted logs even
+// when persistence fails. Rejected Extract requests do not mark Token usage;
+// a later authenticated Search still counts once.
 func TestMountedExtractRejections(t *testing.T) {
 	for _, transport := range []struct {
 		path         string
