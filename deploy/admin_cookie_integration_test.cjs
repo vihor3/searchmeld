@@ -880,8 +880,8 @@ async function lockoutDespiteSpoofing(fixture) {
 /**
  * Exercises shared/separate jars, Cookie deletion/revocation, stale replies and
  * restart with the original browser origin and jar. External DB identity and
- * installed credentials must persist; contexts and fixture containers are closed
- * on success, with tracked resources left to suite cleanup on failure.
+ * installed credentials must persist; contexts close on success, while the caller
+ * owns browser/container teardown. Tracked resources remain for failure cleanup.
  */
 async function exercise(fixture) {
   const context = await openContext(fixture)
@@ -993,8 +993,6 @@ async function exercise(fixture) {
   assert.deepEqual(fixture.problems, [], 'Unexpected browser/fixture errors')
   await context.close()
   contexts.delete(context)
-  await removeFixture(fixture)
-  console.log(`Packaged ${fixture.label} Cookie, shared-tab, CSRF, Key, removed-route and stale-response cases completed`)
 }
 
 /**
@@ -1047,8 +1045,9 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 }
 
 /**
- * Generates runner-local TLS material and runs the HTTP/HTTPS suites under a
- * watchdog, attempting masked failure PNGs before final tracked-resource cleanup.
+ * Generates runner-local TLS material and runs each HTTP/HTTPS suite under a
+ * watchdog. Each browser starts after fixture startup and closes before removal;
+ * failures retain tracked resources for masked PNGs and final cleanup.
  */
 async function main() {
   const watchdog = setTimeout(() => process.kill(process.pid, 'SIGTERM'), 9 * 60 * 1000)
@@ -1060,10 +1059,16 @@ async function main() {
       '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1',
       '-keyout', join(temporary, 'tls.key'), '-out', join(temporary, 'tls.crt')], { timeout: 30000 })
     const tls = { key: await readFile(join(temporary, 'tls.key')), cert: await readFile(join(temporary, 'tls.crt')) }
-    browser = await chromium.launch({ headless: true })
     for (const mode of ['http', 'https']) {
       fixture = await startFixture(mode, tls)
+      // Keep Chromium outside fixture network setup/removal, but retain this
+      // browser and its Cookie jars through the app restart inside exercise.
+      browser = await chromium.launch({ headless: true })
       await exercise(fixture)
+      await bounded(browser.close(), 'browser cleanup', 5000)
+      browser = undefined
+      await removeFixture(fixture)
+      console.log(`Packaged ${fixture.label} Cookie, shared-tab, CSRF, Key, removed-route and stale-response cases completed`)
     }
   } catch (error) {
     for (const [index, page] of (fixture?.pages || []).entries()) {
