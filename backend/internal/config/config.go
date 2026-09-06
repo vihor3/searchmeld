@@ -39,6 +39,9 @@ type Config struct {
 	AdminLoginLockout       time.Duration
 }
 
+// Load applies environment files without overwriting inherited variables, reads
+// defaults, and returns the Config with its validation error. A supplied admin
+// public origin is normalized; origin errors do not echo the supplied value.
 func Load() (Config, error) {
 	loadEnvFiles()
 	appEnv := getString("APP_ENV", "development")
@@ -85,6 +88,9 @@ func Load() (Config, error) {
 	return cfg, cfg.Validate()
 }
 
+// Validate checks the admin username, positive session TTL, optional HTTP(S)
+// origin and production secret requirements without mutating the Config.
+// An empty password is allowed; account existence is not checked here.
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.AdminUsername) == "" {
 		return fmt.Errorf("ADMIN_USERNAME is required")

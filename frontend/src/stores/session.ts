@@ -4,6 +4,7 @@ import type { AdminProfile } from '../api/client'
 
 const STORAGE_KEYS = ['searchmeld-admin-token', 'one-search-admin-token']
 
+/** Best-effort removal of current/legacy stored tokens; storage never supplies authentication. */
 function removeStoredCredentials() {
   for (const name of ['sessionStorage', 'localStorage'] as const) {
     try {
@@ -19,6 +20,10 @@ interface SessionCheck {
   status: 'authenticated' | 'anonymous' | 'error'
 }
 
+/**
+ * Hold transient per-tab probe and UI state, removing obsolete stored credentials.
+ * The server validates the Cookie for access; profile presence is not authority.
+ */
 export const useSessionStore = defineStore('session', () => {
   removeStoredCredentials()
   const revision = ref(0)
@@ -28,6 +33,10 @@ export const useSessionStore = defineStore('session', () => {
   const retryTarget = ref('')
   let pending: { revision: number; promise: Promise<SessionCheck> } | null = null
 
+  /**
+   * Start a new in-tab auth revision, forgetting pending checks and retry UI.
+   * Existing I/O and the displayed profile remain; late completions must compare revisions.
+   */
   function advanceRevision() {
     revision.value += 1
     pending = null
@@ -38,6 +47,11 @@ export const useSessionStore = defineStore('session', () => {
     return revision.value
   }
 
+  /**
+   * Share only a pending same-revision probe, never a settled authorization result.
+   * Return revision-tagged status even when superseded; only current work updates
+   * profile/error UI. A null profile means anonymous; reader failures become error status.
+   */
   function check(readProfile: () => Promise<AdminProfile | null>): Promise<SessionCheck> {
     if (pending?.revision === revision.value) return pending.promise
     const checkRevision = revision.value
@@ -45,6 +59,7 @@ export const useSessionStore = defineStore('session', () => {
     error.value = ''
     retryTarget.value = ''
     removeStoredCredentials()
+    /** Settle a revision-tagged probe without overwriting newer UI or clearing its pending slot. */
     const promise = (async (): Promise<SessionCheck> => {
       try {
         const currentProfile = await readProfile()

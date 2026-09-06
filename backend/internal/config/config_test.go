@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+// TestNormalizeHTTPOrigin covers canonical host/IP/port forms and rejects malformed
+// authorities or URL components outside the shared origin contract.
 func TestNormalizeHTTPOrigin(t *testing.T) {
 	for _, test := range []struct {
 		input string
@@ -52,6 +54,8 @@ func TestNormalizeHTTPOrigin(t *testing.T) {
 	}
 }
 
+// TestLoadAdminPublicOrigin checks env trimming/normalization, unchanged session
+// TTL, and setting-specific origin errors that omit supplied credentials.
 func TestLoadAdminPublicOrigin(t *testing.T) {
 	t.Setenv("APP_ENV", "development")
 	t.Setenv("ADMIN_USERNAME", "admin")
@@ -85,6 +89,8 @@ func TestLoadAdminPublicOrigin(t *testing.T) {
 	}
 }
 
+// TestValidateAdminPublicOrigin checks optional origins on manually built Config
+// values, including rejection of an explicitly empty query.
 func TestValidateAdminPublicOrigin(t *testing.T) {
 	cfg := Config{AdminUsername: "admin", AdminSessionTTL: time.Hour}
 	for _, origin := range []string{"", "https://admin.example", "http://localhost:18080/"} {

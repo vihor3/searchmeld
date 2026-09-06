@@ -14,6 +14,9 @@ type Server struct {
 	healthy func() bool
 }
 
+// NewServer wires request identity and peer handling before route middleware,
+// placing the admin policy ahead of public CORS. It registers health checks
+// without starting a listener; application routes must be mounted separately.
 func NewServer(cfg config.Config, log requestLogger) *Server {
 	server := &Server{cfg: cfg, log: log, healthy: func() bool { return true }}
 	r := chi.NewRouter()

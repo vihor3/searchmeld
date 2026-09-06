@@ -19,6 +19,8 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// TestConnectRequiresSuccessfulPing checks that Connect returns no pool and
+// preserves context.Canceled when the integration startup context is canceled.
 func TestConnectRequiresSuccessfulPing(t *testing.T) {
 	databaseURL := os.Getenv("SEARCHMELD_TEST_DATABASE_URL")
 	if databaseURL == "" {
@@ -36,6 +38,8 @@ func TestConnectRequiresSuccessfulPing(t *testing.T) {
 	}
 }
 
+// TestPGXAdminCredentialsAndNoRows checks missing-row semantics, idempotent admin
+// creation, and API-key lookup/rotation across migration replay in a fresh schema.
 func TestPGXAdminCredentialsAndNoRows(t *testing.T) {
 	ctx, store := newPGXIntegrationStore(t)
 	username := `pgx-admin ' $1 \\`
@@ -91,6 +95,8 @@ func TestPGXAdminCredentialsAndNoRows(t *testing.T) {
 	}
 }
 
+// TestPGXTokenArraysAndNullableTimes exercises escaped arrays, NULL-to-used
+// timestamps, zero limits, secret reveal/list separation, and disabled-token lookup.
 func TestPGXTokenArraysAndNullableTimes(t *testing.T) {
 	ctx, store := newPGXIntegrationStore(t)
 	scopes := []string{"search", "extract", `scope,with"quotes\\`, "NULL"}
@@ -138,6 +144,8 @@ func TestPGXTokenArraysAndNullableTimes(t *testing.T) {
 	}
 }
 
+// TestPGXProviderKeyNullableQuota checks secret round trips and distinguishes NULL,
+// zero, and fractional quotas through partial updates and key-use accounting.
 func TestPGXProviderKeyNullableQuota(t *testing.T) {
 	ctx, store := newPGXIntegrationStore(t)
 	key, err := store.CreateProviderKey(ctx, model.ProviderExa, "pgx-key", "synthetic-provider-secret", "fixture-key-id", "synthetic-service-secret", 3, 11, 19, 31, 2)
@@ -207,6 +215,8 @@ func TestPGXProviderKeyNullableQuota(t *testing.T) {
 	}
 }
 
+// TestPGXSettingsCacheAndAuditJSON exercises settings and nested JSONB round trips,
+// cache miss/update/expiry, and audit timestamps in an isolated schema.
 func TestPGXSettingsCacheAndAuditJSON(t *testing.T) {
 	ctx, store := newPGXIntegrationStore(t)
 	settings, err := store.RuntimeSettings(ctx)
@@ -256,6 +266,9 @@ func TestPGXSettingsCacheAndAuditJSON(t *testing.T) {
 	}
 }
 
+// TestPGXRequestAccountingAndRollback checks fractional usage aggregation, rollback
+// after a later provider-call constraint failure, and totals retained when deleting
+// a token.
 func TestPGXRequestAccountingAndRollback(t *testing.T) {
 	ctx, store := newPGXIntegrationStore(t)
 	token, _, err := store.CreateAPIToken(ctx, "pgx-accounting", []string{"search"}, []string{}, 0, 0, 0)
@@ -351,8 +364,11 @@ func TestPGXRequestAccountingAndRollback(t *testing.T) {
 	}
 }
 
+// newPGXIntegrationStore returns a freshly migrated store with a synthetic key.
 // Each fixture owns a schema so singleton settings/keys and NULL-token totals
 // cannot leak into another test sharing the disposable CI database.
+// It skips without SEARCHMELD_TEST_DATABASE_URL and registers pool/schema cleanup,
+// with a fresh timeout for schema removal. This is not a historical-upgrade fixture.
 func newPGXIntegrationStore(t *testing.T) (context.Context, *Store) {
 	t.Helper()
 	databaseURL := os.Getenv("SEARCHMELD_TEST_DATABASE_URL")
@@ -396,6 +412,8 @@ func newPGXIntegrationStore(t *testing.T) (context.Context, *Store) {
 	return ctx, NewStore(pool, security.NewCrypto("pgx-integration-fixture"))
 }
 
+// assertPGXJSONEqual compares decoded values so JSONB representation changes do
+// not fail the fixture, without printing differing payloads in diagnostics.
 func assertPGXJSONEqual(t *testing.T, got, want []byte) {
 	t.Helper()
 	var gotValue, wantValue interface{}

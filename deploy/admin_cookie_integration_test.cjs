@@ -46,23 +46,27 @@ const operations = new AbortController()
 let browser
 let cleanupPromise
 
+/** Registers nonempty synthetic credentials for diagnostic redaction and returns the value unchanged. */
 function secret(value) {
   if (value) secrets.add(value)
   return value
 }
 
+/** Masks registered credential strings in diagnostics; unregistered values are not scrubbed. */
 function redact(value) {
   let text = String(value)
   for (const value of secrets) text = text.replaceAll(value, '[redacted]')
   return text
 }
 
+/** Exposes a resolver for coordinating response capture, release and delivery between fixture actions. */
 function deferred() {
   let resolve
   const promise = new Promise((done) => { resolve = done })
   return { promise, resolve }
 }
 
+/** Limits the wait and clears its timer; a timeout does not cancel the underlying operation. */
 async function bounded(promise, label, milliseconds = 15000) {
   let timer
   try {
@@ -75,6 +79,10 @@ async function bounded(promise, label, milliseconds = 15000) {
   }
 }
 
+/**
+ * Runs the Docker CLI with process/output limits and trims stdout. Cleanup
+ * commands bypass the shared abort signal; aborting the CLI is not container removal.
+ */
 async function docker(args, { timeout = 90000, cleanup = false } = {}) {
   const { stdout } = await execute('docker', args, {
     timeout, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024, signal: cleanup ? undefined : operations.signal
@@ -82,6 +90,7 @@ async function docker(args, { timeout = 90000, cleanup = false } = {}) {
   return stdout.trim()
 }
 
+/** Reads only lifecycle fields and port bindings, excluding environment, health output and application logs. */
 async function inspectContainer(name) {
   // Never inspect Env, State.Health.Log or application logs: only lifecycle
   // status and published bindings are needed to diagnose this fixture.
@@ -92,10 +101,15 @@ async function inspectContainer(name) {
   return JSON.parse(stdout)
 }
 
+/** Reduces request failures to a short uppercase code without exposing arbitrary error messages. */
 function requestErrorCode(error) {
   return typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(error.code) ? error.code : 'REQUEST_FAILED'
 }
 
+/**
+ * Sends loopback-only JSON requests with timed aborts and a 4 MiB reply cap.
+ * Self-signed TLS is accepted for this synthetic fixture, not as production policy.
+ */
 function request(origin, path, { method = 'GET', headers = {}, body, timeout = 10000 } = {}) {
   const url = new URL(path, origin)
   assert.equal(url.hostname, '127.0.0.1', 'Fixtures must not contact external services')
@@ -122,6 +136,7 @@ function request(origin, path, { method = 'GET', headers = {}, body, timeout = 1
   })
 }
 
+/** Asserts admin status/no-store headers and forbids Set-Cookie unless the caller marks a login reply. */
 function adminReply(reply, status, label, { login = false } = {}) {
   assert.equal(reply.status, status, label)
   assert.equal(reply.headers['cache-control'], 'no-store', `${label}: no-store`)
@@ -130,6 +145,10 @@ function adminReply(reply, status, label, { login = false } = {}) {
   return reply
 }
 
+/**
+ * Reports restricted app/database state and caller-supplied probe summaries,
+ * without querying Env, health logs or application logs.
+ */
 async function healthDiagnostics(fixture, phase, lastHealthError) {
   let state
   try {
@@ -150,6 +169,10 @@ async function healthDiagnostics(fixture, phase, lastHealthError) {
   })}`)
 }
 
+/**
+ * Refreshes the Docker upstream without changing the browser origin, then polls
+ * health on a 120-second deadline and emits restricted diagnostics on failure.
+ */
 async function waitHealthy(fixture, phase) {
   let lastHealthError = { error: 'NOT_PROBED' }
   try {
@@ -185,6 +208,7 @@ async function waitHealthy(fixture, phase) {
   }
 }
 
+/** Tracks a loopback listener for suite cleanup, bounds its startup wait and sets request/socket timeouts. */
 async function listen(server) {
   servers.add(server)
   server.requestTimeout = 15000
@@ -199,10 +223,15 @@ async function listen(server) {
   return server.address().port
 }
 
+/** Writes synthetic environment values with owner-only creation permissions; suite cleanup removes the directory. */
 async function writeEnvironment(path, environment) {
   await writeFile(path, Object.entries(environment).map(([key, value]) => `${key}=${value}\n`).join(''), { mode: 0o600 })
 }
 
+/**
+ * Tracks an internal-network PostgreSQL fixture without host bindings, installs
+ * its synthetic DSN in the app environment and polls TCP readiness on a 60-second deadline.
+ */
 async function startExternalDatabase(fixture, environment) {
   fixture.database = { name: `${fixture.name}-postgres`, network: `${fixture.name}-network` }
   const { name, network } = fixture.database
@@ -241,6 +270,10 @@ async function startExternalDatabase(fixture, environment) {
   throw new Error('External PostgreSQL did not become ready within 60 seconds')
 }
 
+/**
+ * Records external container/postmaster identities and asserts one persisted
+ * account, Key and Token for restart comparisons; embedded mode returns null.
+ */
 async function externalDatabaseSnapshot(fixture) {
   if (!fixture.database) return null
   const state = await inspectContainer(fixture.database.name)
@@ -259,6 +292,10 @@ async function externalDatabaseSnapshot(fixture) {
   return { id: state.id, started_at: state.started_at, restart_count: state.restart_count, database: snapshot }
 }
 
+/**
+ * Removes this fixture's app, optional database, anonymous volumes and network,
+ * forgetting each only after success. Listeners remain owned by suite cleanup.
+ */
 async function removeFixture(fixture) {
   await docker(['rm', '--force', '--volumes', fixture.name], { timeout: 10000 })
   containers.delete(fixture.name)
@@ -270,12 +307,21 @@ async function removeFixture(fixture) {
   }
 }
 
+/**
+ * Starts a synthetic-credential packaged instance behind a stable HTTP/HTTPS
+ * origin. HTTPS first tests missing public-origin rejection, then configured
+ * proxy access; created Docker resources and listeners stay tracked for cleanup.
+ */
 async function startFixture(mode, tls) {
   const fixture = { mode, label: `${databaseMode}-${mode}`, name: `${prefix}-${mode}`, problems: [], observations: [], pages: [], pendingObservations: [] }
   fixture.credentials = { username: 'ci-cookie-operator', password: secret(randomBytes(24).toString('hex')) }
   // Keep the browser's actual listening origin alive across container restarts.
   // Docker's dynamically published upstream is re-inspected after every start;
   // all traffic still traverses the built assets and bundled Nginx -> Go.
+  /**
+   * Preserves Host/port while targeting the current Docker binding. HTTPS
+   * sanitizes proxy headers; HTTP retains spoof inputs for bundled Nginx tests.
+   */
   const forward = (req, res) => {
     if (!fixture.upstream) { res.writeHead(503).end(); return }
     const headers = { ...req.headers, host: req.headers.host }
@@ -351,6 +397,7 @@ async function startFixture(mode, tls) {
     }
   }
 
+  /** Serves a synthetic page on another port of the same Cookie host for browser Origin/proof tests. */
   const hostileHandler = (_req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html', 'Cache-Control': 'no-store' })
     res.end('<!doctype html><title>Synthetic same-site origin</title><p>CI origin fixture</p>')
@@ -360,6 +407,11 @@ async function startFixture(mode, tls) {
   return fixture
 }
 
+/**
+ * Tracks an isolated Cookie jar with fixture-only routing, credential-presence
+ * observations and redacted page errors. The TLS exception is fixture-only;
+ * callers or suite cleanup close the context.
+ */
 async function openContext(fixture, viewport = desktop) {
   const context = await browser.newContext({ viewport, ignoreHTTPSErrors: true, serviceWorkers: 'block', reducedMotion: 'reduce' })
   contexts.add(context)
@@ -393,6 +445,10 @@ async function openContext(fixture, viewport = desktop) {
   return context
 }
 
+/**
+ * Uses real page Cookie/CORS handling for a credentialed fetch. Fetch failures,
+ * including but not limited to CORS rejection, return a blocked marker.
+ */
 async function browserRequest(page, url, { method = 'GET', headers = proof, body } = {}) {
   return page.evaluate(async ({ url, method, headers, body }) => {
     try {
@@ -407,6 +463,7 @@ async function browserRequest(page, url, { method = 'GET', headers = proof, body
   }, { url, method, headers, body })
 }
 
+/** Checks the login return target and absence of the protected shell once the login card appears. */
 async function atLogin(page, redirect = target) {
   await page.locator('.login-card').waitFor()
   const url = new URL(page.url())
@@ -415,6 +472,7 @@ async function atLogin(page, redirect = target) {
   assert.equal(await page.locator('.app-shell').count(), 0, 'Protected shell must not mount anonymously')
 }
 
+/** Waits for the destination and protected view, asserting that no login card remains mounted. */
 async function atProtected(page, fixture, path = target) {
   await page.waitForURL(new URL(path, fixture.origin).href)
   await page.locator('.app-shell').waitFor()
@@ -422,6 +480,11 @@ async function atProtected(page, fixture, path = target) {
   assert.equal(await page.locator('.login-card').count(), 0)
 }
 
+/**
+ * Registers the sole admin Cookie for redaction before asserting its host, path,
+ * HttpOnly/SameSite, protocol-dependent Secure and browser-session lifetime flags,
+ * then returns it for subsequent session checks.
+ */
 async function currentCookie(context, fixture) {
   const cookies = (await context.cookies(`${fixture.origin}/api/admin/me`)).filter((cookie) => cookie.name === cookieName)
   assert.equal(cookies.length, 1, 'One shared admin Cookie')
@@ -436,6 +499,11 @@ async function currentCookie(context, fixture) {
   return cookie
 }
 
+/**
+ * Submits synthetic account credentials through the UI. The wrong-password case
+ * must stay on the login form; success returns the Cookie after expiry-only JSON
+ * and protected-route checks.
+ */
 async function login(page, fixture, { wrongPassword = false } = {}) {
   const inputs = page.locator('.login-card input')
   await inputs.nth(0).fill(fixture.credentials.username)
@@ -463,6 +531,10 @@ async function login(page, fixture, { wrongPassword = false } = {}) {
   return cookie
 }
 
+/**
+ * Asserts legacy keys are absent and registered credentials do not appear in
+ * snapshots of sessionStorage, localStorage or document.cookie.
+ */
 async function storageIsClean(page) {
   const state = await page.evaluate(() => ({ session: { ...sessionStorage }, local: { ...localStorage }, visibleCookies: document.cookie }))
   for (const key of tokenKeys) {
@@ -473,6 +545,7 @@ async function storageIsClean(page) {
   assert.ok(!state.visibleCookies.includes(`${cookieName}=`), 'Admin Cookie must remain HttpOnly')
 }
 
+/** Writes a synthetic full-page PNG while masking known credential-bearing controls and code elements. */
 async function screenshot(page, name) {
   await mkdir(artifacts, { recursive: true })
   await page.screenshot({
@@ -481,12 +554,14 @@ async function screenshot(page, name) {
   })
 }
 
+/** Probes live server session state through the page's Cookie/proof path and checks admin response policy. */
 async function me(page, fixture, status = 200) {
   const reply = await browserRequest(page, `${fixture.origin}/api/admin/me`)
   adminReply(reply, status, 'browser me')
   if (status === 200) assert.equal(typeof JSON.parse(reply.body).username, 'string')
 }
 
+/** Checks accepted credentials reach empty-query validation before provider work; admission may still count usage. */
 async function searchValidation(fixture, headers, label) {
   // Empty input reaches the retained business handler but returns before
   // orchestration, so an accepted Key/Token cannot spend upstream credits.
@@ -497,7 +572,12 @@ async function searchValidation(fixture, headers, label) {
   assert.equal(body.error.message, 'query is required', `${label}: reached the search handler`)
 }
 
+/**
+ * Checks removed public routes across credentials and persisted auth-on/off modes,
+ * asserts admin equivalents remain protected and restores initial settings in finally.
+ */
 async function removedPublicEndpoints(fixture, cookieHeaders, { key, token, session }) {
+  /** Pins settings requests to the authenticated Cookie/proof headers while business auth mode changes. */
   const admin = (path, options = {}) => request(fixture.origin, path, { ...options, headers: cookieHeaders })
   const settings = JSON.parse(adminReply(await admin('/api/admin/settings'), 200, 'Read effective business auth setting').body)
   assert.equal(settings.api_auth_required, true, 'Fixture business auth must initially be enabled in the database')
@@ -548,9 +628,15 @@ async function removedPublicEndpoints(fixture, cookieHeaders, { key, token, sess
   assert.equal(restored.api_auth_required, true)
 }
 
+/**
+ * Provisions synthetic Key/Token credentials and tests header precedence,
+ * Cookie exclusion from business/MCP auth, browser proof and Origin policy,
+ * including same-host cross-port requests. Returns credentials for restart checks.
+ */
 async function authBoundaries(fixture, page) {
   const cookie = await currentCookie(page.context(), fixture)
   const cookieHeaders = { ...proof, Cookie: `${cookieName}=${cookie.value}`, Origin: fixture.origin }
+  /** Overlays case-specific headers on a valid Cookie/proof baseline to test credential and Origin rejection. */
   const admin = (path, options = {}) => request(fixture.origin, path, { ...options, headers: { ...cookieHeaders, ...options.headers } })
   const rotation = adminReply(await admin('/api/admin/settings/admin-api-key', { method: 'POST' }), 201, 'first Key provisioning')
   const key = secret(JSON.parse(rotation.body).key)
@@ -674,6 +760,11 @@ async function authBoundaries(fixture, page) {
   return { key, token }
 }
 
+/**
+ * Captures one real reply per path, delaying delivery rather than server
+ * authentication. Callers own release(), which unroutes the hold; suite cleanup
+ * resolves outstanding release gates before closing browser resources.
+ */
 async function holdResponses(fixture, page, paths, status) {
   const arrived = deferred()
   const released = deferred()
@@ -683,7 +774,12 @@ async function holdResponses(fixture, page, paths, status) {
   let completed = 0
   let failure
   gates.add(released)
+  /** Selects endpoint pathnames; the handler's remaining set limits each to one captured reply. */
   const matcher = (url) => paths.includes(url.pathname)
+  /**
+   * Fetches before awaiting release, fulfilling and disposing the reply on success;
+   * capture/delivery failures are recorded and route abort is attempted.
+   */
   const handler = async (route) => {
     const path = new URL(route.request().url()).pathname
     if (!remaining.delete(path)) { await route.continue(); return }
@@ -708,7 +804,9 @@ async function holdResponses(fixture, page, paths, status) {
   }
   await page.route(matcher, handler)
   return {
+    /** Waits for all captures or a saved failure within the bound, without canceling outstanding fetches. */
     async wait() { await bounded(arrived.promise, 'real response capture'); if (failure) throw failure },
+    /** Releases replies, waits for handlers, then removes the gate/route and reports saved failures. */
     async release() {
       released.resolve()
       await bounded(settled.promise, 'held response delivery')
@@ -719,10 +817,15 @@ async function holdResponses(fixture, page, paths, status) {
   }
 }
 
+/** Triggers the visible providers toolbar refresh to exercise its request and loading lifecycle. */
 async function refresh(page) {
   await page.locator('.page-actions .el-button[title="\u5237\u65b0"]').click()
 }
 
+/**
+ * Holds old-session 401/logout replies while a same-jar page logs in again, then
+ * awaits action settlement and server probes before checking the newer Cookie survives.
+ */
 async function staleResponses(fixture, first, second) {
   for (const kind of ['401', 'logout']) {
     const old = await currentCookie(first.context(), fixture)
@@ -754,6 +857,7 @@ async function staleResponses(fixture, first, second) {
   }
 }
 
+/** Checks forged forwarding headers cannot reset one nonexistent account's lockout, without locking the shared account. */
 async function lockoutDespiteSpoofing(fixture) {
   // Run last, and use a different nonexistent username so the shared account's
   // successful-login and restart cases can never inherit the lockout bucket.
@@ -773,6 +877,12 @@ async function lockoutDespiteSpoofing(fixture) {
   }
 }
 
+/**
+ * Exercises shared/separate jars, Cookie deletion/revocation, stale replies and
+ * restart with the original browser origin and jar. External DB identity and
+ * installed credentials must persist; contexts and fixture containers are closed
+ * on success, with tracked resources left to suite cleanup on failure.
+ */
 async function exercise(fixture) {
   const context = await openContext(fixture)
   const first = await context.newPage()
@@ -887,11 +997,18 @@ async function exercise(fixture) {
   console.log(`Packaged ${fixture.label} Cookie, shared-tab, CSRF, Key, removed-route and stale-response cases completed`)
 }
 
+/**
+ * Coalesces teardown: aborts normal Docker CLI operations, releases gates and
+ * closes tracked contexts/browser/listeners. Attempts removal of tracked containers
+ * with anonymous volumes, tracked networks and the fixture temporary directory.
+ * Failed steps mark a nonzero exit; timing out does not prove a resource has exited.
+ */
 async function cleanup() {
   if (cleanupPromise) return cleanupPromise
   cleanupPromise = (async () => {
     operations.abort()
     const failures = []
+    /** Records sync failures, rejections or five-second wait expiry so later cleanup steps can be attempted. */
     const step = async (label, action) => {
       try {
         await bounded(action(), label, 5000)
@@ -929,6 +1046,10 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   })
 }
 
+/**
+ * Generates runner-local TLS material and runs the HTTP/HTTPS suites under a
+ * watchdog, attempting masked failure PNGs before final tracked-resource cleanup.
+ */
 async function main() {
   const watchdog = setTimeout(() => process.kill(process.pid, 'SIGTERM'), 9 * 60 * 1000)
   let fixture

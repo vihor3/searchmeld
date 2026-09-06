@@ -10,6 +10,9 @@ import (
 	"github.com/vihor3/searchmeld/backend/internal/config"
 )
 
+// TestAdminBrowserOriginBoundary exercises Cookie reads/writes and Key requests
+// against canonical, exact-allowlisted and malformed Origins. Rejections must not
+// authenticate a Key or revoke a session, even with public wildcard CORS enabled.
 func TestAdminBrowserOriginBoundary(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -75,6 +78,9 @@ func TestAdminBrowserOriginBoundary(t *testing.T) {
 	}
 }
 
+// TestAdminCookieSecureUsesConfiguredOriginOrDirectTLS checks Cookie transport and
+// host-only scope across direct/proxied HTTP(S), normalized ports and IPv6. Forged
+// forwarding headers must not control Secure or rescue invalid origin configuration.
 func TestAdminCookieSecureUsesConfiguredOriginOrDirectTLS(t *testing.T) {
 	for _, test := range []struct {
 		name         string
@@ -123,6 +129,9 @@ func TestAdminCookieSecureUsesConfiguredOriginOrDirectTLS(t *testing.T) {
 	}
 }
 
+// TestAdminCORSPreflightIsIsolatedFromPublicCORS checks admin OPTIONS enforce
+// origin/method/header policy before authentication while unrelated paths retain
+// public wildcard behavior without admin cache or proof-header policy.
 func TestAdminCORSPreflightIsIsolatedFromPublicCORS(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -180,6 +189,9 @@ func TestAdminCORSPreflightIsIsolatedFromPublicCORS(t *testing.T) {
 	}
 }
 
+// TestAllowlistedHTTPSOriginRequiresExplicitProxyConfiguration checks an HTTPS
+// Origin over backend HTTP needs ADMIN_PUBLIC_ORIGIN even when exactly allowlisted,
+// failing before session or credentialed-CORS effects while originless access remains.
 func TestAllowlistedHTTPSOriginRequiresExplicitProxyConfiguration(t *testing.T) {
 	const publicOrigin = "https://admin.example:8443"
 	for _, configured := range []bool{false, true} {
@@ -228,6 +240,9 @@ func TestAllowlistedHTTPSOriginRequiresExplicitProxyConfiguration(t *testing.T) 
 	}
 }
 
+// TestAdminProofRequiredForEveryCookieMethod checks one exact browser-proof value
+// on protected reads/writes without revoking sessions on failure. A valid admin
+// Key must not exempt the password-login endpoint from proof validation.
 func TestAdminProofRequiredForEveryCookieMethod(t *testing.T) {
 	f := newAdminAuthFixture(t, config.Config{})
 	cookie := f.login(t)
@@ -260,6 +275,9 @@ func TestAdminProofRequiredForEveryCookieMethod(t *testing.T) {
 	adminTestResponse(t, f.server.Router(), r, http.StatusForbidden)
 }
 
+// TestAdminLoginRejectsAmbiguousMediaAndOversizedBodies checks duplicate media
+// headers yield 415 and a body exceeding the configured bound yields 400 without
+// issuing a session.
 func TestAdminLoginRejectsAmbiguousMediaAndOversizedBodies(t *testing.T) {
 	f := newAdminAuthFixture(t, config.Config{})
 	r := adminTestRequest(http.MethodPost, "/api/admin/login", `{"username":"operator","password":"synthetic-password"}`, nil)
@@ -273,6 +291,9 @@ func TestAdminLoginRejectsAmbiguousMediaAndOversizedBodies(t *testing.T) {
 	}
 }
 
+// TestTrustedProxyIPMiddleware checks socket-peer and normalized client addresses
+// for IPv4/IPv6, malformed peers and ambiguous headers. Only one valid X-Real-IP
+// from a loopback peer may replace the address; other forwarding headers are ignored.
 func TestTrustedProxyIPMiddleware(t *testing.T) {
 	for _, test := range []struct {
 		name       string

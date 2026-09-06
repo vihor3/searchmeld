@@ -101,6 +101,7 @@ const router = useRouter()
 const session = useSessionStore()
 const pendingLogout = ref<number | null>(null)
 const logoutError = ref<{ revision: number; message: string } | null>(null)
+/** Expose pending logout only for the current revision; older requests may still settle. */
 const loggingOut = computed(() => pendingLogout.value === session.revision)
 
 const activeMenu = computed(() => {
@@ -108,6 +109,11 @@ const activeMenu = computed(() => {
   return route.path
 })
 
+/**
+ * Revoke the server session, treating 401 as already invalid, then probe again
+ * through the login guard. Ignore superseded responses and expose other revocation
+ * failures for manual retry without claiming browser-wide logout.
+ */
 async function logout() {
   if (loggingOut.value) return
   const revision = session.advanceRevision()
@@ -130,6 +136,7 @@ async function logout() {
   }
 }
 
+/** Retry guarded navigation to the failed or current route, not its writes or passwords. */
 async function retrySession() {
   if (session.checking) return
   const target = router.resolve(session.retryTarget || route.fullPath)

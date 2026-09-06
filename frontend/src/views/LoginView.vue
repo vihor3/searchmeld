@@ -27,6 +27,11 @@ const session = useSessionStore()
 const loading = ref(false)
 const form = reactive({ username: '', password: '' })
 
+/**
+ * Submit once per pending attempt; only current-revision results may report errors
+ * or continue to a validated return target and its server guard. Clear the password
+ * after a successful current response; never persist or automatically replay it.
+ */
 async function login() {
   if (loading.value) return
   loading.value = true

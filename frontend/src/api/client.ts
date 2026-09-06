@@ -7,6 +7,7 @@ export interface AdminProfile {
 }
 
 export class ApiError extends Error {
+  /** Keep HTTP status available for auth decisions even when the error body is absent. */
   constructor(public readonly status: number, message: string) {
     super(message)
     this.name = 'ApiError'
@@ -274,6 +275,14 @@ export interface ProviderCallLog {
   usage?: Array<{ unit: string; quantity: number; cost_usd?: number; metadata?: Record<string, unknown> }>
 }
 
+/**
+ * Read JSON with Cookie credentials, browser proof and no-store for admin paths.
+ * Current-revision protected 401s request recovery before body parsing, then reject;
+ * login/logout/me and stale responses do not trigger that recovery. Never replay
+ * a failed request. HTTP failures retain status in ApiError even without JSON;
+ * network errors and invalid success JSON propagate. Successful payload validation
+ * belongs to the caller.
+ */
 export async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
   const session = useSessionStore()
   const requestRevision = session.revision
@@ -309,7 +318,12 @@ export async function apiFetch<T>(path: string, options: RequestInit = {}): Prom
 }
 
 export const api = {
+  /** Post credentials for a server-issued Cookie; JSON returns expiry, not a bearer token. */
   login: (username: string, password: string) => apiFetch<{ expires_at: string }>('/api/admin/login', { method: 'POST', body: JSON.stringify({ username, password }) }),
+  /**
+   * Probe the current Cookie; only HTTP 401 means anonymous. Malformed profiles
+   * and all other failures reject so callers retain an unknown, retryable state.
+   */
   me: async (): Promise<AdminProfile | null> => {
     try {
       const payload = await apiFetch<unknown>('/api/admin/me')
@@ -322,6 +336,7 @@ export const api = {
       throw error
     }
   },
+  /** Request server-side Cookie-session revocation; leave failures, including 401, to the caller. */
   logout: () => apiFetch<{ status: string }>('/api/admin/logout', { method: 'POST' }),
   dashboard: (range: DashboardRangeKey | string = '14d') => apiFetch<{
     range?: DashboardRangeMeta

@@ -76,6 +76,9 @@ type loginWindow struct {
 	LockedUntil time.Time
 }
 
+// NewAuthService creates process-local auth state with fixed-TTL sessions and
+// at most maxLoginWindows login buckets when limiting is enabled. Nonpositive
+// durations and zero attempts use defaults; negative attempts disable the limiter.
 func NewAuthService(store AuthStore, sessionTTL time.Duration, loginMaxAttempts int, loginWindowDuration, loginLockout time.Duration) *AuthService {
 	if sessionTTL <= 0 {
 		sessionTTL = 24 * time.Hour
@@ -102,6 +105,10 @@ func NewAuthService(store AuthStore, sessionTTL time.Duration, loginMaxAttempts 
 	}
 }
 
+// Login rejects overlong raw usernames before limiter/store access, then creates
+// a fixed-TTL in-memory session after password verification. Account lookup and
+// password failures map to ErrInvalidCredentials or ErrLoginRateLimited;
+// token-generation errors propagate. Success clears the username/IP login bucket.
 func (a *AuthService) Login(ctx context.Context, username, password, clientIP string) (string, time.Time, error) {
 	if len(username) > maxLoginUsernameBytes {
 		return "", time.Time{}, ErrInvalidCredentials
@@ -148,6 +155,10 @@ func (a *AuthService) Logout(token string) bool {
 	return true
 }
 
+// requireAdmin validates a supplied header credential as an admin Key without
+// Cookie fallback. With no supplied header it requires a live session Cookie and
+// browser proof, including reads. It captures the credential for scoped logout
+// and reports Key lookup failures as a generic 500 without exposing store errors.
 func (a *AuthService) requireAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if token, supplied := adminHeaderCredential(r); supplied {
@@ -183,6 +194,9 @@ func (a *AuthService) requireAdmin(next http.Handler) http.Handler {
 	})
 }
 
+// adminHeaderCredential reports supplied auth headers even when empty or invalid.
+// Repeated values return an empty supplied credential; otherwise bearerToken
+// selects Bearer before X-API-Key. The presence flag prevents Cookie fallback.
 func adminHeaderCredential(r *http.Request) (string, bool) {
 	authorization, hasAuthorization := r.Header["Authorization"]
 	apiKey, hasAPIKey := r.Header[http.CanonicalHeaderKey("X-API-Key")]
@@ -304,6 +318,9 @@ func (a *AuthService) validSession(token string) bool {
 	return true
 }
 
+// loginLocked prunes expired state under a.mu, then reports an active lockout or
+// lack of room for a new bucket. An admitted new username/IP bucket is reserved
+// before account lookup; a disabled limiter returns false without retaining state.
 func (a *AuthService) loginLocked(key string) bool {
 	if a.loginMaxAttempts < 0 {
 		return false
@@ -337,6 +354,9 @@ func (a *AuthService) pruneLoginWindows(now time.Time) {
 	}
 }
 
+// recordLoginFailure counts failures under a.mu and starts a lockout at the
+// configured threshold. Existing locks and new names at capacity return true
+// without resetting a lock or adding a bucket; negative limits skip tracking.
 func (a *AuthService) recordLoginFailure(key string) bool {
 	if a.loginMaxAttempts < 0 {
 		return false

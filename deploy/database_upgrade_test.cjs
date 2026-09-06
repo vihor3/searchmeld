@@ -34,17 +34,25 @@ let upstream
 let origin
 let closing
 
+/** Marks deliberately limited diagnostic messages that may be printed without raw command output or rows. */
 class FixtureError extends Error {}
 
+/** Rejects an invariant using only the supplied label, never rendering compared credentials or database rows. */
 function check(condition, label) {
   // Assertions must never render actual/expected credentials or database rows.
   if (!condition) throw new FixtureError(label)
 }
 
+/** Replaces parse-error details with a caller label so malformed credential or row data is not exposed. */
 function decodeJSON(value, label) {
   try { return JSON.parse(value) } catch { throw new FixtureError(`${label}: invalid JSON`) }
 }
 
+/**
+ * Runs a bounded child process with optional stdin and shared cancellation;
+ * cleanup bypasses that signal. Failures expose only the executable, first
+ * argument and coarse exit result, so callers must keep those labels nonsecret.
+ */
 async function command(file, args, { timeout = 90000, cleanup = false, input } = {}) {
   try {
     const execution = execute(file, args, {
@@ -62,26 +70,35 @@ async function command(file, args, { timeout = 90000, cleanup = false, input } =
   }
 }
 
+/** Limits Docker failure diagnostics through command(), retaining its timeout, stdin and cleanup options. */
 function docker(args, options) {
   return command('docker', args, options)
 }
 
+/** Reads lifecycle status, exit code and port bindings only, avoiding environment and health/application logs. */
 async function inspectContainer(name) {
   const format = '{"status":{{json .State.Status}},"running":{{json .State.Running}},"exit_code":{{json .State.ExitCode}},"ports":{{json .NetworkSettings.Ports}}}'
   return decodeJSON(await docker(['inspect', '--type', 'container', '--format', format, name], { timeout: 5000 }), 'Container state')
 }
 
+/** Removes one tracked container and anonymous volumes, retaining its registration for finish() if removal fails. */
 async function removeContainer(name) {
   await docker(['rm', '--force', '--volumes', name], { timeout: 30000 })
   containers.delete(name)
 }
 
+/** Registers a fixture-owned named volume before creation so teardown can attempt removal even after setup failure. */
 async function volume(name) {
   volumes.add(name)
   await docker(['volume', 'create', '--label', `searchmeld.database-upgrade-fixture=${prefix}`, name])
   return name
 }
 
+/**
+ * Runs trusted fixture shell/mount inputs in a networkless current-image container
+ * and removes that container before returning stdout. Failed helpers stay tracked
+ * for finish() cleanup.
+ */
 async function helper(mounts, script) {
   const name = `${prefix}-helper-${++helperNumber}`
   containers.add(name)
@@ -92,6 +109,10 @@ async function helper(mounts, script) {
   return output
 }
 
+/**
+ * Contacts only the stable loopback fixture origin with a timed abort and 2 MiB
+ * reply cap, replacing transport failures with diagnostics that omit raw details.
+ */
 function request(path, { method = 'GET', headers = {}, body, timeout = 10000 } = {}) {
   const url = new URL(path, origin)
   check(url.origin === origin && url.hostname === '127.0.0.1', 'Only the loopback fixture may receive HTTP requests')
@@ -116,6 +137,10 @@ function request(path, { method = 'GET', headers = {}, body, timeout = 10000 } =
   })
 }
 
+/**
+ * Checks status and JSON for either image's API; current admin calls additionally
+ * assert no-store headers and prohibit Cookie issuance unless marked as login.
+ */
 async function api(path, options = {}, status = 200, { current = false, login = false } = {}) {
   const reply = await request(path, options)
   check(reply.status === status, `${options.method || 'GET'} ${path}: unexpected HTTP status`)
@@ -126,6 +151,10 @@ async function api(path, options = {}, status = 200, { current = false, login = 
   return { ...reply, json: decodeJSON(reply.body, 'API response') }
 }
 
+/**
+ * Creates the suite-owned loopback origin, preserving Host while the upstream
+ * binding changes between image starts. finish() owns listener shutdown.
+ */
 async function startForwarder() {
   forwarder = http.createServer((req, res) => {
     if (!upstream) { res.writeHead(503).end(); return }
@@ -156,6 +185,10 @@ async function startForwarder() {
   origin = `http://127.0.0.1:${forwarder.address().port}`
 }
 
+/**
+ * Rebinds only the upstream, retaining the HTTP origin, and polls health plus
+ * container liveness against a 150-second polling deadline.
+ */
 async function waitHealthy(name) {
   const state = await inspectContainer(name)
   const bindings = state.ports?.['80/tcp'] || []
@@ -175,6 +208,10 @@ async function waitHealthy(name) {
   throw new FixtureError('Application startup exceeded 150 seconds')
 }
 
+/**
+ * Tracks an app using the supplied PGDATA volume with volume-nocopy and a
+ * loopback-only published port, then waits for packaged health at the stable origin.
+ */
 async function startApp(name, image, dataVolume, environmentPath) {
   containers.add(name)
   await docker(['run', '--detach', '--pull', 'never', '--name', name, '--network', `${prefix}-network`,
@@ -184,6 +221,10 @@ async function startApp(name, image, dataVolume, environmentPath) {
   await waitHealthy(name)
 }
 
+/**
+ * Sends trusted fixture SQL via stdin using container-held credentials, with
+ * connection/statement/lock/process limits; TCP mode exercises password auth.
+ */
 async function sql(name, query, { tcp = false } = {}) {
   return docker(['exec', '--interactive', '--env', 'PGCONNECT_TIMEOUT=5',
     '--env', 'PGOPTIONS=-c statement_timeout=30000 -c lock_timeout=5000', name,
@@ -193,6 +234,10 @@ async function sql(name, query, { tcp = false } = {}) {
   ], { input: query, timeout: 45000 })
 }
 
+/**
+ * Returns ordered rows from the listed representative tables in memory, not a
+ * whole-database backup. Compare before further authenticated calls mutate usage.
+ */
 async function snapshot(name) {
   // No snapshots leave process memory. Audit/usage admission can append records,
   // so compare before authenticating again after each image replacement.
@@ -209,6 +254,7 @@ async function snapshot(name) {
   );`), 'Database snapshot')
 }
 
+/** Requires a clean PostgreSQL stop and stopped app before clearing the upstream; call before physically copying PGDATA. */
 async function stopApp(name) {
   // Stop PostgreSQL cleanly before making a physical backup. The entrypoint then
   // exits or is stopped; never copy a running cluster as a rollback backup.
@@ -219,6 +265,11 @@ async function stopApp(name) {
   upstream = undefined
 }
 
+/**
+ * Archives the immutable historical source revision, builds a disposable image
+ * and verifies its revision label. This is not a released or digest-pinned image;
+ * the dedicated builder and image are registered for finish() cleanup.
+ */
 async function buildBaseline() {
   const revision = await command('git', ['rev-parse', '--verify', `${baselineRevision}^{commit}`])
   check(revision === baselineRevision, 'Historical checkout is missing; fetch the immutable baseline commit')
@@ -237,12 +288,14 @@ async function buildBaseline() {
   console.log(`Built disposable historical application ${baselineRevision}`)
 }
 
+/** Exclusively creates an owner-only synthetic environment file; finish() removes the owned temporary directory. */
 async function writeEnvironment(name, values) {
   const path = join(temporary, `${name}.env`)
   await writeFile(path, Object.entries(values).map(([key, value]) => `${key}=${value}\n`).join(''), { mode: 0o600, flag: 'wx' })
   return path
 }
 
+/** Authenticates the synthetic account against the historical header-session contract, returning its token without a Cookie. */
 async function loginOld(credentials) {
   const reply = await api('/api/admin/login', { method: 'POST', body: credentials })
   check(typeof reply.json.token === 'string' && reply.json.token.startsWith('adm_'), 'Historical login must issue its old header session')
@@ -250,6 +303,10 @@ async function loginOld(credentials) {
   return reply.json.token
 }
 
+/**
+ * Requires expiry-only JSON and one host-only HttpOnly/SameSite browser-session
+ * Cookie without Secure on direct HTTP, returning its name/value pair for requests.
+ */
 async function loginCurrent(credentials) {
   const reply = await api('/api/admin/login', {
     method: 'POST', headers: { ...proof, Origin: origin }, body: credentials
@@ -264,6 +321,11 @@ async function loginCurrent(credentials) {
   return attributes[0]
 }
 
+/**
+ * Seeds synthetic Keys, Token, settings and representative history/cache through
+ * the historical app and SQL. Providers are disabled with loopback targets;
+ * Token admission must persist before credentials/IDs are returned for later checks.
+ */
 async function seedOld(name, credentials) {
   const oldSession = await loginOld(credentials)
   const headers = { Authorization: `Bearer ${oldSession}` }
@@ -317,6 +379,11 @@ async function seedOld(name, credentials) {
     tokenID: token.token.id, businessToken: token.raw_token, settings }
 }
 
+/**
+ * Compares representative snapshots before auth side effects, then exercises
+ * the original database password, admin Key, settings, secret decryption and
+ * visible historical request/usage data under the selected image's API policy.
+ */
 async function verifyPreserved(name, expected, seeded, { current = false } = {}) {
   const actual = await snapshot(name)
   for (const [table, rows] of Object.entries(expected)) {
@@ -337,6 +404,11 @@ async function verifyPreserved(name, expected, seeded, { current = false } = {})
   check(usage.requests_total === 3 && usage.cache_hits === 3, 'Persisted usage must remain visible')
 }
 
+/**
+ * Checks old-account login with new Cookie/proof policy, header-session rejection,
+ * public-auth exclusion and logout/restart revocation. Persisted Key/Token calls
+ * use empty queries to establish admission without invoking providers.
+ */
 async function verifyCookieMigration(name, credentials, seeded) {
   const cookie = await loginCurrent(credentials)
   const headers = { ...proof, Cookie: cookie, Origin: origin }
@@ -362,6 +434,10 @@ async function verifyCookieMigration(name, credentials, seeded) {
   await loginCurrent(credentials)
 }
 
+/**
+ * Requires a stopped cluster. Uses a read-only mount to digest contents and path,
+ * ownership, mode, size, mtime and ctime metadata, returning only the two digest lines.
+ */
 async function volumeFingerprint(dataVolume) {
   const output = await helper([`type=volume,source=${dataVolume},target=/pgdata,readonly,volume-nocopy`], `
     set -o pipefail
@@ -373,6 +449,7 @@ async function volumeFingerprint(dataVolume) {
   return output
 }
 
+/** Waits on a 90-second polling deadline for PG17 readiness with postgres as PID 1, excluding the temporary init server. */
 async function waitIncompatibleDatabase(name) {
   const deadline = Date.now() + 90000
   while (Date.now() < deadline) {
@@ -387,6 +464,12 @@ async function waitIncompatibleDatabase(name) {
   throw new FixtureError('PostgreSQL 17 fixture startup exceeded 90 seconds')
 }
 
+/**
+ * Stops a real PG17 sentinel cluster, checks prompt PG16 startup rejection and
+ * unchanged content/metadata fingerprints, then reopens it with PG17 to verify
+ * the row and password survive. Only the rejected app's last ten log lines are
+ * read for its preflight message; the fixture does not test major-version migration.
+ */
 async function verifyMismatch(environmentPath) {
   const dataVolume = await volume(`${prefix}-mismatch`)
   const pgName = `${prefix}-postgres17`
@@ -425,6 +508,12 @@ async function verifyMismatch(environmentPath) {
   console.log('PostgreSQL 17 mismatch refused without modification; matching-server recovery passed')
 }
 
+/**
+ * Checks the Actions checkout SHA and records the current image ID. Exercises
+ * historical PG16 data upgrade with original encryption/database secrets and an
+ * empty startup admin password, clean stopped-backup recovery under the historical
+ * image, and PG17 rejection/recovery. finish() owns success/failure/signal cleanup.
+ */
 async function main() {
   check(/^searchmeld-db-upgrade-[0-9]+-[0-9]+$/.test(prefix || ''), 'A run-scoped UPGRADE_CONTAINER_PREFIX is required')
   check(Boolean(process.env.RUNNER_TEMP), 'RUNNER_TEMP is required')
@@ -483,6 +572,13 @@ async function main() {
   console.log(`Database upgrade contract passed for ${process.env.GITHUB_SHA}; baseline ${baselineRevision}`)
 }
 
+/**
+ * Coalesces teardown and exits with the requested code unless cleanup fails.
+ * Aborts normal commands and initiates forwarder shutdown, then attempts removal
+ * of tracked containers/volumes and owned network, builder, historical image,
+ * newly acquired PG17 image and temporary files, leaving the supplied current image.
+ * A two-minute forced exit leaves incomplete removal to the scoped Actions fallback.
+ */
 async function finish(code) {
   if (closing) return closing
   closing = (async () => {
@@ -492,6 +588,7 @@ async function finish(code) {
     }, 2 * 60 * 1000)
     controller.abort()
     let cleanupFailed = false
+    /** Attempts timed Docker teardown after normal-work cancellation, recording failures without skipping later attempts. */
     const clean = async (args, timeout = 30000) => {
       try { await docker(args, { timeout, cleanup: true }) } catch { cleanupFailed = true }
     }

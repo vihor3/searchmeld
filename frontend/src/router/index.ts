@@ -27,6 +27,11 @@ const router = createRouter({
   ]
 })
 
+/**
+ * Return a same-origin, router-known non-public fullPath, preserving query/hash.
+ * Fall back to /playground for malformed, external, ambiguous or public targets;
+ * decoded controls and encoded path separators are rejected as well.
+ */
 export function loginRedirect(value: unknown): string {
   const fallback = '/playground'
   if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')) return fallback
@@ -47,6 +52,13 @@ export function loginRedirect(value: unknown): string {
 let guardAttempt = 0
 let pendingRecovery: { revision: number; promise: Promise<void> } | null = null
 
+/**
+ * Recover through the login guard's Cookie probe, sharing only pending work for
+ * the same revision. Ignore stale or public-route expiry responses; explicit
+ * logout can also start from public routes and omits the return target.
+ * Navigation rejections become current-revision retry state, not request replay.
+ * Settlement releases only its own pending slot, preserving any newer recovery.
+ */
 export function recheckSession(requestRevision: number, explicitLogout = false): Promise<void> {
   const session = useSessionStore()
   const route = router.currentRoute.value
@@ -68,6 +80,11 @@ export function recheckSession(requestRevision: number, explicitLogout = false):
   return promise
 }
 
+/**
+ * Gate every entry, including login, on a server probe rather than stored profile.
+ * Retry once after an auth revision change; cancel superseded navigation or
+ * unknown probe results, and use validated return targets for auth redirects.
+ */
 router.beforeEach(async (to) => {
   const attempt = ++guardAttempt
   const session = useSessionStore()

@@ -59,6 +59,9 @@ func clientRequestIDPrefix(value string) string {
 	return strings.Trim(prefix.String(), "-_.")
 }
 
+// corsMiddleware applies the public CORS policy, including its wildcard and
+// OPTIONS behavior. Admin paths bypass it so adminBrowserMiddleware owns their
+// separate origin and preflight checks.
 func corsMiddleware(origins []string) func(http.Handler) http.Handler {
 	allowed := map[string]bool{}
 	allowAll := false
@@ -94,10 +97,17 @@ func corsMiddleware(origins []string) func(http.Handler) http.Handler {
 	}
 }
 
+// isAdminPath matches the admin namespace at a path-segment boundary, excluding
+// similarly prefixed public paths.
 func isAdminPath(path string) bool {
 	return path == "/api/admin" || strings.HasPrefix(path, "/api/admin/")
 }
 
+// adminBrowserMiddleware applies admin-only no-store and preflight policy,
+// allowing supplied Origins only when they match the normalized canonical origin
+// or a valid exact CORS entry. The Cookie Secure decision uses configured origin
+// or direct TLS, never forwarded scheme/host headers. HTTPS Origins over plain HTTP
+// require publicOrigin even when allowlisted; auth and browser proof remain downstream.
 func adminBrowserMiddleware(publicOrigin string, corsOrigins []string) func(http.Handler) http.Handler {
 	allowed := map[string]bool{}
 	for _, raw := range corsOrigins {
@@ -173,6 +183,9 @@ func adminBrowserMiddleware(publicOrigin string, corsOrigins []string) func(http
 	}
 }
 
+// validAdminPreflight accepts exactly one supported request method and only
+// permitted requested header names. An absent header list is allowed; Origin
+// trust and actual request credentials are checked separately.
 func validAdminPreflight(r *http.Request) bool {
 	methods := r.Header.Values("Access-Control-Request-Method")
 	if len(methods) != 1 {
@@ -195,6 +208,9 @@ func validAdminPreflight(r *http.Request) bool {
 	return true
 }
 
+// requireAdminBrowserProof requires exactly one X-SearchMeld-Admin value of "1",
+// otherwise writing 403 and returning false. This is a browser CSRF control,
+// not an authentication credential.
 func requireAdminBrowserProof(w http.ResponseWriter, r *http.Request) bool {
 	values := r.Header.Values(adminBrowserHeader)
 	if len(values) != 1 || values[0] != "1" {
@@ -204,6 +220,8 @@ func requireAdminBrowserProof(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// adminCookieSecure reads the transport decision from admin middleware, falling
+// back only to direct TLS when no decision is in context.
 func adminCookieSecure(r *http.Request) bool {
 	if secure, ok := r.Context().Value(adminCookieSecureKey).(bool); ok {
 		return secure
@@ -211,7 +229,9 @@ func adminCookieSecure(r *http.Request) bool {
 	return r.TLS != nil
 }
 
-// Only the bundled loopback proxy may replace the socket peer's address.
+// trustedProxyIPMiddleware accepts one valid X-Real-IP from a loopback socket
+// peer, ignoring all other forwarding headers. The bundled loopback proxy must
+// sanitize that header; other peers retain their socket address.
 func trustedProxyIPMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		peer := net.ParseIP(clientIP(r))

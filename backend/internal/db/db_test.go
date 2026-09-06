@@ -8,6 +8,9 @@ import (
 	"testing"
 )
 
+// TestConnectRejectsIncompatibleQueryOptions checks that URL and keyword DSNs
+// report migration guidance before a canceled connection attempt, without echoing
+// the fixture password.
 func TestConnectRejectsIncompatibleQueryOptions(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
@@ -59,6 +62,8 @@ func TestConnectRejectsIncompatibleQueryOptions(t *testing.T) {
 	}
 }
 
+// TestConnectAcceptsExplicitQueryModes checks that valid mode/cache combinations
+// reach the canceled startup Ping. It does not exercise store SQL in every mode.
 func TestConnectAcceptsExplicitQueryModes(t *testing.T) {
 	for _, mode := range []string{"cache_statement", "cache_describe", "describe_exec", "exec", "simple_protocol"} {
 		zeroUnusedCaches := "statement_cache_capacity=0&description_cache_capacity=0"

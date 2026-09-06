@@ -15,6 +15,10 @@ import (
 	"github.com/vihor3/searchmeld/backend/internal/model"
 )
 
+// TestMountedLoginUsernameBound counts raw padding and UTF-8 bytes toward the
+// username limit. Overlong names must fail before lookup, limiter or audit state,
+// while boundary/empty names retain ordinary HTTP failure semantics. A direct
+// service call must enforce the same early bound on overlong names.
 func TestMountedLoginUsernameBound(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -54,12 +58,16 @@ func TestMountedLoginUsernameBound(t *testing.T) {
 	}
 }
 
+// TestMountedLoginCapacityPreservesActiveLocks checks new names are denied at
+// capacity without evicting active locks, including locks beyond their attempt
+// window. Existing names still count failures and expired locks permit login.
 func TestMountedLoginCapacityPreservesActiveLocks(t *testing.T) {
 	f := newAdminAuthFixture(t, config.Config{AdminLoginMaxAttempts: 2})
 	if f.auth.loginMaxWindows != maxLoginWindows {
 		t.Fatalf("default login capacity = %d, want %d", f.auth.loginMaxWindows, maxLoginWindows)
 	}
 	f.auth.loginMaxWindows = 3
+	// login submits mounted JSON requests through the shared status/header assertions.
 	login := func(username, password string, status int) {
 		t.Helper()
 		body, err := json.Marshal(map[string]string{"username": username, "password": password})
@@ -99,6 +107,8 @@ func TestMountedLoginCapacityPreservesActiveLocks(t *testing.T) {
 	}
 }
 
+// TestLoginAttemptExpiryReclaimsUnrelatedNames checks a new login lazily reclaims
+// expired attempts and locks while preserving unrelated active state.
 func TestLoginAttemptExpiryReclaimsUnrelatedNames(t *testing.T) {
 	f := newAdminAuthFixture(t, config.Config{})
 	f.auth.loginMaxWindows = 4
@@ -125,6 +135,8 @@ func TestLoginAttemptExpiryReclaimsUnrelatedNames(t *testing.T) {
 	}
 }
 
+// TestLoginWindowExpiryBoundary fixes the pruning instant to assert inclusive
+// expiry for idle windows and lock deadlines without discarding a still-active lock.
 func TestLoginWindowExpiryBoundary(t *testing.T) {
 	auth := NewAuthService(nil, 0, 0, 0, 0)
 	now := time.Now()
@@ -141,6 +153,9 @@ func TestLoginWindowExpiryBoundary(t *testing.T) {
 	}
 }
 
+// TestLoginCapacityReservedBeforeFailure checks reservations consume capacity
+// before failure recording; late unreserved failures cannot grow the map, while
+// failures for an admitted name still count.
 func TestLoginCapacityReservedBeforeFailure(t *testing.T) {
 	auth := NewAuthService(nil, 0, 0, 0, 0)
 	auth.loginMaxWindows = 2
@@ -155,6 +170,8 @@ func TestLoginCapacityReservedBeforeFailure(t *testing.T) {
 	}
 }
 
+// TestDisabledLoginLimiterDoesNotRetainWindows checks negative attempt limits skip
+// bucket allocation across distinct failures without changing successful login.
 func TestDisabledLoginLimiterDoesNotRetainWindows(t *testing.T) {
 	f := newAdminAuthFixture(t, config.Config{AdminLoginMaxAttempts: -1})
 	f.auth.loginMaxWindows = 1
@@ -170,6 +187,9 @@ func TestDisabledLoginLimiterDoesNotRetainWindows(t *testing.T) {
 	}
 }
 
+// TestConcurrentLoginNamesReserveCapacityBeforeLookup holds lookup completions
+// behind a channel barrier, asserting the cap includes in-flight names and never
+// evicts an active lock. Released failures count once and create no sessions.
 func TestConcurrentLoginNamesReserveCapacityBeforeLookup(t *testing.T) {
 	const attempts, capacity = 8, 3
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -250,6 +270,9 @@ type blockingLoginStore struct {
 	release chan struct{}
 }
 
+// GetAdminByUsername announces entry, then blocks until released or canceled to
+// expose reservations before lookup failure. The test buffers entered for every
+// attempt because the notification itself is not cancellable.
 func (s *blockingLoginStore) GetAdminByUsername(ctx context.Context, username string) (model.AdminUser, error) {
 	s.entered <- username
 	select {

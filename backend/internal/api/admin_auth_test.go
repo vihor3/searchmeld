@@ -38,6 +38,8 @@ type adminAuthTestStore struct {
 	usageMarks   int
 }
 
+// GetAdminByUsername records the exact lookup name and accepts only the configured
+// fixture account, allowing tests to distinguish rejection from account lookup.
 func (s *adminAuthTestStore) GetAdminByUsername(_ context.Context, username string) (model.AdminUser, error) {
 	s.userLookups = append(s.userLookups, username)
 	if username != s.user.Username {
@@ -46,6 +48,8 @@ func (s *adminAuthTestStore) GetAdminByUsername(_ context.Context, username stri
 	return s.user, nil
 }
 
+// FindAdminAPIKey records the selected credential and matches only the installed
+// fixture Key, or returns the injected store error for failure-mapping assertions.
 func (s *adminAuthTestStore) FindAdminAPIKey(_ context.Context, token string) (model.AdminAPIKey, bool, error) {
 	s.keyLookups = append(s.keyLookups, token)
 	if s.adminKeyErr != nil {
@@ -57,6 +61,8 @@ func (s *adminAuthTestStore) FindAdminAPIKey(_ context.Context, token string) (m
 	return model.AdminAPIKey{KeyPrefix: "oak_synthetic"}, true, nil
 }
 
+// FindAPIToken records lookups and accepts only the fixture's ordinary Token,
+// returning stable identity and search/extract scopes for admission assertions.
 func (s *adminAuthTestStore) FindAPIToken(_ context.Context, token string) (model.APIToken, error) {
 	s.tokenLookups = append(s.tokenLookups, token)
 	if token != adminTestToken {
@@ -65,36 +71,49 @@ func (s *adminAuthTestStore) FindAPIToken(_ context.Context, token string) (mode
 	return model.APIToken{ID: 42, Scopes: []string{"search", "extract"}, Status: "active"}, nil
 }
 
+// MarkAPITokenUsed increments the fixture's admission counter without persisting usage.
 func (s *adminAuthTestStore) MarkAPITokenUsed(context.Context, int64) error {
 	s.usageMarks++
 	return nil
 }
 
+// RuntimeSettings exposes the fixture's current auth and compatibility switches
+// without a database lookup.
 func (s *adminAuthTestStore) RuntimeSettings(context.Context) (model.RuntimeSettings, error) {
 	return s.settings, nil
 }
 
+// RecordAuditLog retains audit inputs for actor, metadata and secret-leak assertions.
 func (s *adminAuthTestStore) RecordAuditLog(_ context.Context, input model.AuditLogInput) error {
 	s.audits = append(s.audits, input)
 	return nil
 }
 
+// ListProviders returns an empty catalog so mounted admin reads need no provider I/O.
 func (*adminAuthTestStore) ListProviders(context.Context) ([]model.ProviderConfig, error) {
 	return []model.ProviderConfig{}, nil
 }
 
+// GetAPIKeyByID returns synthetic provider-secret data for mounted reveal and
+// no-store assertions, preserving the requested ID.
 func (*adminAuthTestStore) GetAPIKeyByID(_ context.Context, id int64) (model.APIKey, error) {
 	return model.APIKey{ID: id, Value: "synthetic-provider-secret"}, nil
 }
 
+// RevealAPIToken supplies the fixture Token at the requested ID for the real
+// mounted reveal handler without consulting persistent storage.
 func (*adminAuthTestStore) RevealAPIToken(_ context.Context, id int64) (model.APIToken, error) {
 	return model.APIToken{ID: id, Token: adminTestToken}, nil
 }
 
+// GetAdminAPIKey exposes the fixture's current Key, including the empty state
+// used for first-key setup, for mounted setup and reveal scenarios.
 func (s *adminAuthTestStore) GetAdminAPIKey(context.Context) (model.AdminAPIKey, error) {
 	return model.AdminAPIKey{Key: s.adminKey, KeyPrefix: "oak_synthetic"}, nil
 }
 
+// RotateAdminAPIKey installs a fixed synthetic replacement so later lookups can
+// reject the initial Key without touching browser-session state.
 func (s *adminAuthTestStore) RotateAdminAPIKey(context.Context) (model.AdminAPIKey, string, error) {
 	s.adminKey = "oak_synthetic-rotated-key"
 	return model.AdminAPIKey{Key: s.adminKey, KeyPrefix: "oak_synthetic"}, s.adminKey, nil
@@ -104,10 +123,13 @@ type adminAuthTestLogger struct {
 	fields []map[string]interface{}
 }
 
+// Info retains structured fields, not message text, for credential-leak assertions.
 func (l *adminAuthTestLogger) Info(_ string, fields map[string]interface{}) {
 	l.fields = append(l.fields, fields)
 }
 
+// Error records error fields in the same sink as Info so assertions can inspect
+// both log levels without emitting runtime logs.
 func (l *adminAuthTestLogger) Error(_ string, fields map[string]interface{}) {
 	l.fields = append(l.fields, fields)
 }
@@ -120,6 +142,9 @@ type adminAuthFixture struct {
 	log    *adminAuthTestLogger
 }
 
+// newAdminAuthFixture mounts production middleware and handlers, including MCP,
+// over a credential-aware store and low-cost synthetic password hash. It installs
+// no search orchestrator; search execution needs additional fixture wiring.
 func newAdminAuthFixture(t *testing.T, cfg config.Config) *adminAuthFixture {
 	t.Helper()
 	hash, err := bcrypt.GenerateFromPassword([]byte(adminTestPassword), bcrypt.MinCost)
@@ -140,6 +165,8 @@ func newAdminAuthFixture(t *testing.T, cfg config.Config) *adminAuthFixture {
 	return &adminAuthFixture{store: store, auth: auth, h: h, server: server, log: log}
 }
 
+// adminTestRequest uses the fixture origin and nonloopback peer, adds browser
+// proof and an optional Cookie, and marks nonempty bodies as JSON.
 func adminTestRequest(method, path, body string, cookie *http.Cookie) *http.Request {
 	r := httptest.NewRequest(method, adminTestOrigin+path, strings.NewReader(body))
 	r.RemoteAddr = "192.0.2.10:54321"
@@ -153,6 +180,8 @@ func adminTestRequest(method, path, body string, cookie *http.Cookie) *http.Requ
 	return r
 }
 
+// adminTestResponse serves a request and asserts its status, plus admin no-store
+// headers and no Set-Cookie outside successful login responses.
 func adminTestResponse(t *testing.T, handler http.Handler, r *http.Request, wantStatus int) *httptest.ResponseRecorder {
 	t.Helper()
 	response := httptest.NewRecorder()
@@ -173,6 +202,8 @@ func adminTestResponse(t *testing.T, handler http.Handler, r *http.Request, want
 	return response
 }
 
+// login authenticates through the mounted handler and requires exactly one
+// nonempty admin session Cookie for subsequent fixture requests.
 func (f *adminAuthFixture) login(t *testing.T) *http.Cookie {
 	t.Helper()
 	r := adminTestRequest(http.MethodPost, "/api/admin/login", `{"username":"operator","password":"synthetic-password"}`, nil)
@@ -184,6 +215,9 @@ func (f *adminAuthFixture) login(t *testing.T) *http.Cookie {
 	return cookies[0]
 }
 
+// TestAdminLoginCookieContract checks fixed expiry, host-only HttpOnly session
+// Cookie flags, metadata-only login JSON, and absence of session/password material
+// from JSON and recorded logs. A second login must issue a distinct session.
 func TestAdminLoginCookieContract(t *testing.T) {
 	f := newAdminAuthFixture(t, config.Config{AdminSessionTTL: 2 * time.Hour})
 	r := adminTestRequest(http.MethodPost, "/api/admin/login", `{"username":"operator","password":"synthetic-password"}`, nil)
@@ -240,6 +274,9 @@ func TestAdminLoginCookieContract(t *testing.T) {
 	}
 }
 
+// TestAdminLoginRejectsInvalidRequests checks credential, JSON, media, proof and
+// Origin failures retain their native status/envelope without creating sessions;
+// browser/parse failures must not reach password-auth audit logging.
 func TestAdminLoginRejectsInvalidRequests(t *testing.T) {
 	validBody := `{"username":"operator","password":"synthetic-password"}`
 	for _, test := range []struct {
@@ -293,6 +330,9 @@ func TestAdminLoginRejectsInvalidRequests(t *testing.T) {
 	}
 }
 
+// TestAdminHeaderCredentialPrecedence checks exact Key selection and no Cookie
+// fallback for invalid, empty, repeated or legacy session headers. It also checks
+// proof enforcement, secret-safe store errors and preservation of incidental sessions.
 func TestAdminHeaderCredentialPrecedence(t *testing.T) {
 	for _, test := range []struct {
 		name          string
@@ -379,6 +419,9 @@ func TestAdminHeaderCredentialPrecedence(t *testing.T) {
 	}
 }
 
+// TestAdminCookieTTLRevocationAndRestart checks reads do not extend expiry and
+// revoked/expired sessions are rejected. Replacing AuthService simulates restart:
+// old Cookies fail while the fixture's stored admin Key still authenticates.
 func TestAdminCookieTTLRevocationAndRestart(t *testing.T) {
 	f := newAdminAuthFixture(t, config.Config{AdminSessionTTL: time.Hour})
 	cookie := f.login(t)
@@ -423,6 +466,9 @@ func TestAdminCookieTTLRevocationAndRestart(t *testing.T) {
 	adminTestResponse(t, restarted.Router(), r, http.StatusOK)
 }
 
+// TestAdminLogoutAndKeyRotationAreCredentialScoped checks Key-authenticated logout
+// preserves both Key and incidental Cookie, rotation invalidates the old Key
+// without revoking the browser session, and Cookie logout leaves the Key usable.
 func TestAdminLogoutAndKeyRotationAreCredentialScoped(t *testing.T) {
 	f := newAdminAuthFixture(t, config.Config{})
 	cookie := f.login(t)
@@ -465,6 +511,8 @@ func TestAdminLogoutAndKeyRotationAreCredentialScoped(t *testing.T) {
 	adminTestResponse(t, f.server.Router(), r, http.StatusOK)
 }
 
+// TestAdminFirstKeySetupStillUsesPasswordSession checks password-Cookie login can
+// provision the first Key and use its explicit reveal response for header auth.
 func TestAdminFirstKeySetupStillUsesPasswordSession(t *testing.T) {
 	f := newAdminAuthFixture(t, config.Config{})
 	f.store.adminKey = ""
@@ -481,6 +529,9 @@ func TestAdminFirstKeySetupStillUsesPasswordSession(t *testing.T) {
 	adminTestResponse(t, f.server.Router(), r, http.StatusOK)
 }
 
+// TestAdminDelayedLogoutCannotRevokeNewSession inserts a new login after logout
+// authentication, then checks only the captured old session is revoked. Neither
+// the logout nor later 401 responses may emit replacement or clearing Cookies.
 func TestAdminDelayedLogoutCannotRevokeNewSession(t *testing.T) {
 	f := newAdminAuthFixture(t, config.Config{})
 	oldCookie := f.login(t)
@@ -510,6 +561,8 @@ func TestAdminDelayedLogoutCannotRevokeNewSession(t *testing.T) {
 	adminTestResponse(t, f.server.Router(), adminTestRequest(http.MethodGet, "/api/admin/me", "", newCookie), http.StatusOK)
 }
 
+// TestAdminNoStoreIncludesSecretsAndRoutingErrors checks no-store/no-cache on
+// mounted reveal handlers and admin 404/405 responses without Set-Cookie.
 func TestAdminNoStoreIncludesSecretsAndRoutingErrors(t *testing.T) {
 	f := newAdminAuthFixture(t, config.Config{})
 	cookie := f.login(t)
@@ -525,6 +578,9 @@ func TestAdminNoStoreIncludesSecretsAndRoutingErrors(t *testing.T) {
 	adminTestResponse(t, f.server.Router(), adminTestRequest(http.MethodGet, "/api/admin", "", cookie), http.StatusNotFound)
 }
 
+// TestAdminLoginLockoutUsesTrustedPeerIP varies untrusted forwarding headers while
+// holding the direct or loopback-proxy client IP fixed, asserting stable lockout
+// and audit attribution and normal login after forced lock expiry.
 func TestAdminLoginLockoutUsesTrustedPeerIP(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -589,6 +645,9 @@ func TestAdminLoginLockoutUsesTrustedPeerIP(t *testing.T) {
 	}
 }
 
+// TestBrowserCredentialsDoNotAuthenticatePublicRoutes rejects Cookie/session
+// credentials on business HTTP and MCP tool routes, preserving the MCP auth error
+// and leaving ordinary-Token admission counters unchanged.
 func TestBrowserCredentialsDoNotAuthenticatePublicRoutes(t *testing.T) {
 	f := newAdminAuthFixture(t, config.Config{})
 	cookie := f.login(t)
@@ -633,6 +692,9 @@ func TestBrowserCredentialsDoNotAuthenticatePublicRoutes(t *testing.T) {
 	}
 }
 
+// TestPublicProgrammaticCredentialsRemainIndependent checks Keys/Tokens reach
+// search validation without browser proof despite an incidental Cookie. It keeps
+// ordinary-Token admission marks, auth-off search and anonymous MCP discovery intact.
 func TestPublicProgrammaticCredentialsRemainIndependent(t *testing.T) {
 	f := newAdminAuthFixture(t, config.Config{})
 	cookie := f.login(t)

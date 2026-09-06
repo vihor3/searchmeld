@@ -8,6 +8,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Connect parses databaseURL, rejecting legacy query options and nonpositive
+// cache capacities for the selected cached mode before constructing a pgx pool.
+// It closes the pool if the startup Ping fails; callers must close a returned pool.
 func Connect(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	config, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {

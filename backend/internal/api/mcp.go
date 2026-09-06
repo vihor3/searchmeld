@@ -92,6 +92,9 @@ func (h *Handler) mcpDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusMethodNotAllowed)
 }
 
+// mcp dispatches JSON-RPC POSTs after batch validation and required authentication.
+// Tool-bearing replies use the larger encoded-byte budget; cancellation does not
+// roll back already completed tool or accounting work.
 func (h *Handler) mcp(w http.ResponseWriter, r *http.Request) {
 	if mcpRequestCanceled(w, r) {
 		return
@@ -174,6 +177,8 @@ func (h *Handler) mcp(w http.ResponseWriter, r *http.Request) {
 	writeMCPPayload(w, http.StatusOK, payload)
 }
 
+// mcpRequestCanceled writes a null-ID HTTP 408 / -32000 error when the context
+// has ended and reports whether the caller must stop processing.
 func mcpRequestCanceled(w http.ResponseWriter, r *http.Request) bool {
 	if r.Context().Err() == nil {
 		return false
@@ -182,6 +187,9 @@ func mcpRequestCanceled(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// mcpResponseLimit selects the larger encoded-byte budget for any tools/call
+// entry; all other methods share the discovery limit. Callers reserve JSON framing
+// and the trailing newline from this budget.
 func mcpResponseLimit(requests []mcpRequest) int {
 	if countMCPToolCalls(requests) > 0 {
 		return maxMCPResponseBytes
@@ -199,6 +207,10 @@ func countMCPToolCalls(requests []mcpRequest) int {
 	return count
 }
 
+// handleMCPBatch buffers replies in order, reserving JSON framing in the budget.
+// Notifications are omitted; cancellation or encoding failure discards buffered
+// output but cannot undo completed tool work. The caller owns authentication and
+// the one-tool-call restriction.
 func (h *Handler) handleMCPBatch(w http.ResponseWriter, r *http.Request, requests []mcpRequest) {
 	if len(requests) == 0 || len(requests) > maxMCPBatchRequests {
 		writeMCPError(w, http.StatusBadRequest, nil, -32600, fmt.Sprintf("a JSON-RPC batch must contain between 1 and %d requests", maxMCPBatchRequests), nil)
@@ -243,6 +255,9 @@ func (h *Handler) handleMCPBatch(w http.ResponseWriter, r *http.Request, request
 	writeMCPPayload(w, http.StatusOK, payload.Bytes())
 }
 
+// handleMCPRequest dispatches one entry, with authentication owned by its caller.
+// The boolean indicates a reply: notifications omit one unless the context was
+// already canceled, which yields an error before any dispatch.
 func (h *Handler) handleMCPRequest(r *http.Request, req mcpRequest) (mcpResponse, bool) {
 	if r.Context().Err() != nil {
 		return newMCPError(req.ID, -32000, "request canceled", nil), true
@@ -693,6 +708,8 @@ func writeMCPAccepted(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
+// writeMCPResponse sends a single reply within the discovery budget, including
+// its newline, or substitutes a bounded encoding error before writing headers.
 func writeMCPResponse(w http.ResponseWriter, status int, response mcpResponse) {
 	payload, err := marshalMCPResponse(response, maxMCPDiscoveryBytes-1)
 	if err != nil {
@@ -702,6 +719,9 @@ func writeMCPResponse(w http.ResponseWriter, status int, response mcpResponse) {
 	writeMCPPayload(w, status, payload)
 }
 
+// marshalMCPResponse propagates JSON errors or rejects encoded bytes above limit.
+// Marshaling allocates before size rejection, so this is not a heap bound.
+// Callers reserve any batch framing and trailing newline outside this limit.
 func marshalMCPResponse(response mcpResponse, limit int) ([]byte, error) {
 	payload, err := json.Marshal(response)
 	if err != nil {
@@ -713,6 +733,8 @@ func marshalMCPResponse(response mcpResponse, limit int) ([]byte, error) {
 	return payload, nil
 }
 
+// writeMCPEncodingError maps size overflow to HTTP 413 / -32000 and other encoding
+// failures to HTTP 500 / -32603, without reflecting the caller ID or error details.
 func writeMCPEncodingError(w http.ResponseWriter, err error) {
 	status, code, message := http.StatusInternalServerError, -32603, "could not encode mcp response"
 	if errors.Is(err, errMCPResponseTooLarge) {
@@ -723,6 +745,8 @@ func writeMCPEncodingError(w http.ResponseWriter, err error) {
 	writeMCPPayload(w, status, payload)
 }
 
+// writeMCPPayload appends a newline and writes MCP headers and pre-encoded JSON.
+// The caller owns size validation; response-writer errors are not returned.
 func writeMCPPayload(w http.ResponseWriter, status int, payload []byte) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Mcp-Protocol-Version", mcpLatestProtocolVersion)

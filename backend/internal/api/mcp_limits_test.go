@@ -18,6 +18,8 @@ import (
 	"github.com/vihor3/searchmeld/backend/internal/search"
 )
 
+// mcpLimitsServer mounts both MCP aliases, including trailing-slash variants,
+// under the real server middleware with a fixture-selected request-body limit.
 func mcpLimitsServer(h *Handler, bodyLimit int64) *Server {
 	server := NewServer(config.Config{RequestBodyLimitBytes: bodyLimit}, &adminAuthTestLogger{})
 	server.Mount(func(r chi.Router) {
@@ -27,6 +29,8 @@ func mcpLimitsServer(h *Handler, bodyLimit int64) *Server {
 	return server
 }
 
+// TestMountedMCPDiscoveryBatchBounds checks anonymous discovery on every alias,
+// preserving ordered schemas within the batch cap and rejecting one extra entry.
 func TestMountedMCPDiscoveryBatchBounds(t *testing.T) {
 	server := mcpLimitsServer(&Handler{}, 1024*1024)
 	for _, path := range []string{"/mcp", "/mcp/", "/v1/mcp", "/v1/mcp/"} {
@@ -73,6 +77,8 @@ func TestMountedMCPDiscoveryBatchBounds(t *testing.T) {
 	}
 }
 
+// TestMountedMCPRejectsOversizedBatchBeforeAuthentication checks that empty and
+// over-limit batches fail with -32600 before any authentication dependency is used.
 func TestMountedMCPRejectsOversizedBatchBeforeAuthentication(t *testing.T) {
 	server := mcpLimitsServer(&Handler{}, 1024*1024)
 	for _, method := range []string{"tools/call", "unknown", "notifications/initialized"} {
@@ -92,6 +98,9 @@ func TestMountedMCPRejectsOversizedBatchBeforeAuthentication(t *testing.T) {
 	assertMCPBoundError(t, response, -32600)
 }
 
+// TestMountedMCPEncodedDiscoveryBudget uses IDs that expand under JSON escaping
+// to exceed the output budget while the input fits, requiring a small null-ID error
+// instead of schemas or reflected IDs for both single and batch replies.
 func TestMountedMCPEncodedDiscoveryBudget(t *testing.T) {
 	server := mcpLimitsServer(&Handler{}, 1024*1024)
 	for _, count := range []int{1, 8} {
@@ -122,6 +131,8 @@ func TestMountedMCPEncodedDiscoveryBudget(t *testing.T) {
 	}
 }
 
+// TestMountedMCPStillEnforcesRequestBodyLimit keeps oversized bodies mapped to
+// HTTP 400 / -32700 even with separate encoded-response budgets.
 func TestMountedMCPStillEnforcesRequestBodyLimit(t *testing.T) {
 	server := mcpLimitsServer(&Handler{}, 64)
 	body := `{"jsonrpc":"2.0","method":"tools/list","id":"` + strings.Repeat("x", 64) + `"}`
@@ -129,6 +140,8 @@ func TestMountedMCPStillEnforcesRequestBodyLimit(t *testing.T) {
 	assertMCPBoundError(t, response, -32700)
 }
 
+// TestMCPNotificationsRemainAcceptedAndOmitted checks bodyless HTTP 202 for
+// notification-only requests and omission of notifications from mixed batch results.
 func TestMCPNotificationsRemainAcceptedAndOmitted(t *testing.T) {
 	server := mcpLimitsServer(&Handler{}, 1024*1024)
 	for _, body := range []string{
@@ -148,6 +161,9 @@ func TestMCPNotificationsRemainAcceptedAndOmitted(t *testing.T) {
 	}
 }
 
+// TestMCPResponseEncodingBudgetAndFailure checks exact encoded-byte edges,
+// generic errors for unsupported JSON values, and null-ID overflow errors when
+// the original error response would reflect an oversized caller ID.
 func TestMCPResponseEncodingBudgetAndFailure(t *testing.T) {
 	response := newMCPResult(json.RawMessage("1"), map[string]interface{}{"text": "<content>"})
 	encoded, err := json.Marshal(response)
@@ -186,6 +202,8 @@ func TestMCPResponseEncodingBudgetAndFailure(t *testing.T) {
 	assertMCPBoundError(t, recorder, -32000)
 }
 
+// TestMountedMCPCancellationStopsBeforeReading requires HTTP 408 / -32000 without
+// consuming the body when the request context is already canceled.
 func TestMountedMCPCancellationStopsBeforeReading(t *testing.T) {
 	server := mcpLimitsServer(&Handler{}, 1024*1024)
 	body := bytes.NewBufferString(`[{"jsonrpc":"2.0","id":1,"method":"tools/list"}]`)
@@ -200,6 +218,8 @@ func TestMountedMCPCancellationStopsBeforeReading(t *testing.T) {
 	}
 }
 
+// TestMountedMCPCancellationDuringBodyRead gives cancellation precedence over the
+// body-read error, retaining the bounded null-ID timeout response.
 func TestMountedMCPCancellationDuringBodyRead(t *testing.T) {
 	server := mcpLimitsServer(&Handler{}, 1024*1024)
 	r := httptest.NewRequest(http.MethodPost, "/mcp", nil)
@@ -214,15 +234,21 @@ type cancelingMCPBody struct {
 	cancel context.CancelFunc
 }
 
+// Read cancels the request context and returns context.Canceled without bytes,
+// forcing the handler's post-read cancellation check.
 func (b *cancelingMCPBody) Read([]byte) (int, error) {
 	b.cancel()
 	return 0, context.Canceled
 }
 
+// Close is a no-op because the synthetic reader owns no external resource.
 func (*cancelingMCPBody) Close() error {
 	return nil
 }
 
+// TestMCPBatchCancellationDiscardsBufferedResults rejects buffered discovery after
+// the search fixture cancels its context, while retaining the single provider call
+// and Token admission mark that already occurred.
 func TestMCPBatchCancellationDiscardsBufferedResults(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -244,6 +270,9 @@ func TestMCPBatchCancellationDiscardsBufferedResults(t *testing.T) {
 	}
 }
 
+// TestMCPFullExtractSurvivesDiscoveryBudget checks that single and batched tool
+// replies can exceed the discovery cap without truncating structured Extract data,
+// while retaining the bounded text preview and one Token admission mark.
 func TestMCPFullExtractSurvivesDiscoveryBudget(t *testing.T) {
 	for _, batch := range []bool{false, true} {
 		t.Run(fmt.Sprintf("batch=%t", batch), func(t *testing.T) {
@@ -295,6 +324,8 @@ func TestMCPFullExtractSurvivesDiscoveryBudget(t *testing.T) {
 	}
 }
 
+// assertMCPBoundError requires valid JSON with the expected RPC error code and a
+// null ID; callers assert the HTTP status and any encoded-size bound.
 func assertMCPBoundError(t *testing.T, response *httptest.ResponseRecorder, code int) {
 	t.Helper()
 	var result mcpResponse
@@ -308,6 +339,8 @@ type mcpLimitExtractProvider struct {
 	content string
 }
 
+// Extract returns synthetic content for the first requested URL without upstream
+// I/O; callers must supply at least one URL.
 func (p *mcpLimitExtractProvider) Extract(_ context.Context, req model.ExtractRequest, _ model.APIKey) (model.ExtractProviderResponse, error) {
 	return model.ExtractProviderResponse{Results: []model.ExtractResult{{URL: req.URLs[0], Provider: model.ProviderTavily, Content: p.content}}}, nil
 }
@@ -316,10 +349,14 @@ type mcpLimitExtractStore struct {
 	extractValidationStore
 }
 
+// RuntimeSettings permits private targets to skip DNS validation for this
+// synthetic provider fixture; it is not a production configuration.
 func (mcpLimitExtractStore) RuntimeSettings(context.Context) (model.RuntimeSettings, error) {
 	return model.RuntimeSettings{AllowPrivateExtractTargets: true}, nil
 }
 
+// ListProviders exposes enabled Tavily with one available key so normal provider
+// selection reaches the synthetic Extract adapter.
 func (mcpLimitExtractStore) ListProviders(context.Context) ([]model.ProviderConfig, error) {
 	return []model.ProviderConfig{{Name: model.ProviderTavily, Enabled: true, AvailableKeys: 1}}, nil
 }
