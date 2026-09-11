@@ -42,6 +42,7 @@ const networks = new Set()
 const servers = new Set()
 const contexts = new Set()
 const gates = new Set()
+const responseHolds = new WeakMap()
 const secrets = new Set()
 const operations = new AbortController()
 let browser
@@ -410,8 +411,9 @@ async function startFixture(mode, tls) {
 
 /**
  * Tracks an isolated Cookie jar with fixture-only routing, credential-presence
- * observations and redacted page errors. The TLS exception is fixture-only;
- * callers or suite cleanup close the context.
+ * observations and redacted page errors. One persistent route owns both the
+ * origin guard and page response holds; callers or suite cleanup close the context.
+ * The TLS exception is fixture-only.
  */
 async function openContext(fixture, viewport = desktop) {
   const context = await browser.newContext({ viewport, ignoreHTTPSErrors: true, serviceWorkers: 'block', reducedMotion: 'reduce' })
@@ -419,11 +421,27 @@ async function openContext(fixture, viewport = desktop) {
   context.setDefaultTimeout(15000)
   context.setDefaultNavigationTimeout(20000)
   await context.route('**/*', async (route) => {
-    const origin = new URL(route.request().url()).origin
-    if (![fixture.origin, fixture.hostileOrigin].includes(origin)) {
-      fixture.problems.push('Unexpected external browser request')
-      await route.abort()
-    } else await route.continue()
+    const request = route.request()
+    const url = new URL(request.url())
+    const metadata = { method: request.method(), path: url.pathname, resource: request.resourceType() }
+    try {
+      if (![fixture.origin, fixture.hostileOrigin].includes(url.origin)) {
+        fixture.problems.push('Unexpected external browser request')
+        await route.abort()
+      } else {
+        const hold = responseHolds.get(request.frame().page())
+        if (hold) await hold(route)
+        else await route.continue()
+      }
+    } catch (error) {
+      try {
+        console.error(redact(`Packaged ${fixture.label} route failure: ${JSON.stringify({
+          ...metadata, release_gates: gates.size, cleanup_started: Boolean(cleanupPromise)
+        })}`))
+      } finally {
+        throw error
+      }
+    }
   })
   context.on('page', (page) => {
     fixture.pages.push(page)
@@ -958,10 +976,11 @@ async function authBoundaries(fixture, page) {
 
 /**
  * Captures one real reply per path, delaying delivery rather than server
- * authentication. Callers own release(), which unroutes the hold; suite cleanup
- * resolves outstanding release gates before closing browser resources.
+ * authentication. Callers own release(), which removes the page's in-memory
+ * hold; suite cleanup resolves release gates before closing browser resources.
  */
 async function holdResponses(fixture, page, paths, status) {
+  assert.ok(!responseHolds.has(page), 'Only one response hold may own a page')
   const arrived = deferred()
   const released = deferred()
   const settled = deferred()
@@ -970,8 +989,6 @@ async function holdResponses(fixture, page, paths, status) {
   let completed = 0
   let failure
   gates.add(released)
-  /** Selects endpoint pathnames; the handler's remaining set limits each to one captured reply. */
-  const matcher = (url) => paths.includes(url.pathname)
   /**
    * Fetches before awaiting release, fulfilling and disposing the reply on success;
    * capture/delivery failures are recorded and route abort is attempted.
@@ -998,16 +1015,18 @@ async function holdResponses(fixture, page, paths, status) {
       if (completed === paths.length) settled.resolve()
     }
   }
-  await page.route(matcher, handler)
+  // Releasing a hold must not remove a Playwright interceptor: removal can
+  // auto-continue requests whose context guard is still running.
+  responseHolds.set(page, handler)
   return {
     /** Waits for all captures or a saved failure within the bound, without canceling outstanding fetches. */
     async wait() { await bounded(arrived.promise, 'real response capture'); if (failure) throw failure },
-    /** Releases replies, waits for handlers, then removes the gate/route and reports saved failures. */
+    /** Releases replies, waits for captures to settle, then removes the hold and reports saved failures. */
     async release() {
       released.resolve()
       await bounded(settled.promise, 'held response delivery')
       gates.delete(released)
-      await page.unroute(matcher, handler)
+      responseHolds.delete(page)
       if (failure) throw failure
     }
   }

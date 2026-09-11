@@ -1079,8 +1079,8 @@ async function logReadSettled(app, path, index = -1) {
     await Promise.resolve()
     return outcome
   }, { path, index }), 'log read settlement: ' + path)
-  // Vue transitions schedule two animation frames before leaving loading overlays.
-  if (app.logClockPaused) await app.page.clock.runFor(50)
+  // Element Plus schedules loading teardown at 400 ms, after Vue's leave frames.
+  if (app.logClockPaused) await app.page.clock.runFor(500)
   return outcome
 }
 
