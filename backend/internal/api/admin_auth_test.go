@@ -38,6 +38,12 @@ type adminAuthTestStore struct {
 	usageMarks   int
 }
 
+// RecordUserRequestLog keeps unrelated mounted auth fixtures independent of
+// entry storage instead of invoking their nil embedded AppStore.
+func (*adminAuthTestStore) RecordUserRequestLog(context.Context, model.UserRequestLogInput) error {
+	return nil
+}
+
 // GetAdminByUsername records the exact lookup name and accepts only the configured
 // fixture account, allowing tests to distinguish rejection from account lookup.
 func (s *adminAuthTestStore) GetAdminByUsername(_ context.Context, username string) (model.AdminUser, error) {

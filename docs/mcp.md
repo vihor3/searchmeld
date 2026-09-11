@@ -86,6 +86,8 @@ Authorization: Bearer oak_xxx
 
 JSON-RPC batch 可以合并初始化、列表和通知类方法，每批最多 32 项，最多包含一个 `tools/call`。这样每次实际 Search / Extract 都会独立经过 Token RPM 和日月配额检查；需要调用多个工具时请发送多个 HTTP JSON-RPC 请求。纯发现响应最多 256 KiB，含工具调用的响应最多 16 MiB（含 JSON 封装）；超出时返回 HTTP 413 / JSON-RPC `-32000`，不返回截断 JSON。请求取消返回 408 / `-32000`。这些响应限制不撤销已完成工具调用的用量记录。
 
+管理台“请求日志”的“用户请求”记录到达后端的 MCP 入口，包括发现、通知和提前拒绝。HTTP 状态、协议错误和工具错误分别展示；HTTP 200 中的 JSON-RPC 错误或 `isError: true` 不会显示成工具成功。详情通过明确的执行 ID 关联已有 Search / Extract 日志，入口记录本身不重复计费。字段、保留策略和覆盖边界见 [日志文档](admin-api-key.md#511-查看日志和审计日志)。
+
 ## 5. 工具
 
 ### 5.1 `search`

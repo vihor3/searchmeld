@@ -66,13 +66,17 @@ func (h *Handler) mountMCP(r chi.Router, path string) {
 	h.mountMCPPath(r, path+"/")
 }
 
+// mountMCPPath observes only registered methods, including configured aliases;
+// POST attribution is selected by dispatch while GET/DELETE remain public.
 func (h *Handler) mountMCPPath(r chi.Router, path string) {
-	r.Get(path, h.mcpInfo)
-	r.Post(path, h.mcp)
-	r.Delete(path, h.mcpDelete)
+	r.With(h.captureUserRequest("mcp", model.CompatFormatNative)).Get(path, h.mcpInfo)
+	r.With(h.captureUserRequest("mcp", model.CompatFormatNative)).Post(path, h.mcp)
+	r.With(h.captureUserRequest("mcp", model.CompatFormatNative)).Delete(path, h.mcpDelete)
 }
 
+// mcpInfo retains public transport metadata and the existing SSE rejection.
 func (h *Handler) mcpInfo(w http.ResponseWriter, r *http.Request) {
+	observeUserRequestIdentity(r.Context(), userRequestAuthAnonymous, 0, "")
 	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -88,7 +92,9 @@ func (h *Handler) mcpInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// mcpDelete records an anonymous transport request without inventing a session.
 func (h *Handler) mcpDelete(w http.ResponseWriter, r *http.Request) {
+	observeUserRequestIdentity(r.Context(), userRequestAuthAnonymous, 0, "")
 	w.WriteHeader(http.StatusMethodNotAllowed)
 }
 
@@ -137,6 +143,8 @@ func (h *Handler) mcp(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			r = r.WithContext(ctx)
+		} else {
+			observeUserRequestIdentity(r.Context(), userRequestAuthAnonymous, 0, "")
 		}
 		h.handleMCPBatch(w, r, requests)
 		return
@@ -157,6 +165,8 @@ func (h *Handler) mcp(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		r = r.WithContext(ctx)
+	} else {
+		observeUserRequestIdentity(r.Context(), userRequestAuthAnonymous, 0, "")
 	}
 	response, ok := h.handleMCPRequest(r, req)
 	if mcpRequestCanceled(w, r) {
@@ -257,8 +267,14 @@ func (h *Handler) handleMCPBatch(w http.ResponseWriter, r *http.Request, request
 
 // handleMCPRequest dispatches one entry, with authentication owned by its caller.
 // The boolean indicates a reply: notifications omit one unless the context was
-// already canceled, which yields an error before any dispatch.
-func (h *Handler) handleMCPRequest(r *http.Request, req mcpRequest) (mcpResponse, bool) {
+// already canceled, which yields an error before any dispatch. Observe returned
+// protocol/tool failures before encoding; notification acceptance is not execution.
+func (h *Handler) handleMCPRequest(r *http.Request, req mcpRequest) (response mcpResponse, reply bool) {
+	defer func() {
+		if reply {
+			observeUserRequestMCP(r.Context(), response)
+		}
+	}()
 	if r.Context().Err() != nil {
 		return newMCPError(req.ID, -32000, "request canceled", nil), true
 	}
@@ -455,11 +471,14 @@ func mcpExtractToolResult(response model.ExtractResponse) map[string]interface{}
 	}
 }
 
+// mcpInvocationRequestID selects and observes the exact execution ID at the
+// orchestrator call site; it never correlates by a client ID or prefix lookup.
 func mcpInvocationRequestID(r *http.Request) string {
 	invocationID := newRequestID()
 	if parentID := RequestID(r.Context()); parentID != "" {
-		return parentID + "-" + invocationID
+		invocationID = parentID + "-" + invocationID
 	}
+	observeUserRequestExecution(r.Context(), invocationID)
 	return invocationID
 }
 
@@ -481,12 +500,15 @@ func mcpMethodRequiresAuth(method string) bool {
 	}
 }
 
+// mcpAuthContext observes verified identity before rejection without moving MCP's
+// immediate admission mark or adding lookups for anonymous/auth-disabled callers.
 func (h *Handler) mcpAuthContext(r *http.Request) (context.Context, int, string, error) {
 	settings, err := h.store.RuntimeSettings(r.Context())
 	if err != nil {
 		return r.Context(), http.StatusInternalServerError, err.Error(), err
 	}
 	if !settings.APIAuthRequired {
+		observeUserRequestIdentity(r.Context(), userRequestAuthAnonymous, 0, "")
 		return r.Context(), http.StatusOK, "", nil
 	}
 	token := bearerToken(r)
@@ -498,12 +520,14 @@ func (h *Handler) mcpAuthContext(r *http.Request) (context.Context, int, string,
 		return r.Context(), http.StatusInternalServerError, err.Error(), err
 	}
 	if ok {
+		observeUserRequestIdentity(r.Context(), userRequestAuthAdminKey, 0, "")
 		return context.WithValue(r.Context(), adminActorKey, adminAPIKeyActor(adminKey)), http.StatusOK, "", nil
 	}
 	apiToken, err := h.store.FindAPIToken(r.Context(), token)
 	if err != nil {
 		return r.Context(), http.StatusUnauthorized, "invalid api token", err
 	}
+	observeUserRequestIdentity(r.Context(), userRequestAuthToken, apiToken.ID, apiToken.Name)
 	h.auth.markAPITokenUsed(apiToken.ID)
 	if !h.auth.allowToken(apiToken) {
 		return r.Context(), http.StatusTooManyRequests, "api token rate limit exceeded", fmt.Errorf("api token rate limit exceeded")
@@ -710,11 +734,15 @@ func writeMCPAccepted(w http.ResponseWriter) {
 
 // writeMCPResponse sends a single reply within the discovery budget, including
 // its newline, or substitutes a bounded encoding error before writing headers.
+// Transport errors count once at the encoded outcome; dispatch is observed separately.
 func writeMCPResponse(w http.ResponseWriter, status int, response mcpResponse) {
 	payload, err := marshalMCPResponse(response, maxMCPDiscoveryBytes-1)
 	if err != nil {
 		writeMCPEncodingError(w, err)
 		return
+	}
+	if response.Error != nil {
+		observeMCPTransportError(w)
 	}
 	writeMCPPayload(w, status, payload)
 }
@@ -736,6 +764,7 @@ func marshalMCPResponse(response mcpResponse, limit int) ([]byte, error) {
 // writeMCPEncodingError maps size overflow to HTTP 413 / -32000 and other encoding
 // failures to HTTP 500 / -32603, without reflecting the caller ID or error details.
 func writeMCPEncodingError(w http.ResponseWriter, err error) {
+	observeMCPTransportError(w)
 	status, code, message := http.StatusInternalServerError, -32603, "could not encode mcp response"
 	if errors.Is(err, errMCPResponseTooLarge) {
 		status, code, message = http.StatusRequestEntityTooLarge, -32000, errMCPResponseTooLarge.Error()

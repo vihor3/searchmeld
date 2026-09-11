@@ -10,6 +10,7 @@ const { randomBytes } = require('node:crypto')
 const { mkdir, readFile, rm, writeFile } = require('node:fs/promises')
 const http = require('node:http')
 const https = require('node:https')
+const { isIP } = require('node:net')
 const { join, resolve, sep } = require('node:path')
 const { promisify } = require('node:util')
 const { chromium } = require('playwright')
@@ -561,7 +562,7 @@ async function me(page, fixture, status = 200) {
   if (status === 200) assert.equal(typeof JSON.parse(reply.body).username, 'string')
 }
 
-/** Checks accepted credentials reach empty-query validation before provider work; admission may still count usage. */
+/** Returns the real reply after empty-query validation, permitting entry correlation without provider work. */
 async function searchValidation(fixture, headers, label) {
   // Empty input reaches the retained business handler but returns before
   // orchestration, so an accepted Key/Token cannot spend upstream credits.
@@ -570,11 +571,152 @@ async function searchValidation(fixture, headers, label) {
   const body = JSON.parse(reply.body)
   assert.equal(body.error.status, 400, `${label}: business validation envelope`)
   assert.equal(body.error.message, 'query is required', `${label}: reached the search handler`)
+  return reply
+}
+
+/** Captures server identity and expected safe fields; only rejected Extract cases select an execution here. */
+function userRequestCase(reply, fields = {}, rejectedExtract = false) {
+  const requestID = reply.headers['x-request-id']
+  assert.ok(typeof requestID === 'string' && requestID.length > 0 && Buffer.byteLength(requestID) <= 256, 'Mounted Go reply needs a bounded server request ID')
+  return {
+    request_id: requestID, operation: 'search', compat_format: 'native', method: 'POST', path: '/v1/search',
+    auth_type: 'unknown', api_token_id: null, token_name: '', http_status: reply.status,
+    completion: 'completed', mcp_error_count: 0, mcp_tool_error_count: 0,
+    execution_request_id: rejectedExtract ? requestID : null, ...fields
+  }
+}
+
+/** Rejects credential/payload fields and invalid metadata without including secret values in assertion messages. */
+function safeUserRequest(log) {
+  assert.ok(log !== null && typeof log === 'object' && !Array.isArray(log), 'User entry must be an object')
+  const serialized = JSON.stringify(log)
+  for (const value of secrets) assert.ok(!serialized.includes(value), 'Entry metadata must exclude synthetic credentials and payload sentinels')
+  assert.deepEqual(Object.keys(log).sort(), [
+    'id', 'request_id', 'created_at', 'operation', 'compat_format', 'method', 'path', 'client_ip',
+    'auth_type', 'api_token_id', 'token_name', 'http_status', 'completion', 'latency_ms',
+    'mcp_error_count', 'mcp_tool_error_count', 'execution_request_id'
+  ].sort(), 'Entry API contains only the frozen metadata fields')
+  assert.ok(Number.isSafeInteger(log.id) && log.id > 0, 'Entry has a persistent numeric ID')
+  assert.ok(Number.isFinite(Date.parse(log.created_at)), 'Entry has a request timestamp')
+  assert.ok(Number.isSafeInteger(log.latency_ms) && log.latency_ms >= 0, 'Entry duration includes zero')
+  assert.ok(isIP(log.client_ip) > 0, 'Packaged proxy attribution must be an IP without a port')
+  assert.ok(!['192.0.2.44', '198.51.100.44', '203.0.113.44'].includes(log.client_ip), 'Forged forwarding headers cannot choose the entry IP')
+}
+
+/**
+ * Polls for post-handler inserts against a ten-second deadline, failing HTTP errors
+ * immediately. Resolves exact details and checks rejected Extract links have no calls.
+ */
+async function userRequestEntries(fixture, headers, cases) {
+  assert.equal(new Set(cases.map((entry) => entry.request_id)).size, cases.length, 'Every HTTP request has a distinct server ID')
+  const deadline = Date.now() + 10000
+  let logs
+  while (Date.now() < deadline) {
+    const reply = adminReply(await request(fixture.origin, '/api/admin/request-logs?limit=1000', {
+      headers, timeout: Math.max(1, Math.min(2000, deadline - Date.now()))
+    }), 200, 'Read persisted user entries')
+    const body = JSON.parse(reply.body)
+    assert.deepEqual(Object.keys(body), ['logs'], 'Entry list envelope')
+    assert.ok(Array.isArray(body.logs), 'Entry list must be an array')
+    logs = body.logs
+    if (cases.every((entry) => logs.some((log) => log.request_id === entry.request_id))) break
+    await new Promise((done) => setTimeout(done, Math.max(0, Math.min(100, deadline - Date.now()))))
+  }
+  assert.ok(cases.every((entry) => logs?.some((log) => log.request_id === entry.request_id)), 'User entries must persist within ten seconds of handling')
+  assert.equal(logs.length, cases.length, 'Admin reads, health probes and removed routes must not create user entries')
+  for (const log of logs) safeUserRequest(log)
+  const details = []
+  let clientIP
+  for (const expected of cases) {
+    const matching = logs.filter((log) => log.request_id === expected.request_id)
+    assert.equal(matching.length, 1, 'One entry per server request ID')
+    const [log] = matching
+    safeUserRequest(log)
+    for (const [field, value] of Object.entries(expected)) assert.equal(log[field], value, `Entry ${field} must reflect the request outcome`)
+    if (clientIP === undefined) clientIP = log.client_ip
+    assert.equal(log.client_ip, clientIP, 'Clean and forged requests retain the same packaged proxy peer')
+    const detail = JSON.parse(adminReply(await request(fixture.origin, `/api/admin/request-logs/${log.id}`, { headers }), 200, 'User entry detail').body)
+    assert.deepEqual(Object.keys(detail).sort(), ['execution_log_id', 'log'], 'Entry detail envelope')
+    safeUserRequest(detail.log)
+    assert.deepEqual(detail.log, log, 'List and detail expose the same persisted metadata')
+    if (expected.execution_request_id === null) {
+      assert.equal(detail.execution_log_id, null, 'No selected execution must have an explicit null link')
+    } else {
+      assert.ok(Number.isSafeInteger(detail.execution_log_id) && detail.execution_log_id > 0, 'Rejected Extract must resolve its existing execution')
+      const execution = JSON.parse(adminReply(await request(fixture.origin, `/api/admin/logs/${detail.execution_log_id}`, { headers }), 200, 'Linked rejected Extract execution').body)
+      assert.equal(execution.log.request_id, expected.execution_request_id, 'Execution linkage is exact')
+      assert.equal(execution.log.operation, 'extract')
+      assert.equal(execution.log.status, 'error')
+      assert.deepEqual(execution.calls, [], 'Rejected Extract does not call a provider')
+      assert.deepEqual(execution.log.request_json, {}, 'Rejected Extract retains no request payload')
+      assert.deepEqual(execution.log.response_json, {}, 'Rejected Extract retains no response payload')
+    }
+    details.push(detail)
+  }
+  return details
+}
+
+/** Checks populated list/detail reads inherit Cookie proof, explicit Key precedence and no-store policy. */
+async function userRequestAccess(fixture, cookieHeaders, { key, token }, detail) {
+  for (const path of ['/api/admin/request-logs', `/api/admin/request-logs/${detail.log.id}`]) {
+    for (const headers of [cookieHeaders, { Authorization: `Bearer ${key}` }, { 'X-API-Key': key }]) {
+      const body = JSON.parse(adminReply(await request(fixture.origin, path, { headers }), 200, 'Admin-only user entry read').body)
+      if (Array.isArray(body.logs)) assert.ok(body.logs.some((log) => log.request_id === detail.log.request_id), 'Authorized list contains the real entry')
+      else assert.deepEqual(body, detail, 'Key-only and Cookie detail agree')
+    }
+    for (const headers of [
+      proof, { Authorization: `Bearer ${token}` }, { 'X-API-Key': token },
+      { ...cookieHeaders, Authorization: `Bearer ${token}` }, { ...cookieHeaders, 'X-API-Key': token },
+      { ...cookieHeaders, Authorization: 'Bearer oak_invalid_fixture' }
+    ]) adminReply(await request(fixture.origin, path, { headers }), 401, 'Ordinary Tokens and invalid headers cannot read entries or borrow Cookie privileges')
+    adminReply(await request(fixture.origin, path, { headers: { Cookie: cookieHeaders.Cookie } }), 403, 'Entry Cookie read requires browser proof')
+  }
+}
+
+/** Inspects real packaged metadata at the page viewport, then returns to providers for the session lifecycle cases. */
+async function userRequestUI(fixture, page, detail, size) {
+  await page.goto(`${fixture.origin}/logs`)
+  await atProtected(page, fixture, '/logs')
+  const tabs = page.locator('.logs-view-tabs')
+  const userTab = tabs.getByRole('tab', { name: '\u7528\u6237\u8bf7\u6c42', exact: true })
+  await userTab.waitFor()
+  assert.equal(await userTab.getAttribute('aria-selected'), 'true', 'User requests are the default view')
+  await tabs.getByRole('tab', { name: '\u6267\u884c\u65e5\u5fd7', exact: true }).waitFor()
+  const toggle = page.locator('.logs-actions .el-switch')
+  if (await toggle.locator('[role="switch"]').getAttribute('aria-checked') === 'true') await toggle.click()
+  const row = page.locator(`[data-log-kind="user"][data-log-id="${detail.log.id}"]`)
+  await row.waitFor()
+  const pending = page.waitForResponse((res) => new URL(res.url()).pathname === `/api/admin/request-logs/${detail.log.id}` && res.request().method() === 'GET')
+  await row.click()
+  const response = await pending
+  adminReply({ status: response.status(), headers: await response.allHeaders() }, 200, 'Packaged drawer reads with browser Cookie')
+  await response.finished()
+  assert.deepEqual(await response.json(), detail, 'Browser detail matches the persisted API entry')
+  const drawer = page.locator('.log-drawer.open')
+  await drawer.waitFor()
+  await drawer.locator('.entry-detail[aria-busy="false"]').waitFor()
+  await drawer.locator('[data-execution-state="none"]').waitFor()
+  await page.waitForFunction((log) => {
+    const text = document.querySelector('.log-drawer.open')?.textContent || ''
+    return [log.request_id, log.path, log.method, log.client_ip, log.token_name, `Token #${log.api_token_id}`, `HTTP ${log.http_status}`].every((value) => text.includes(value))
+  }, detail.log)
+  const text = await drawer.innerText()
+  for (const value of secrets) assert.ok(!text.includes(value), 'Drawer must not render credentials or unretained payloads')
+  const inBounds = await drawer.evaluate((element) => {
+    const rect = element.getBoundingClientRect()
+    return rect.left >= -1 && rect.right <= innerWidth + 1 && element.scrollWidth <= element.clientWidth + 1
+  })
+  assert.ok(inBounds, 'Packaged entry drawer fits the viewport')
+  await screenshot(page, `${fixture.label}-${size}-user-request`)
+  await drawer.press('Escape')
+  await drawer.waitFor({ state: 'hidden' })
+  await page.goto(`${fixture.origin}${target}`)
+  await atProtected(page, fixture)
 }
 
 /**
  * Checks removed public routes across credentials and persisted auth-on/off modes,
- * asserts admin equivalents remain protected and restores initial settings in finally.
+ * returns entry expectations for retained business probes and restores settings in finally.
  */
 async function removedPublicEndpoints(fixture, cookieHeaders, { key, token, session }) {
   /** Pins settings requests to the authenticated Cookie/proof headers while business auth mode changes. */
@@ -589,6 +731,7 @@ async function removedPublicEndpoints(fixture, cookieHeaders, { key, token, sess
     ['invalid Key', { Authorization: 'Bearer oak_invalid_fixture' }]
   ]
   let settingsChanged = false
+  const entries = []
   try {
     for (const required of [true, false]) {
       if (!required) {
@@ -600,8 +743,10 @@ async function removedPublicEndpoints(fixture, cookieHeaders, { key, token, sess
       const effective = JSON.parse(adminReply(await admin('/api/admin/settings'), 200, 'Probe effective business auth').body)
       assert.equal(effective.api_auth_required, required)
       if (required) {
-        assert.equal((await request(fixture.origin, '/v1/search', { method: 'POST', body: {} })).status, 401, 'Auth-on rejects anonymous business calls')
-      } else await searchValidation(fixture, {}, 'Auth-off reaches the retained business handler anonymously')
+        const reply = await request(fixture.origin, '/v1/search', { method: 'POST', body: {} })
+        assert.equal(reply.status, 401, 'Auth-on rejects anonymous business calls')
+        entries.push(userRequestCase(reply))
+      } else entries.push(userRequestCase(await searchValidation(fixture, {}, 'Auth-off reaches the retained business handler anonymously'), { auth_type: 'anonymous' }))
       for (const path of ['/v1/providers', '/v1/usage/summary']) {
         for (const [label, headers] of credentials) {
           const reply = await request(fixture.origin, path, { headers })
@@ -626,12 +771,14 @@ async function removedPublicEndpoints(fixture, cookieHeaders, { key, token, sess
   }
   const restored = JSON.parse(adminReply(await admin('/api/admin/settings'), 200, 'Probe restored business auth').body)
   assert.equal(restored.api_auth_required, true)
+  return entries
 }
 
 /**
  * Provisions synthetic Key/Token credentials and tests header precedence,
  * Cookie exclusion from business/MCP auth, browser proof and Origin policy,
- * including same-host cross-port requests. Returns credentials for restart checks.
+ * including same-host cross-port requests. Returns credentials and persisted entry
+ * snapshots for restart checks; all business cases reject before provider work.
  */
 async function authBoundaries(fixture, page) {
   const cookie = await currentCookie(page.context(), fixture)
@@ -644,10 +791,13 @@ async function authBoundaries(fixture, page) {
   const tokenReply = adminReply(await admin('/api/admin/tokens', {
     method: 'POST', body: { name: 'ci-cookie-control', scopes: ['search'], allowed_providers: [] }
   }), 201, 'ordinary Token provisioning')
-  const token = secret(JSON.parse(tokenReply.body).raw_token)
+  const provisioned = JSON.parse(tokenReply.body)
+  const token = secret(provisioned.raw_token)
   assert.ok(token.startsWith('osr_'))
-  await searchValidation(fixture, { Authorization: `Bearer ${token}` }, 'Ordinary search Token reaches business validation')
-  await removedPublicEndpoints(fixture, cookieHeaders, { key, token, session: cookie.value })
+  assert.ok(Number.isSafeInteger(provisioned.token?.id) && provisioned.token.id > 0, 'Ordinary Token has a persistent ID')
+  const caller = { auth_type: 'api_token', api_token_id: provisioned.token.id, token_name: provisioned.token.name }
+  const requestCases = [userRequestCase(await searchValidation(fixture, { Authorization: `Bearer ${token}` }, 'Ordinary search Token reaches business validation'), caller)]
+  requestCases.push(...await removedPublicEndpoints(fixture, cookieHeaders, { key, token, session: cookie.value }))
 
   for (const headers of [
     { Authorization: `Bearer ${cookie.value}` }, { 'X-API-Key': cookie.value },
@@ -664,7 +814,7 @@ async function authBoundaries(fixture, page) {
     adminReply(await request(fixture.origin, '/api/admin/me', {
       headers: { ...headers, Cookie: `${cookieName}=adm_invalid_fixture` }
     }), 200, 'Valid Key wins over stale Cookie')
-    await searchValidation(fixture, headers, 'Key business API')
+    requestCases.push(userRequestCase(await searchValidation(fixture, headers, 'Key business API'), { auth_type: 'admin_key' }))
     adminReply(await request(fixture.origin, '/api/admin/logout', {
       method: 'POST', headers: { ...headers, Cookie: cookieHeaders.Cookie }
     }), 200, 'Key logout is non-revoking and ignores incidental Cookie')
@@ -675,30 +825,76 @@ async function authBoundaries(fixture, page) {
   // Send the Cookie explicitly beyond its browser Path. Path omission alone
   // would not establish the backend's public credential boundary.
   const business = [
-    ['/v1/search', 'POST'], ['/v1/extract', 'POST'],
-    ['/v1/compat/tavily/search', 'POST'], ['/v1/compat/tavily/extract', 'POST'],
-    ['/v1/compat/serper/search', 'POST'], ['/v1/compat/openai/responses-search', 'POST']
+    ['/v1/search', 'search', 'native'], ['/v1/extract', 'extract', 'native'],
+    ['/v1/compat/tavily/search', 'search', 'tavily'], ['/v1/compat/tavily/extract', 'extract', 'tavily'],
+    ['/v1/compat/serper/search', 'search', 'serper'], ['/v1/compat/openai/responses-search', 'search', 'openai']
   ]
-  for (const [path, method] of business) {
+  for (const [path, operation, compat_format] of business) {
     for (const [kind, headers] of [
       ['Cookie', cookieHeaders], ['session Bearer', { Authorization: `Bearer ${cookie.value}` }], ['session X-API-Key', { 'X-API-Key': cookie.value }]
     ]) {
       const reply = await request(fixture.origin, path, {
-        method, headers,
-        ...(method === 'GET' ? {} : { body: { query: 'ci-only', urls: ['https://example.invalid/article'] } })
+        method: 'POST', headers, body: { query: 'ci-only', urls: ['https://example.invalid/article'] }
       })
       assert.equal(reply.status, 401, `${path}: explicit ${kind} must not authorize business calls`)
+      requestCases.push(userRequestCase(reply, { path, operation, compat_format }))
     }
   }
   const rpc = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'ci-no-such-tool', arguments: {} } }
   for (const path of ['/mcp', '/v1/mcp']) {
     for (const headers of [cookieHeaders, { Authorization: `Bearer ${cookie.value}` }]) {
-      assert.equal((await request(fixture.origin, path, { method: 'POST', headers, body: rpc })).status, 401, 'MCP rejects session credentials')
+      const reply = await request(fixture.origin, path, { method: 'POST', headers, body: rpc })
+      assert.equal(reply.status, 401, 'MCP rejects session credentials')
+      requestCases.push(userRequestCase(reply, { path, operation: 'mcp', mcp_error_count: 1 }))
     }
     const reply = await request(fixture.origin, path, { method: 'POST', headers: { Authorization: `Bearer ${key}` }, body: rpc })
     assert.equal(reply.status, 200, 'Key passes MCP auth without calling a provider')
     assert.equal(JSON.parse(reply.body).error.code, -32602, 'Synthetic unknown tool reaches method validation')
+    requestCases.push(userRequestCase(reply, { path, operation: 'mcp', auth_type: 'admin_key', mcp_error_count: 1 }))
   }
+
+  const payloadSentinel = secret(`ci-entry-private-${randomBytes(16).toString('hex')}`)
+  const spoofed = await request(fixture.origin, `/v1/search?api_key=${payloadSentinel}`, {
+    method: 'POST', body: { query: '', unretained: payloadSentinel },
+    headers: {
+      Authorization: `Bearer ${key}`, Cookie: cookieHeaders.Cookie, 'X-Request-ID': 'ci-entry-correlation',
+      'True-Client-IP': '198.51.100.44', 'X-Real-IP': '203.0.113.44', 'X-Forwarded-For': '192.0.2.44',
+      Forwarded: 'for=192.0.2.44;proto=https;host=untrusted.invalid'
+    }
+  })
+  assert.equal(spoofed.status, 400, 'Spoofed metadata fixture still stops at empty-query validation')
+  assert.ok(spoofed.headers['x-request-id']?.startsWith('ci-entry-correlation-'), 'Permitted correlation prefix remains intact')
+  requestCases.push(userRequestCase(spoofed, { auth_type: 'admin_key' }))
+  for (const [path, compat_format] of [['/v1/extract', 'native'], ['/v1/compat/tavily/extract', 'tavily']]) {
+    const reply = await request(fixture.origin, path, {
+      method: 'POST', headers: compat_format === 'tavily' ? {} : { Authorization: `Bearer ${token}` },
+      body: { urls: [`https://example.invalid/${payloadSentinel}`], ...(compat_format === 'tavily' ? { api_key: token } : {}) }
+    })
+    assert.equal(reply.status, 403, 'Search-only Token cannot execute Extract')
+    assert.equal(JSON.parse(reply.body).error.message, 'api token does not include extract scope', 'Extract rejects before decoding targets')
+    requestCases.push(userRequestCase(reply, { ...caller, path, operation: 'extract', compat_format }, true))
+  }
+  try {
+    adminReply(await admin(`/api/admin/tokens/${provisioned.token.id}`, {
+      method: 'PATCH', body: { ...provisioned.token, rate_limit_per_min: 1 }
+    }), 200, 'Limit the synthetic Token for a bounded 429 case')
+    const admitted = await searchValidation(fixture, { Authorization: `Bearer ${token}` }, 'First limited Token request reaches validation')
+    requestCases.push(userRequestCase(admitted, caller))
+    const limited = await request(fixture.origin, '/v1/search', { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: {} })
+    assert.equal(limited.status, 429, 'Second request exceeds the one-per-minute Token limit')
+    assert.equal(JSON.parse(limited.body).error.message, 'api token rate limit exceeded', '429 is generated by mounted Go auth')
+    requestCases.push(userRequestCase(limited, caller))
+  } finally {
+    adminReply(await admin(`/api/admin/tokens/${provisioned.token.id}`, {
+      method: 'PATCH', body: provisioned.token
+    }), 200, 'Restore the Token rate setting before restart checks')
+  }
+  const requestLogs = await userRequestEntries(fixture, cookieHeaders, requestCases)
+  await userRequestAccess(fixture, cookieHeaders, { key, token }, requestLogs[0])
+  const executions = JSON.parse(adminReply(await admin('/api/admin/logs?limit=1000'), 200, 'Execution history remains separate').body).logs
+  assert.deepEqual(executions.map((log) => log.request_id).sort(), requestCases.filter((entry) => entry.execution_request_id !== null).map((entry) => entry.execution_request_id).sort(), 'Only the existing rejected Extract paths create executions')
+  const usage = JSON.parse(adminReply(await admin('/api/admin/usage/summary'), 200, 'Entry-only traffic does not bill providers').body)
+  assert.equal(usage.requests_total, 0, 'Entry logging and rejected Extract must not create accounted executions')
 
   for (const suppliedProof of [undefined, '0']) {
     const headers = suppliedProof === undefined ? {} : { 'X-SearchMeld-Admin': suppliedProof }
@@ -757,7 +953,7 @@ async function authBoundaries(fixture, page) {
   assert.equal(preflighted.blocked, true, 'Hostile custom-header fetch is rejected by CORS')
   await me(page, fixture)
   await hostile.close()
-  return { key, token }
+  return { key, token, requestCases, requestLogs }
 }
 
 /**
@@ -880,8 +1076,8 @@ async function lockoutDespiteSpoofing(fixture) {
 /**
  * Exercises shared/separate jars, Cookie deletion/revocation, stale replies and
  * restart with the original browser origin and jar. External DB identity and
- * installed credentials must persist; contexts close on success, while the caller
- * owns browser/container teardown. Tracked resources remain for failure cleanup.
+ * installed credentials and entry metadata must persist; contexts close on success.
+ * The caller owns browser/container teardown; failures retain tracked resources.
  */
 async function exercise(fixture) {
   const context = await openContext(fixture)
@@ -915,7 +1111,9 @@ async function exercise(fixture) {
   await me(first, fixture)
   await independent.close()
   contexts.delete(independent)
-  const { key, token } = await authBoundaries(fixture, first)
+  const { key, token, requestCases, requestLogs } = await authBoundaries(fixture, first)
+  await userRequestUI(fixture, first, requestLogs[0], 'desktop')
+  await userRequestUI(fixture, second, requestLogs[0], 'mobile')
 
   const formerlyValid = await currentCookie(context, fixture)
   for (const page of [first, second]) {
@@ -965,6 +1163,7 @@ async function exercise(fixture) {
     throw error
   }
   await waitHealthy(fixture, 'after restart')
+  assert.deepEqual(await userRequestEntries(fixture, { 'X-API-Key': key }, requestCases), requestLogs, 'Entry metadata and exact execution links survive app restart')
   if (fixture.database) {
     assert.deepEqual(await externalDatabaseSnapshot(fixture), beforeDatabase, 'App restart must not replace/restart external PostgreSQL or lose persisted account/Keys')
   }

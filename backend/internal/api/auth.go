@@ -209,6 +209,8 @@ func adminHeaderCredential(r *http.Request) (string, bool) {
 	return bearerToken(r), true
 }
 
+// requireAPIToken observes only verified identity before rate/scope denial and
+// retains deferred admission marks, including the explicit Extract exemption.
 func (a *AuthService) requireAPIToken(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		settings, err := a.store.RuntimeSettings(r.Context())
@@ -217,6 +219,7 @@ func (a *AuthService) requireAPIToken(next http.Handler) http.Handler {
 			return
 		}
 		if !settings.APIAuthRequired {
+			observeUserRequestIdentity(r.Context(), userRequestAuthAnonymous, 0, "")
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -231,6 +234,7 @@ func (a *AuthService) requireAPIToken(next http.Handler) http.Handler {
 			return
 		}
 		if ok {
+			observeUserRequestIdentity(r.Context(), userRequestAuthAdminKey, 0, "")
 			ctx := context.WithValue(r.Context(), adminActorKey, adminAPIKeyActor(adminKey))
 			next.ServeHTTP(w, r.WithContext(ctx))
 			return
@@ -240,6 +244,7 @@ func (a *AuthService) requireAPIToken(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, "invalid api token")
 			return
 		}
+		observeUserRequestIdentity(r.Context(), userRequestAuthToken, apiToken.ID, apiToken.Name)
 		extractRejected := false
 		defer func() {
 			if !extractRejected {

@@ -177,6 +177,8 @@ func buildProviderRegistry(cfg config.Config) (*provider.Registry, error) {
 	return registry, nil
 }
 
+// startLogRetentionCleaner runs cleanup immediately and hourly with a shared
+// 30-second budget per run. The returned function stops future scheduled runs.
 func startLogRetentionCleaner(store *db.Store, log *logging.Logger) func() {
 	stop := make(chan struct{})
 	run := func() {
@@ -187,7 +189,7 @@ func startLogRetentionCleaner(store *db.Store, log *logging.Logger) func() {
 			log.Error("log_retention_settings_failed", map[string]interface{}{"error": err.Error()})
 			return
 		}
-		searchDeleted, auditDeleted, err := store.DeleteOldLogs(ctx, settings.LogRetentionDays)
+		searchDeleted, auditDeleted, userRequestDeleted, err := store.DeleteOldLogs(ctx, settings.LogRetentionDays)
 		if err != nil {
 			log.Error("log_retention_cleanup_failed", map[string]interface{}{"error": err.Error(), "retention_days": settings.LogRetentionDays})
 			return
@@ -195,8 +197,8 @@ func startLogRetentionCleaner(store *db.Store, log *logging.Logger) func() {
 		if err := store.DeleteExpiredCache(ctx); err != nil {
 			log.Error("cache_cleanup_failed", map[string]interface{}{"error": err.Error()})
 		}
-		if searchDeleted > 0 || auditDeleted > 0 {
-			log.Info("log_retention_cleanup", map[string]interface{}{"retention_days": settings.LogRetentionDays, "search_deleted": searchDeleted, "audit_deleted": auditDeleted})
+		if searchDeleted > 0 || auditDeleted > 0 || userRequestDeleted > 0 {
+			log.Info("log_retention_cleanup", map[string]interface{}{"retention_days": settings.LogRetentionDays, "search_deleted": searchDeleted, "audit_deleted": auditDeleted, "user_request_deleted": userRequestDeleted})
 		}
 	}
 	go func() {

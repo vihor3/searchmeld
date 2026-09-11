@@ -85,6 +85,7 @@ async function openApp(browser, { session = '', legacy = false, viewport = deskt
     'GET /api/admin/providers': json({ providers: [provider] }),
     'GET /api/admin/keys': json({ keys: [] }),
     'GET /api/admin/tokens': json({ tokens: [] }),
+    'GET /api/admin/request-logs': json({ logs: [] }),
     'GET /api/admin/logs': json({ logs: [] }),
     'GET /api/admin/audit-logs': json({ logs: [] }),
     'GET /api/admin/providers/health': json({ providers: [] }),
@@ -174,11 +175,11 @@ async function observe(app) {
   })
 }
 
-/** Awaits both browser and router URLs, then disables Logs polling for deterministic requests. */
+/** Awaits both URLs and disables Logs polling; paused-clock cases avoid RAF-dependent router waits. */
 async function at(app, path) {
   const expected = new URL(path, origin).href
   await app.page.waitForURL(expected)
-  await app.page.waitForFunction(/** Waits for the router state as well as the browser URL before asserting a destination. */ (expected) => new URL(window.authProbe.router.currentRoute.value.fullPath, location.origin).href === expected, expected)
+  await app.page.waitForFunction(/** Waits for the router state as well as the browser URL before asserting a destination. */ (expected) => new URL(window.authProbe.router.currentRoute.value.fullPath, location.origin).href === expected, expected, { polling: app.logClockPaused ? 50 : 'raf' })
   if (new URL(path, origin).pathname === '/logs') {
     // Element Plus puts the switch role on a zero-sized input; click its visible wrapper.
     const toggle = app.page.locator('.logs-actions .el-switch')
@@ -335,7 +336,7 @@ async function closeApp(app) {
   console.log(`Browser case completed (${app.diagnostics.length} intentional error diagnostics)`)
 }
 
-/** Exercises login, expiry and return navigation on each viewport, retaining screenshots and history behavior. */
+/** Expires the default user-request refresh on each viewport without replay, preserving return URL and history. */
 async function roundTrip(browser, viewport, name) {
   const app = await openApp(browser, { viewport })
   const target = '/logs?probe=a%2Bb#row-7'
@@ -351,7 +352,7 @@ async function roundTrip(browser, viewport, name) {
   await app.page.evaluate(/** Excludes setup navigation from the single-expiry recovery counts. */ () => { window.authProbe.replacements = []; window.authProbe.transitions = [] })
   await legacyCopies(app)
   app.expectedErrors.add('admin login required')
-  const refresh = hold(app, 'GET /api/admin/logs', failure())
+  const refresh = hold(app, 'GET /api/admin/request-logs', failure())
   await app.page.locator('.logs-actions button[title="\u5237\u65b0"]').click()
   assert.equal((await refresh.seen).cookie, sessionA)
   refresh.release()
@@ -360,7 +361,7 @@ async function roundTrip(browser, viewport, name) {
   await app.page.waitForFunction(() => document.querySelector('.login-logo')?.naturalWidth > 0)
   await screenshot(app, `${name}-expired`)
   await login(app, target)
-  assert.equal(app.requests.filter((request) => request.key === 'GET /api/admin/logs' && request.cookie === sessionA).length, 3)
+  assert.equal(app.requests.filter((request) => request.key === 'GET /api/admin/request-logs' && request.cookie === sessionA).length, 3)
   await app.page.locator('.logs-actions button[title="\u5237\u65b0"]:not(.is-loading)').waitFor()
   await screenshot(app, `${name}-returned`)
   await app.page.goBack()
@@ -510,7 +511,7 @@ async function wrongPassword(browser) {
   await closeApp(app)
 }
 
-/** Preserves session state for non-expiry failures and proves failed search writes are never replayed. */
+/** Preserves auth across legacy/new log-read failures and proves failed search writes are never replayed. */
 async function otherErrors(browser) {
   const app = await openApp(browser, { session: sessionA })
   const target = '/playground?probe=errors#search'
@@ -519,6 +520,10 @@ async function otherErrors(browser) {
   const cases = [
     ...[403, 429, 500].map((status) => ({ path: '/api/admin/logs', reply: failure(status, `fixture-${status}`), message: `fixture-${status}` })),
     { path: '/api/admin/logs', reply: { abort: true }, message: 'Failed to fetch' },
+    ...['/api/admin/request-logs', '/api/admin/request-logs/41'].flatMap((path) => [
+      ...[403, 429, 500].map((status) => ({ path, reply: failure(status, `entry-${status}`), message: `entry-${status}` })),
+      { path, reply: { abort: true }, message: 'Failed to fetch' }
+    ]),
     { path: '/v1/search', reply: failure(401, 'API token rejected'), message: 'API token rejected', options: { method: 'POST', body: JSON.stringify({ query: searchQuery }) } },
     { path: '/api/admin/login?probe=existing-session', reply: failure(401, 'credentials rejected'), message: 'credentials rejected', options: { method: 'POST', body: JSON.stringify(credentials) } },
     { path: '/api/admin/me', reply: failure(403, 'proof rejected'), message: 'proof rejected' }
@@ -950,7 +955,858 @@ async function crossTabLateResponses(browser) {
   }
 }
 
-/** Runs every existing browser case in order with its own deadline. */
+/** Builds metadata-only entries with explicit nullable identity, status and execution fields. */
+function userLog(overrides = {}) {
+  return {
+    id: 41, request_id: 'entry-41', created_at: '2026-09-11T01:02:03Z',
+    operation: 'search', compat_format: 'native', method: 'POST', path: '/v1/search',
+    client_ip: '2001:db8::41', auth_type: 'api_token', api_token_id: 17,
+    token_name: 'fixture-retired-token', http_status: 200, completion: 'completed',
+    latency_ms: 0, mcp_error_count: 0, mcp_tool_error_count: 0,
+    execution_request_id: null, ...overrides
+  }
+}
+
+/** Keeps historical execution fixtures free of invented HTTP or caller metadata. */
+function executionLog(overrides = {}) {
+  return {
+    id: 41, request_id: 'historical-41', created_at: '2026-09-10T01:02:03Z',
+    operation: 'search', query: 'historical response-only search', mode: 'fallback',
+    compat_format: 'native', providers: ['tavily'], cache_policy: 'auto',
+    cache_hit: false, result_count: 1, status: 'success', error_message: '',
+    latency_ms: 34, request_json: {}, response_json: {}, ...overrides
+  }
+}
+
+/** Provides retries, cached results and both legacy call fallbacks without upstream traffic. */
+function logFixtures() {
+  const result = { title: 'fixture result title', url: 'https://fixture.invalid/result', snippet: 'fixture result snippet', provider: 'tavily' }
+  const call = {
+    provider_key_id: 31, provider_name: 'tavily', key_alias: 'fixture-success-key',
+    attempt_index: 2, will_retry: false, status: 'success', error_type: '',
+    error_message: '', latency_ms: 14, result_count: 1, cached: false
+  }
+  const group = { provider: 'tavily', status: 'success', latency_ms: 14, result_count: 1, results: [result] }
+  const entries = [
+    userLog({ execution_request_id: 'entry-41' }),
+    userLog({ id: 42, request_id: 'entry-42', auth_type: 'unknown', api_token_id: null, token_name: '', client_ip: '', http_status: 401 }),
+    userLog({ id: 43, request_id: 'entry-43', token_name: 'fixture-rate-limited', api_token_id: 18, client_ip: '198.51.100.43', http_status: 429 }),
+    userLog({ id: 44, request_id: 'entry-44', operation: 'mcp', path: '/v1/mcp', auth_type: 'anonymous', api_token_id: null, token_name: '', mcp_error_count: 2 }),
+    userLog({ id: 45, request_id: 'entry-45', operation: 'mcp', path: '/custom-mcp', mcp_error_count: 1, mcp_tool_error_count: 1, execution_request_id: 'entry-45-mcp-7-2' }),
+    userLog({ id: 46, request_id: 'entry-46', operation: 'mcp', path: '/v1/mcp', auth_type: 'anonymous', api_token_id: null, token_name: '', http_status: 202 }),
+    userLog({ id: 47, request_id: 'entry-47', operation: 'mcp', method: 'GET', path: '/custom-mcp', auth_type: 'unknown', api_token_id: null, token_name: '', http_status: null, completion: 'interrupted' }),
+    userLog({ id: 48, request_id: 'entry-48', operation: 'extract', compat_format: 'tavily', path: '/v1/compat/tavily/extract', http_status: 403, execution_request_id: 'entry-48' }),
+    userLog({ id: 49, request_id: 'entry-49', execution_request_id: 'entry-49' }),
+    userLog({ id: 50, request_id: 'entry-50', operation: 'mcp', method: 'DELETE', path: '/custom-mcp', auth_type: 'admin_key', api_token_id: null, token_name: '', http_status: 204 }),
+    userLog({ id: 51, request_id: 'entry-51', http_status: 302 }),
+    userLog({ id: 52, request_id: 'entry-52', http_status: 502, completion: 'write_error' }),
+    userLog({ id: 53, request_id: 'entry-53', http_status: null, completion: 'canceled' })
+  ]
+  const executions = [
+    { log: executionLog({ response_json: { provider_calls: [call], provider_results: [group] } }), calls: [] },
+    { log: executionLog({ id: 42, request_id: 'historical-42', query: 'historical group-only search', response_json: { provider_results: [group] } }), calls: [] },
+    { log: executionLog({ id: 43, request_id: 'historical-43', query: 'historical summary-only search' }), calls: [call] },
+    {
+      log: executionLog({
+        id: 44, request_id: 'historical-44', operation: 'extract', query: 'historical extraction',
+        request_json: { urls: ['https://fixture.invalid/extract'], providers: ['tavily'] },
+        response_json: { results: [{ ...result, title: 'fixture extract title', content: 'fixture extract content', content_truncated: true, log_content_truncated: true }] }
+      }),
+      calls: []
+    },
+    {
+      log: executionLog({ id: 901, request_id: 'entry-41', query: 'linked retry search', response_json: { results: [result], provider_results: [group] } }),
+      calls: [
+        { ...call, provider_key_id: 30, key_alias: 'fixture-retry-key', attempt_index: 1, will_retry: true, status: 'error', error_type: 'rate_limited', error_message: 'fixture rate limit', result_count: 0 },
+        call
+      ]
+    },
+    { log: executionLog({ id: 902, request_id: 'entry-49', query: 'linked cached search', cache_hit: true, response_json: { results: [result] } }), calls: [] },
+    { log: executionLog({ id: 903, request_id: 'entry-45-mcp-7-2', query: 'linked MCP failure', status: 'error', error_message: 'fixture tool failure', result_count: 0 }), calls: [] },
+    { log: executionLog({ id: 904, request_id: 'entry-48', operation: 'extract', query: '', status: 'error', error_message: 'fixture extract scope rejected', result_count: 0, providers: [] }), calls: [] }
+  ]
+  return { entries, executions, recent: executions.slice(0, 4).map((detail) => detail.log) }
+}
+
+/** Installs explicit list and numeric-detail responses; every unlisted route still fails. */
+function mockLogs(app, fixture) {
+  app.overrides.set('GET /api/admin/request-logs', json({ logs: fixture.entries }))
+  app.overrides.set('GET /api/admin/logs', json({ logs: fixture.recent }))
+  for (const log of fixture.entries) {
+    const execution = fixture.executions.find((detail) => detail.log.request_id === log.execution_request_id)
+    app.overrides.set('GET /api/admin/request-logs/' + log.id, json({ log, execution_log_id: execution?.log.id ?? null }))
+  }
+  for (const detail of fixture.executions) app.overrides.set('GET /api/admin/logs/' + detail.log.id, json(detail))
+}
+
+/** Observes original API promises so stale-success/catch/finally assertions wait for actual settlement. */
+async function observeLogReads(app) {
+  await app.page.evaluate(/** Returns each original promise to the view, storing only a separate settlement observer. */ async () => {
+    const { api } = await import('/src/api/client.ts')
+    window.authProbe.logReads = []
+    for (const [name, path, detail] of [
+      ['userRequestLogs', '/api/admin/request-logs', false],
+      ['userRequestLogDetail', '/api/admin/request-logs', true],
+      ['logs', '/api/admin/logs', false],
+      ['logDetail', '/api/admin/logs', true]
+    ]) {
+      const read = api[name]
+      if (typeof read !== 'function') throw new Error('Missing log API method: ' + name)
+      /** Preserves the real fetch, body parsing and session recovery without replay or synthetic results. */
+      api[name] = (...args) => {
+        const pending = read(...args)
+        const record = { path: path + (detail ? '/' + args[0] : '') }
+        record.pending = pending.then(
+          /** Records completion without retaining execution bodies or changing the view's promise. */
+          () => ({ status: 'fulfilled' }),
+          /** Observes rejection without suppressing it for the view that owns error presentation. */
+          (error) => ({ status: 'rejected', message: error.message })
+        )
+        window.authProbe.logReads.push(record)
+        return pending
+      }
+    }
+  })
+}
+
+/** Waits for a read and Vue updates; paused timer cases advance transition frames without resuming real time. */
+async function logReadSettled(app, path, index = -1) {
+  const outcome = await bounded(app.page.evaluate(/** Awaits the registered API observer after the view has subscribed to the same original promise. */ async ({ path, index }) => {
+    const record = window.authProbe.logReads.filter((read) => read.path === path).at(index)
+    if (!record) throw new Error('No observed log request: ' + path)
+    const outcome = await record.pending
+    await Promise.resolve()
+    await Promise.resolve()
+    return outcome
+  }, { path, index }), 'log read settlement: ' + path)
+  // Vue transitions schedule two animation frames before leaving loading overlays.
+  if (app.logClockPaused) await app.page.clock.runFor(50)
+  return outcome
+}
+
+/** Observes reads before the first log view; timer cases install before app load and pause only after readiness. */
+async function openLogs(browser, { viewport = desktop, fixture = logFixtures(), clock = false, initialReply } = {}) {
+  const app = await openApp(browser, { session: sessionA, viewport })
+  if (clock) await app.page.clock.install({ time: new Date('2026-09-11T00:00:00Z') })
+  mockLogs(app, fixture)
+  await visit(app, '/tokens')
+  await app.page.locator('.token-table').waitFor()
+  await observeLogReads(app)
+  if (initialReply) app.overrides.set('GET /api/admin/request-logs', initialReply)
+  await navigate(app, '/logs')
+  await logReadSettled(app, '/api/admin/request-logs')
+  if (clock) {
+    // Polling is already disabled by at(); allow setup timers to settle before freezing time.
+    const pauseTime = await app.page.evaluate(() => Date.now() + 60000)
+    await app.page.clock.pauseAt(pauseTime)
+    app.logClockPaused = true
+  }
+  return app
+}
+
+/** Selects page tabs separately from the execution drawer's parameter/result tabs. */
+async function logView(app, kind) {
+  const tab = app.page.locator('.logs-view-tabs').getByRole('tab', { name: kind === 'user' ? '\u7528\u6237\u8bf7\u6c42' : '\u6267\u884c\u65e5\u5fd7', exact: true })
+  await tab.click()
+  assert.equal(await tab.getAttribute('aria-selected'), 'true')
+}
+
+/** Targets row identity within the page so colliding entry/execution IDs cannot select drawer metadata. */
+function logRow(app, kind, id) {
+  return app.page.locator('.logs-page [data-log-kind="' + kind + '"][data-log-id="' + id + '"]')
+}
+
+/** Requires the exact visible row set; null statuses and hidden tabs cannot silently join a filter. */
+async function logRowsAre(app, kind, ids) {
+  await app.page.waitForFunction(/** Compares visible row identities rather than text that can appear in a hidden drawer. */ ({ kind, ids }) => {
+    const rows = [...document.querySelectorAll('.logs-page [data-log-kind][data-log-id]')].filter((row) => row.getClientRects().length)
+    return rows.every((row) => row.dataset.logKind === kind) &&
+      JSON.stringify(rows.map((row) => Number(row.dataset.logId)).sort((a, b) => a - b)) === JSON.stringify(ids)
+  }, { kind, ids: [...ids].sort((a, b) => a - b) }, { polling: 50 })
+}
+
+/** Selects or clears one visible page filter using the rendered Element Plus controls. */
+async function logFilter(app, index, label) {
+  const select = app.page.locator('.logs-page .el-select:visible').nth(index)
+  if (label === null) {
+    await select.hover()
+    await select.locator('.el-select__clear').click()
+  } else {
+    await select.click()
+    await app.page.locator('.el-select-dropdown:visible').getByRole('option', { name: label, exact: true }).click()
+  }
+}
+
+/** Opens a numeric detail from its visible row and checks the shared drawer has only one active instance. */
+async function openLogDetail(app, kind, id) {
+  await logRow(app, kind, id).click()
+  const outcome = await logReadSettled(app, (kind === 'user' ? '/api/admin/request-logs/' : '/api/admin/logs/') + id)
+  const drawer = app.page.locator('.log-drawer.open')
+  await drawer.waitFor()
+  assert.equal(await app.page.locator('.log-drawer').count(), 1)
+  return { drawer, outcome }
+}
+
+/** Closes through the keyboard and waits until the old selection can no longer render a drawer. */
+async function closeLogDetail(app) {
+  const drawer = app.page.locator('.log-drawer.open')
+  await drawer.press('Escape')
+  await drawer.waitFor({ state: 'hidden' })
+}
+
+/** Checks page, row and detail scroll widths so nested clipping cannot conceal long-metadata overflow. */
+async function logBounds(app) {
+  const viewport = app.page.viewportSize()
+  const layout = await app.page.evaluate(/** Measures rendered boundaries without hiding overflow or relying on PNG width. */ () => {
+    const selectors = ['html', 'body', '#app', '.logs-page', '.logs-view-tabs', '.logs-actions']
+    const elements = selectors.map((selector) => {
+      const element = document.querySelector(selector)
+      if (!element) throw new Error('Missing log layout boundary: ' + selector)
+      return { selector, element }
+    })
+    for (const selector of [
+      '.logs-page .stream', '.logs-page .user-log-card', '.user-log-card .body',
+      '.user-log-card .endpoint', '.user-log-card .request-id', '.user-log-card .entry-caller',
+      '.log-drawer.open', '.log-drawer.open .dhd', '.log-drawer.open .entry-detail',
+      '.log-drawer.open .entry-metadata dd'
+    ]) {
+      for (const element of document.querySelectorAll(selector)) {
+        if (element.getClientRects().length) elements.push({ selector, element })
+      }
+    }
+    return elements.map(({ selector, element }) => {
+      const rect = element.getBoundingClientRect()
+      return { selector, left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, client: element.clientWidth, scroll: element.scrollWidth }
+    })
+  })
+  for (const element of layout) {
+    assert.ok(element.left >= -1 && element.right <= viewport.width + 1, element.selector + ' escaped viewport: ' + JSON.stringify(element))
+    assert.ok(element.scroll <= element.client + 1, element.selector + ' overflowed: ' + JSON.stringify(element))
+    if (element.selector === '.log-drawer.open') {
+      assert.ok(element.top >= -1 && element.bottom <= viewport.height + 1, 'Drawer escaped viewport height')
+    }
+  }
+}
+
+/** Exercises independent recent-window filters, transport/MCP distinctions and keyboard/layout behavior. */
+async function populatedLogs(browser, viewport, name) {
+  const fixture = logFixtures()
+  const long = userLog({
+    id: 54, request_id: 'long-request-' + 'r'.repeat(220), operation: 'mcp',
+    path: '/custom-mcp/' + 'endpoint'.repeat(240), token_name: 'fixture-name-' + 'n'.repeat(240),
+    client_ip: '2001:db8:abcd:1234:5678:90ab:cdef:1234'
+  })
+  long.execution_request_id = long.request_id + '-mcp-7-1'
+  fixture.entries.push(long)
+  fixture.executions.push({ log: executionLog({ id: 905, request_id: long.execution_request_id, query: 'long entry execution' }), calls: [] })
+  const app = await openLogs(browser, { viewport, fixture })
+  const all = fixture.entries.map((row) => row.id)
+  const search = app.page.locator('[data-log-filter="user-text"] input')
+  await logRowsAre(app, 'user', all)
+  assert.equal(await app.page.locator('.logs-view-tabs [role="tab"][aria-selected="true"]').innerText(), '\u7528\u6237\u8bf7\u6c42')
+  assert.equal(await app.page.locator('.kpi-row').count(), 0, 'Execution totals appeared in the entry view')
+  assert.equal(app.requests.some((request) => request.key === 'GET /api/admin/logs'), false)
+  const first = logRow(app, 'user', 41)
+  for (const value of ['POST', '/v1/search', 'entry-41', '2001:db8::41', 'fixture-retired-token', '0ms']) {
+    assert.ok((await first.innerText()).includes(value), 'Missing entry field: ' + value)
+  }
+  assert.match(await first.locator('.entry-caller').innerText(), /17/)
+  assert.match(await first.locator('.meta').innerText(), /2026/)
+  assert.match(await logRow(app, 'user', 44).innerText(), /HTTP 200/)
+  await logRow(app, 'user', 44).getByText('\u534f\u8bae\u9519\u8bef 2', { exact: true }).waitFor()
+  await logRow(app, 'user', 45).getByText('\u5de5\u5177\u9519\u8bef 1', { exact: true }).waitFor()
+  assert.match(await logRow(app, 'user', 46).innerText(), /HTTP 202/)
+  for (const id of [47, 53]) {
+    const outcomes = await logRow(app, 'user', id).locator('.entry-outcomes').innerText()
+    assert.match(outcomes, /\u672a\u8bb0\u5f55/)
+    assert.doesNotMatch(outcomes, /\b(?:200|500)\b/)
+  }
+  assert.doesNotMatch(await logRow(app, 'user', 42).locator('.entry-caller').innerText(), /fixture-|#0|\u533f\u540d/)
+  assert.match(await logRow(app, 'user', 50).innerText(), /DELETE/)
+  assert.match(await logRow(app, 'user', 50).locator('.entry-caller').innerText(), /\u7ba1\u7406\u5458 Key/)
+  assert.match(await logRow(app, 'user', 46).locator('.entry-caller').innerText(), /\u533f\u540d/)
+  for (const [id, text] of [[41, '\u5df2\u5b8c\u6210'], [47, '\u5df2\u4e2d\u65ad'], [52, '\u54cd\u5e94\u5199\u5165\u5931\u8d25'], [53, '\u5df2\u53d6\u6d88']]) {
+    await logRow(app, 'user', id).getByText(text, { exact: true }).waitFor()
+  }
+  for (const id of [44, 45, 47, 52, 53]) assert.match(await logRow(app, 'user', id).getAttribute('class'), /\bfail\b/)
+  assert.doesNotMatch(await logRow(app, 'user', 46).getAttribute('class'), /\bfail\b/)
+  await logBounds(app)
+  await screenshot(app, name + '-user-logs')
+
+  for (const [text, ids] of [
+    ['entry-41', [41]], ['/v1/compat/tavily/extract', [48]],
+    ['198.51.100.43', [43]], ['FIXTURE-RATE-LIMITED', [43]], ['no-matching-request', []]
+  ]) {
+    await search.fill(text)
+    await logRowsAre(app, 'user', ids)
+  }
+  await app.page.locator('.user-stream .empty').waitFor()
+  await search.fill('')
+  for (const [label, ids] of [
+    ['2xx', [41, 44, 45, 46, 49, 50, 54]], ['3xx', [51]],
+    ['4xx', [42, 43, 48]], ['5xx', [52]], ['\u672a\u8bb0\u5f55', [47, 53]]
+  ]) {
+    await logFilter(app, 1, label)
+    await logRowsAre(app, 'user', ids)
+  }
+  await logFilter(app, 1, null)
+  await logFilter(app, 0, 'MCP')
+  await logRowsAre(app, 'user', [44, 45, 46, 47, 50, 54])
+  await logFilter(app, 1, '2xx')
+  for (const [label, ids] of [
+    ['\u534f\u8bae\u6216\u5de5\u5177\u9519\u8bef', [44, 45]],
+    ['\u534f\u8bae\u9519\u8bef', [44, 45]], ['\u5de5\u5177\u9519\u8bef', [45]]
+  ]) {
+    await logFilter(app, 2, label)
+    await logRowsAre(app, 'user', ids)
+  }
+  await logFilter(app, 2, null)
+  await logFilter(app, 1, null)
+  await logFilter(app, 0, '\u62bd\u53d6')
+  await logRowsAre(app, 'user', [48])
+  await logFilter(app, 0, null)
+  await search.fill('entry-41')
+
+  await logView(app, 'execution')
+  await logReadSettled(app, '/api/admin/logs')
+  await logRowsAre(app, 'execution', [41, 42, 43, 44])
+  await app.page.locator('.kpi-row').waitFor()
+  const executionSearch = app.page.locator('[data-log-filter="execution-text"] input')
+  await executionSearch.fill('historical-44')
+  await logRowsAre(app, 'execution', [44])
+  await logView(app, 'user')
+  await logReadSettled(app, '/api/admin/request-logs')
+  await logRowsAre(app, 'user', [41])
+  assert.equal(await search.inputValue(), 'entry-41')
+  assert.match(await app.page.locator('.window-count').innerText(), /1\s*\/.*14/)
+  await logView(app, 'execution')
+  await logReadSettled(app, '/api/admin/logs')
+  await logRowsAre(app, 'execution', [44])
+  const { drawer: executionDrawer } = await openLogDetail(app, 'execution', 44)
+  await executionDrawer.getByRole('tab', { name: /^\u62bd\u53d6\u7ed3\u679c/ }).click()
+  await executionDrawer.locator('.result-expand-button:visible').click()
+  await executionDrawer.getByText('fixture extract content', { exact: true }).waitFor()
+  await logBounds(app)
+  await screenshot(app, name + '-execution-log')
+  await closeLogDetail(app)
+
+  await logView(app, 'user')
+  await logReadSettled(app, '/api/admin/request-logs')
+  await search.fill('long-request-')
+  await logRowsAre(app, 'user', [54])
+  const row = logRow(app, 'user', 54)
+  await row.focus()
+  await row.press('Enter')
+  await logReadSettled(app, '/api/admin/request-logs/54')
+  const drawer = app.page.locator('.log-drawer.open')
+  await drawer.getByText(long.path, { exact: true }).waitFor()
+  assert.ok((await drawer.innerText()).includes(long.token_name))
+  assert.ok((await drawer.innerText()).includes(long.request_id))
+  await app.page.waitForFunction(() => document.querySelector('.log-drawer.open')?.contains(document.activeElement))
+  await logBounds(app)
+  await screenshot(app, name + '-user-log-detail')
+  const link = drawer.getByRole('button', { name: '\u67e5\u770b\u6267\u884c\u65e5\u5fd7', exact: true })
+  await link.scrollIntoViewIfNeeded()
+  const scroll = await drawer.locator('.entry-detail').evaluate((element) => element.scrollTop)
+  assert.ok(scroll > 0, 'Long entry did not exercise scrolling detail content')
+  const listsBefore = app.requests.filter((request) => request.key === 'GET /api/admin/request-logs').length
+  await link.click()
+  await logReadSettled(app, '/api/admin/logs/905')
+  const back = drawer.getByRole('button', { name: '\u8fd4\u56de\u7528\u6237\u8bf7\u6c42', exact: true })
+  await back.focus()
+  await back.press('Enter')
+  await drawer.locator('[data-execution-state="linked"]').waitFor()
+  await app.page.waitForFunction((scroll) => Math.abs(document.querySelector('.log-drawer.open .entry-detail').scrollTop - scroll) <= 1, scroll)
+  assert.equal(await link.evaluate((element) => element === document.activeElement), true, 'Back did not return focus to the execution link')
+  assert.equal(app.requests.filter((request) => request.key === 'GET /api/admin/request-logs').length, listsBefore)
+  await drawer.getByRole('button', { name: '\u5173\u95ed\u8be6\u60c5', exact: true }).focus()
+  await app.page.keyboard.press('Shift+Tab')
+  assert.equal(await link.evaluate((element) => element === document.activeElement), true, 'Drawer keyboard focus escaped its first control')
+  await app.page.keyboard.press('Tab')
+  assert.equal(await drawer.getByRole('button', { name: '\u5173\u95ed\u8be6\u60c5', exact: true }).evaluate((element) => element === document.activeElement), true)
+  await closeLogDetail(app)
+  assert.equal(await row.evaluate((element) => element === document.activeElement), true, 'Closing detail did not restore row focus')
+  await logBounds(app)
+  await sessionIs(app, sessionA)
+  await closeApp(app)
+}
+
+/** Follows exact numeric links outside the execution window and preserves retry/cache/legacy result details. */
+async function logCorrelation(browser) {
+  const app = await openLogs(browser)
+  const search = app.page.locator('[data-log-filter="user-text"] input')
+  for (const [entryId, executionId] of [[41, 901], [49, 902], [45, 903], [48, 904]]) {
+    await search.fill('entry-' + entryId)
+    await logRowsAre(app, 'user', [entryId])
+    const { drawer } = await openLogDetail(app, 'user', entryId)
+    await drawer.locator('[data-execution-state="linked"]').waitFor()
+    await drawer.getByRole('button', { name: '\u67e5\u770b\u6267\u884c\u65e5\u5fd7', exact: true }).click()
+    assert.deepEqual(await logReadSettled(app, '/api/admin/logs/' + executionId), { status: 'fulfilled' })
+    assert.equal(await drawer.getAttribute('data-detail-kind'), 'execution')
+    assert.equal(await drawer.getAttribute('data-detail-id'), String(executionId))
+    assert.equal(await app.page.locator('.log-drawer').count(), 1)
+    assert.equal(app.requests.some((request) => request.key === 'GET /api/admin/logs'), false, 'Link resolution fetched/searched the recent execution window')
+    if (entryId === 41) {
+      assert.equal(await drawer.locator('.call-card').count(), 2)
+      const failed = drawer.locator('.call-card').nth(0)
+      const succeeded = drawer.locator('.call-card').nth(1)
+      assert.match(await failed.innerText(), /fixture-retry-key/)
+      assert.match(await failed.innerText(), /\u5c06\u91cd\u8bd5/)
+      await failed.locator('.call-top').click()
+      assert.equal(await failed.locator('.result-title-link').count(), 0, 'Retry failure borrowed successful attempt results')
+      await succeeded.locator('.call-top').click()
+      await succeeded.locator('.result-title-link').waitFor()
+      await succeeded.locator('.result-expand-button').click()
+      await succeeded.getByText('fixture result snippet', { exact: true }).waitFor()
+      await screenshot(app, 'desktop-linked-retry-execution')
+    } else if (entryId === 49) {
+      assert.equal(await drawer.locator('.call-card').count(), 0, 'Cache hit fabricated provider attempts')
+      await drawer.getByRole('tab', { name: /^\u641c\u7d22\u7ed3\u679c/ }).click()
+      await drawer.locator('.result-title-link:visible').waitFor()
+    } else {
+      await drawer.getByRole('tab', { name: '\u8bf7\u6c42\u53c2\u6570', exact: true }).click()
+      assert.match(await drawer.innerText(), entryId === 45 ? /entry-45-mcp-7-2/ : /fixture extract scope rejected/)
+    }
+    await drawer.getByRole('button', { name: '\u8fd4\u56de\u7528\u6237\u8bf7\u6c42', exact: true }).click()
+    await drawer.locator('[data-execution-state="linked"]').waitFor()
+    assert.equal(await drawer.getAttribute('data-detail-kind'), 'user')
+    assert.equal(await drawer.getAttribute('data-detail-id'), String(entryId))
+    assert.equal(await drawer.locator('.call-card').count(), 0)
+    await closeLogDetail(app)
+    await logRowsAre(app, 'user', [entryId])
+    assert.equal(await search.inputValue(), 'entry-' + entryId)
+  }
+  await logView(app, 'execution')
+  await logReadSettled(app, '/api/admin/logs')
+  for (const id of [41, 42, 43]) {
+    const { drawer } = await openLogDetail(app, 'execution', id)
+    assert.match(await drawer.locator('.dhd').innerText(), new RegExp('historical-' + id))
+    assert.equal(await drawer.locator('.entry-metadata').count(), 0, 'Historical execution acquired fabricated entry metadata')
+    assert.equal(await drawer.getByRole('button', { name: '\u8fd4\u56de\u7528\u6237\u8bf7\u6c42', exact: true }).count(), 0)
+    assert.equal(await drawer.locator('.call-card').count(), 1)
+    await drawer.locator('.call-top').click()
+    if (id === 43) {
+      await drawer.getByText(/\u6b63\u6587\u672a\u5199\u5165\u65e5\u5fd7/).waitFor()
+      assert.equal(await drawer.locator('.result-title-link').count(), 0)
+    } else {
+      await drawer.locator('.result-title-link').waitFor()
+      await drawer.locator('.result-expand-button').click()
+      await drawer.getByText('fixture result snippet', { exact: true }).waitFor()
+    }
+    await closeLogDetail(app)
+  }
+  await sessionIs(app, sessionA)
+  await closeApp(app)
+}
+
+/** Distinguishes initial/refresh errors, no execution, missing intended data and retryable detail failures. */
+async function logReadErrors(browser) {
+  const fixture = logFixtures()
+  const app = await openLogs(browser, { fixture, initialReply: failure(503, 'fixture entry list unavailable') })
+  const listError = app.page.locator('.list-error')
+  await listError.getByText('fixture entry list unavailable', { exact: true }).waitFor()
+  assert.equal(await app.page.locator('.user-stream .empty:visible').count(), 0, 'Initial failure was rendered as an empty success')
+  await logView(app, 'execution')
+  await logReadSettled(app, '/api/admin/logs')
+  await logRowsAre(app, 'execution', [41, 42, 43, 44])
+  await logView(app, 'user')
+  await logReadSettled(app, '/api/admin/request-logs')
+  await listError.waitFor()
+  app.overrides.set('GET /api/admin/request-logs', json({ logs: fixture.entries }))
+  await listError.getByRole('button', { name: '\u91cd\u8bd5', exact: true }).click()
+  await logReadSettled(app, '/api/admin/request-logs')
+  await logRowsAre(app, 'user', fixture.entries.map((row) => row.id))
+
+  for (const [kind, path] of [['user', '/api/admin/request-logs'], ['execution', '/api/admin/logs']]) {
+    await logView(app, kind)
+    await logReadSettled(app, path)
+    app.overrides.set('GET ' + path, failure(500, 'fixture refresh unavailable'))
+    await app.page.locator('.logs-actions button[title="\u5237\u65b0"]').click()
+    await logReadSettled(app, path)
+    await listError.getByText('fixture refresh unavailable', { exact: true }).waitFor()
+    await logRowsAre(app, kind, (kind === 'user' ? fixture.entries : fixture.recent).map((row) => row.id))
+    app.overrides.set('GET ' + path, json({ logs: kind === 'user' ? fixture.entries : fixture.recent }))
+    await listError.getByRole('button', { name: '\u91cd\u8bd5', exact: true }).click()
+    await logReadSettled(app, path)
+    await listError.waitFor({ state: 'hidden' })
+  }
+  await logView(app, 'user')
+  await logReadSettled(app, '/api/admin/request-logs')
+  for (const id of [42, 46]) {
+    const { drawer } = await openLogDetail(app, 'user', id)
+    await drawer.locator('[data-execution-state="none"]').getByText('\u672a\u8fdb\u5165\u6267\u884c\u6d41\u7a0b', { exact: true }).waitFor()
+    assert.equal(await drawer.getByRole('button', { name: '\u67e5\u770b\u6267\u884c\u65e5\u5fd7', exact: true }).count(), 0)
+    await closeLogDetail(app)
+  }
+  const intended = fixture.entries.find((row) => row.id === 48)
+  app.overrides.set('GET /api/admin/request-logs/48', json({ log: intended, execution_log_id: null }))
+  const { drawer } = await openLogDetail(app, 'user', 48)
+  await drawer.locator('[data-execution-state="missing"]').getByText('\u6267\u884c\u8bb0\u5f55\u6682\u4e0d\u53ef\u7528', { exact: true }).waitFor()
+  assert.equal(await drawer.getByText('\u672a\u8fdb\u5165\u6267\u884c\u6d41\u7a0b', { exact: true }).count(), 0)
+  assert.equal(await drawer.getByRole('button', { name: '\u67e5\u770b\u6267\u884c\u65e5\u5fd7', exact: true }).count(), 0)
+  await closeLogDetail(app)
+
+  const metadata = fixture.entries.find((row) => row.id === 41)
+  for (const status of [404, 500]) {
+    app.overrides.set('GET /api/admin/request-logs/41', failure(status, 'fixture entry detail unavailable'))
+    await openLogDetail(app, 'user', 41)
+    const current = app.page.locator('.log-drawer.open')
+    await current.locator('.detail-error').getByText(status === 404 ? /\u7528\u6237\u8bf7\u6c42\u8bb0\u5f55\u4e0d\u5b58\u5728\u6216\u5df2\u6e05\u7406/ : /fixture entry detail unavailable/).waitFor()
+    assert.equal(await current.locator('[data-execution-state="none"], [data-execution-state="missing"]').count(), 0)
+    app.overrides.set('GET /api/admin/request-logs/41', json({ log: metadata, execution_log_id: 901 }))
+    await current.getByRole('button', { name: '\u91cd\u8bd5', exact: true }).click()
+    await logReadSettled(app, '/api/admin/request-logs/41')
+    await current.locator('[data-execution-state="linked"]').waitFor()
+    await closeLogDetail(app)
+  }
+  await openLogDetail(app, 'user', 41)
+  const current = app.page.locator('.log-drawer.open')
+  app.overrides.set('GET /api/admin/logs/901', failure(500, 'fixture linked execution unavailable'))
+  await current.getByRole('button', { name: '\u67e5\u770b\u6267\u884c\u65e5\u5fd7', exact: true }).click()
+  await logReadSettled(app, '/api/admin/logs/901')
+  await current.locator('.detail-error').getByText(/fixture linked execution unavailable/).waitFor()
+  assert.equal(await current.locator('.drawer-tabs').count(), 0, 'Failed detail became an empty execution success')
+  await current.getByRole('button', { name: '\u8fd4\u56de\u7528\u6237\u8bf7\u6c42', exact: true }).click()
+  await current.locator('[data-execution-state="linked"]').waitFor()
+  await current.getByRole('button', { name: '\u67e5\u770b\u6267\u884c\u65e5\u5fd7', exact: true }).click()
+  await logReadSettled(app, '/api/admin/logs/901')
+  app.overrides.set('GET /api/admin/logs/901', json(fixture.executions.find((detail) => detail.log.id === 901)))
+  await current.getByRole('button', { name: '\u91cd\u8bd5', exact: true }).click()
+  await logReadSettled(app, '/api/admin/logs/901')
+  await current.locator('.call-card').first().waitFor()
+  assert.equal(await current.locator('.call-card').count(), 2)
+  await current.getByRole('button', { name: '\u8fd4\u56de\u7528\u6237\u8bf7\u6c42', exact: true }).click()
+  await closeLogDetail(app)
+  await sessionIs(app, sessionA)
+  assert.equal(await app.page.evaluate(() => window.authProbe.replacements.length), 0)
+  await screenshot(app, 'desktop-log-error-recovered')
+  await closeApp(app)
+}
+
+/** Rejects old list success/error/finally work across tab-away/back even when the final kind matches. */
+async function logListRaces(browser) {
+  for (const kind of ['user', 'execution']) {
+    for (const staleFails of [false, true]) {
+      const fixture = logFixtures()
+      const app = await openLogs(browser, { fixture })
+      const path = kind === 'user' ? '/api/admin/request-logs' : '/api/admin/logs'
+      const other = kind === 'user' ? 'execution' : 'user'
+      await logView(app, kind)
+      await logReadSettled(app, path)
+      const before = kind === 'user' ? fixture.entries : fixture.recent
+      const stale = kind === 'user' ? userLog({ id: 201, request_id: 'stale-list-entry' }) : executionLog({ id: 201, query: 'stale-list-execution' })
+      const newest = kind === 'user' ? userLog({ id: 202, request_id: 'current-list-entry' }) : executionLog({ id: 202, query: 'current-list-execution' })
+      const old = hold(app, 'GET ' + path, staleFails ? failure(500, 'fixture stale list error') : json({ logs: [stale] }))
+      await app.page.locator('.logs-actions button[title="\u5237\u65b0"]').click()
+      await bounded(old.seen, 'old list arrival')
+      const oldIndex = await app.page.evaluate((path) => window.authProbe.logReads.filter((read) => read.path === path).length - 1, path)
+      await logView(app, other)
+      await logReadSettled(app, other === 'user' ? '/api/admin/request-logs' : '/api/admin/logs')
+      const next = hold(app, 'GET ' + path, json({ logs: [newest] }))
+      await logView(app, kind)
+      await bounded(next.seen, 'new list arrival')
+      // A stale finally must not clear the new request's pending indicator.
+      old.release()
+      await logReadSettled(app, path, oldIndex)
+      await app.page.locator('.logs-actions button.is-loading').waitFor()
+      await logRowsAre(app, kind, before.map((row) => row.id))
+      assert.equal(await app.page.locator('.list-error').count(), 0)
+      next.release()
+      await logReadSettled(app, path)
+      await logRowsAre(app, kind, [202])
+      assert.equal(await app.page.locator('.list-error').count(), 0)
+
+      const late = hold(app, 'GET ' + path, staleFails ? failure(500, 'fixture late list error') : json({ logs: [stale] }))
+      await app.page.locator('.logs-actions button[title="\u5237\u65b0"]').click()
+      await bounded(late.seen, 'late list arrival')
+      const lateIndex = await app.page.evaluate((path) => window.authProbe.logReads.filter((read) => read.path === path).length - 1, path)
+      app.overrides.set('GET ' + path, json({ logs: [newest] }))
+      await logView(app, other)
+      await logReadSettled(app, other === 'user' ? '/api/admin/request-logs' : '/api/admin/logs')
+      await logView(app, kind)
+      await logReadSettled(app, path)
+      await logRowsAre(app, kind, [202])
+      late.release()
+      await logReadSettled(app, path, lateIndex)
+      await logRowsAre(app, kind, [202])
+      assert.equal(await app.page.locator('.list-error').count(), 0)
+      const unmounted = hold(app, 'GET ' + path, staleFails ? failure(500, 'unmounted-list-sentinel') : json({ logs: [stale] }))
+      await app.page.locator('.logs-actions button[title="\u5237\u65b0"]').click()
+      await bounded(unmounted.seen, 'unmounted list arrival')
+      await navigate(app, '/tokens')
+      unmounted.release()
+      await logReadSettled(app, path)
+      assert.equal(await app.page.locator('.logs-page, .list-error, .log-drawer.open').count(), 0)
+      await closeApp(app)
+    }
+  }
+}
+
+/** Rejects old entry/execution detail success and failure after new selection, back, close or unmount. */
+async function logDetailRaces(browser) {
+  for (const staleFails of [false, true]) {
+    const fixture = logFixtures()
+    const app = await openLogs(browser, { fixture })
+    for (const kind of ['user', 'execution']) {
+      await logView(app, kind)
+      await logReadSettled(app, kind === 'user' ? '/api/admin/request-logs' : '/api/admin/logs')
+      const path = kind === 'user' ? '/api/admin/request-logs/' : '/api/admin/logs/'
+      const oldBody = kind === 'user'
+        ? { log: userLog({ token_name: 'stale-detail-sentinel' }), execution_log_id: 999 }
+        : { log: executionLog({ query: 'stale-detail-sentinel' }), calls: [] }
+      const old = hold(app, 'GET ' + path + '41', staleFails ? failure(500, 'stale-detail-sentinel') : json(oldBody))
+      await logRow(app, kind, 41).click()
+      await bounded(old.seen, 'old detail arrival')
+      const oldIndex = await app.page.evaluate((path) => window.authProbe.logReads.filter((read) => read.path === path).length - 1, path + '41')
+      await closeLogDetail(app)
+      const nextBody = kind === 'user'
+        ? { log: fixture.entries.find((row) => row.id === 42), execution_log_id: null }
+        : fixture.executions.find((detail) => detail.log.id === 42)
+      const next = hold(app, 'GET ' + path + '42', json(nextBody))
+      await logRow(app, kind, 42).click()
+      await bounded(next.seen, 'new detail arrival')
+      old.release()
+      await logReadSettled(app, path + '41', oldIndex)
+      const drawer = app.page.locator('.log-drawer.open')
+      assert.equal(await drawer.getAttribute('data-detail-id'), '42')
+      await drawer.locator('[aria-busy="true"]').waitFor()
+      assert.doesNotMatch(await drawer.innerText(), /stale-detail-sentinel/)
+      assert.equal(await drawer.locator('.detail-error').count(), 0)
+      next.release()
+      await logReadSettled(app, path + '42')
+      assert.equal(await drawer.getAttribute('data-detail-id'), '42')
+      assert.equal(await drawer.locator('.detail-error').count(), 0)
+      await closeLogDetail(app)
+      mockLogs(app, fixture)
+    }
+
+    await logView(app, 'user')
+    await logReadSettled(app, '/api/admin/request-logs')
+    const collision = hold(app, 'GET /api/admin/request-logs/41', staleFails ? failure(500, 'stale-kind-sentinel') : json({
+      log: userLog({ token_name: 'stale-kind-sentinel' }), execution_log_id: 999
+    }))
+    await logRow(app, 'user', 41).click()
+    await bounded(collision.seen, 'colliding-ID entry arrival')
+    await closeLogDetail(app)
+    await logView(app, 'execution')
+    await logReadSettled(app, '/api/admin/logs')
+    await openLogDetail(app, 'execution', 41)
+    collision.release()
+    await logReadSettled(app, '/api/admin/request-logs/41')
+    const executionDrawer = app.page.locator('.log-drawer.open')
+    assert.equal(await executionDrawer.getAttribute('data-detail-kind'), 'execution')
+    assert.equal(await executionDrawer.getAttribute('data-detail-id'), '41')
+    assert.match(await executionDrawer.innerText(), /historical-41/)
+    assert.doesNotMatch(await executionDrawer.innerText(), /stale-kind-sentinel/)
+    assert.equal(await executionDrawer.locator('.detail-error').count(), 0)
+    await closeLogDetail(app)
+    mockLogs(app, fixture)
+
+    await logView(app, 'user')
+    await logReadSettled(app, '/api/admin/request-logs')
+    await openLogDetail(app, 'user', 41)
+    const linked = hold(app, 'GET /api/admin/logs/901', staleFails ? failure(500, 'stale-linked-sentinel') : json({
+      log: executionLog({ id: 901, query: 'stale-linked-sentinel' }), calls: []
+    }))
+    const drawer = app.page.locator('.log-drawer.open')
+    await drawer.getByRole('button', { name: '\u67e5\u770b\u6267\u884c\u65e5\u5fd7', exact: true }).click()
+    await bounded(linked.seen, 'linked detail arrival')
+    await drawer.getByRole('button', { name: '\u8fd4\u56de\u7528\u6237\u8bf7\u6c42', exact: true }).click()
+    linked.release()
+    await logReadSettled(app, '/api/admin/logs/901')
+    await drawer.locator('[data-execution-state="linked"]').waitFor()
+    assert.equal(await drawer.getAttribute('data-detail-kind'), 'user')
+    assert.doesNotMatch(await drawer.innerText(), /stale-linked-sentinel/)
+    assert.equal(await drawer.locator('.detail-error').count(), 0)
+    await closeLogDetail(app)
+
+    for (const boundary of ['close', 'tab', 'unmount']) {
+      const old = hold(app, 'GET /api/admin/request-logs/41', staleFails ? failure(500, 'stale-closed-detail') : json({
+        log: userLog({ token_name: 'stale-closed-detail' }), execution_log_id: 999
+      }))
+      await logRow(app, 'user', 41).click()
+      await bounded(old.seen, boundary + ' detail arrival')
+      await closeLogDetail(app)
+      if (boundary === 'tab') {
+        await logView(app, 'execution')
+        await logReadSettled(app, '/api/admin/logs')
+      } else if (boundary === 'unmount') await navigate(app, '/tokens')
+      old.release()
+      await logReadSettled(app, '/api/admin/request-logs/41')
+      assert.equal(await app.page.locator('.log-drawer.open').count(), 0)
+      assert.equal(await app.page.getByText('stale-closed-detail', { exact: true }).count(), 0)
+      if (boundary === 'tab') {
+        await logView(app, 'user')
+        await logReadSettled(app, '/api/admin/request-logs')
+      } else if (boundary === 'unmount') {
+        await navigate(app, '/logs')
+        await logReadSettled(app, '/api/admin/request-logs')
+      }
+    }
+    await closeApp(app)
+  }
+}
+
+/** Exercises real list/entry/linked UI 401 paths, preserving return URLs and never replaying expired reads. */
+async function logExpiry(browser) {
+  for (const targetKind of ['list', 'entry', 'linked']) {
+    for (const reply of [failure(), { status: 401, contentType: 'text/html', body: '<h1>Unauthorized</h1>' }]) {
+      const fixture = logFixtures()
+      const app = await openLogs(browser, { fixture })
+      const target = '/logs?probe=request-expiry#entry-41'
+      await navigate(app, target)
+      if (targetKind === 'linked') await openLogDetail(app, 'user', 41)
+      const path = targetKind === 'list' ? '/api/admin/request-logs' : targetKind === 'entry' ? '/api/admin/request-logs/41' : '/api/admin/logs/901'
+      const pending = hold(app, 'GET ' + path, reply)
+      if (targetKind === 'list') await app.page.locator('.logs-actions button[title="\u5237\u65b0"]').click()
+      else if (targetKind === 'entry') await logRow(app, 'user', 41).click()
+      else await app.page.locator('.log-drawer.open').getByRole('button', { name: '\u67e5\u770b\u6267\u884c\u65e5\u5fd7', exact: true }).click()
+      assert.equal((await bounded(pending.seen, 'log expiry arrival')).cookie, sessionA)
+      const count = app.requests.filter((request) => request.key === 'GET ' + path && request.cookie === sessionA).length
+      pending.release()
+      await logReadSettled(app, path)
+      await onLogin(app, target)
+      await oneExpiry(app)
+      assert.equal(await app.page.locator('.log-drawer.open').count(), 0)
+      mockLogs(app, fixture)
+      await login(app, target)
+      await logReadSettled(app, '/api/admin/request-logs')
+      await logRowsAre(app, 'user', fixture.entries.map((row) => row.id))
+      assert.equal(app.requests.filter((request) => request.key === 'GET ' + path && request.cookie === sessionA).length, count)
+      assert.equal(await app.page.locator('.log-drawer.open').count(), 0)
+      await sessionIs(app, sessionB)
+      await closeApp(app)
+    }
+  }
+}
+
+/** Invalidates real pending list/detail callbacks across auth revisions and preserves the newer same-ID selection. */
+async function logSessionRaces(browser) {
+  for (const targetKind of ['list', 'entry', 'execution']) {
+    for (const status of [200, 500, 401]) {
+      const fixture = logFixtures()
+      const app = await openLogs(browser, { fixture })
+      const path = targetKind === 'list' ? '/api/admin/request-logs' : targetKind === 'entry' ? '/api/admin/request-logs/41' : '/api/admin/logs/41'
+      if (targetKind === 'execution') {
+        await logView(app, 'execution')
+        await logReadSettled(app, '/api/admin/logs')
+      }
+      const body = targetKind === 'list' ? { logs: [userLog({ id: 201, request_id: 'stale-session-entry' })] }
+        : targetKind === 'entry' ? { log: userLog({ token_name: 'stale-session-entry' }), execution_log_id: 999 }
+          : { log: executionLog({ query: 'stale-session-execution' }), calls: [] }
+      const old = hold(app, 'GET ' + path, status === 200 ? json(body) : failure(status, 'stale-session-failure'))
+      if (targetKind === 'list') await app.page.locator('.logs-actions button[title="\u5237\u65b0"]').click()
+      else await logRow(app, targetKind === 'entry' ? 'user' : 'execution', 41).click()
+      assert.equal((await bounded(old.seen, 'old-session log arrival')).cookie, sessionA)
+      const oldIndex = await app.page.evaluate((path) => window.authProbe.logReads.filter((read) => read.path === path).length - 1, path)
+      fixture.entries[0] = userLog({ token_name: 'current-session-token', execution_request_id: 'entry-41' })
+      fixture.executions[0].log.query = 'current-session-execution'
+      mockLogs(app, fixture)
+      app.overrides.set('POST /api/admin/login', loginReply(sessionB))
+      await app.page.evaluate(/** Uses the actual login and revision boundaries while keeping the log view mounted. */ async (credentials) => {
+        const { api } = await import('/src/api/client.ts')
+        window.authProbe.session.advanceRevision()
+        await api.login(credentials.username, credentials.password)
+        window.authProbe.session.advanceRevision()
+      }, credentials)
+      assert.equal(await app.page.locator('.log-drawer.open').count(), 0)
+      await app.page.locator('.logs-actions button[title="\u5237\u65b0"]').click()
+      await logReadSettled(app, targetKind === 'execution' ? '/api/admin/logs' : '/api/admin/request-logs')
+      if (targetKind !== 'list') await openLogDetail(app, targetKind === 'entry' ? 'user' : 'execution', 41)
+      const replacements = await app.page.evaluate(() => window.authProbe.replacements.length)
+      old.release()
+      await logReadSettled(app, path, oldIndex)
+      if (targetKind === 'list') {
+        await logRowsAre(app, 'user', fixture.entries.map((row) => row.id))
+        assert.match(await logRow(app, 'user', 41).innerText(), /current-session-token/)
+      } else {
+        const drawer = app.page.locator('.log-drawer.open')
+        assert.equal(await drawer.getAttribute('data-detail-id'), '41')
+        assert.equal(await drawer.getAttribute('data-detail-kind'), targetKind === 'entry' ? 'user' : 'execution')
+        assert.match(await drawer.innerText(), targetKind === 'entry' ? /current-session-token/ : /current-session-execution/)
+        assert.doesNotMatch(await drawer.innerText(), /stale-session-/)
+        assert.equal(await drawer.locator('.detail-error').count(), 0)
+        await closeLogDetail(app)
+      }
+      assert.equal(await app.page.locator('.list-error, .login-card').count(), 0)
+      assert.equal(await app.page.evaluate(() => window.authProbe.replacements.length), replacements)
+      await sessionIs(app, sessionB)
+      await closeApp(app)
+    }
+  }
+}
+
+/** Uses the real ten-second timer with held network work to prove pause, resume, no overlap and unmount cleanup. */
+async function logAutoRefresh(browser) {
+  const fixture = logFixtures()
+  const app = await openLogs(browser, { fixture, clock: true })
+  const toggle = app.page.locator('.logs-actions .el-switch')
+  /** Counts actual routed reads so skipped ticks cannot masquerade as successful polling. */
+  const count = (path) => app.requests.filter((request) => request.key === 'GET ' + path).length
+  for (const kind of ['user', 'execution']) {
+    await logView(app, kind)
+    const path = kind === 'user' ? '/api/admin/request-logs' : '/api/admin/logs'
+    await logReadSettled(app, path)
+    const baseline = count(path)
+    await app.page.clock.runFor(30000)
+    assert.equal(count(path), baseline, 'Disabled auto-refresh sent a request')
+    await toggle.click()
+    await toggle.locator('[role="switch"][aria-checked="true"]').waitFor({ state: 'attached' })
+    const polled = hold(app, 'GET ' + path, json({ logs: kind === 'user' ? fixture.entries : fixture.recent }))
+    await app.page.clock.runFor(10000)
+    await bounded(polled.seen, 'first poll arrival')
+    assert.equal(count(path), baseline + 1)
+    await app.page.clock.runFor(30000)
+    assert.equal(count(path), baseline + 1, 'Polling overlapped a pending request')
+    app.overrides.set('GET ' + path, json({ logs: kind === 'user' ? fixture.entries : fixture.recent }))
+    polled.release()
+    await logReadSettled(app, path)
+    await openLogDetail(app, kind, 41)
+    await app.page.clock.runFor(30000)
+    assert.equal(count(path), baseline + 1, 'Polling continued while the detail drawer was open')
+    await closeLogDetail(app)
+    const resumed = hold(app, 'GET ' + path, failure(500, 'fixture poll unavailable'))
+    await app.page.clock.runFor(10000)
+    await bounded(resumed.seen, 'resumed poll arrival')
+    assert.equal(count(path), baseline + 2)
+    resumed.release()
+    await logReadSettled(app, path)
+    await app.page.locator('.list-error').getByText('fixture poll unavailable', { exact: true }).waitFor()
+    await logRowsAre(app, kind, (kind === 'user' ? fixture.entries : fixture.recent).map((row) => row.id))
+    app.overrides.set('GET ' + path, json({ logs: kind === 'user' ? fixture.entries : fixture.recent }))
+    await app.page.clock.runFor(10000)
+    await logReadSettled(app, path)
+    assert.equal(count(path), baseline + 3, 'Polling did not recover after its handled error')
+    await app.page.locator('.list-error').waitFor({ state: 'hidden' })
+    await toggle.click()
+    await toggle.locator('[role="switch"][aria-checked="false"]').waitFor({ state: 'attached' })
+    await app.page.clock.runFor(30000)
+    assert.equal(count(path), baseline + 3)
+  }
+  await logView(app, 'user')
+  await logReadSettled(app, '/api/admin/request-logs')
+  await toggle.click()
+  const old = hold(app, 'GET /api/admin/request-logs', json({ logs: [userLog({ id: 201, request_id: 'unmounted-poll-sentinel' })] }))
+  await app.page.clock.runFor(10000)
+  await bounded(old.seen, 'unmounted poll arrival')
+  const oldIndex = await app.page.evaluate(() => window.authProbe.logReads.filter((read) => read.path === '/api/admin/request-logs').length - 1)
+  await navigate(app, '/tokens')
+  const total = count('/api/admin/request-logs') + count('/api/admin/logs')
+  await app.page.clock.runFor(30000)
+  assert.equal(count('/api/admin/request-logs') + count('/api/admin/logs'), total, 'Unmounted page kept its interval')
+  old.release()
+  await logReadSettled(app, '/api/admin/request-logs', oldIndex)
+  assert.equal(await app.page.locator('.logs-page, .log-drawer.open').count(), 0)
+  mockLogs(app, fixture)
+  await navigate(app, '/logs')
+  await logReadSettled(app, '/api/admin/request-logs')
+  await logRowsAre(app, 'user', fixture.entries.map((row) => row.id))
+  assert.equal(await logRow(app, 'user', 201).count(), 0)
+  await sessionIs(app, sessionA)
+  await closeApp(app)
+}
+
+/** Runs the session and populated-log browser cases in order with separate finite deadlines. */
 async function browserCases(browser) {
   await bounded(roundTrip(browser, desktop, 'desktop'), 'desktop round trip', 45000)
   await bounded(roundTrip(browser, mobile, 'mobile'), 'mobile round trip', 45000)
@@ -968,6 +1824,15 @@ async function browserCases(browser) {
   await bounded(pendingProbes(browser), 'pending and stale probes', 60000)
   await bounded(expiryProbeError(browser), 'expiry probe error ordering', 45000)
   await bounded(crossTabLateResponses(browser), 'cross-tab late responses', 60000)
+  await bounded(populatedLogs(browser, desktop, 'desktop'), 'desktop populated log filters and layout', 60000)
+  await bounded(populatedLogs(browser, mobile, 'mobile'), 'mobile populated log filters and layout', 60000)
+  await bounded(logCorrelation(browser), 'exact log correlation and execution history', 60000)
+  await bounded(logReadErrors(browser), 'log read errors and retry', 60000)
+  await bounded(logListRaces(browser), 'log list generation races', 60000)
+  await bounded(logDetailRaces(browser), 'log selection and detail races', 60000)
+  await bounded(logExpiry(browser), 'log UI expiry boundaries', 60000)
+  await bounded(logSessionRaces(browser), 'log callbacks across session revisions', 90000)
+  await bounded(logAutoRefresh(browser), 'log polling lifecycle', 60000)
 }
 
 /**

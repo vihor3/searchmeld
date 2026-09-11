@@ -45,6 +45,9 @@ type AppStore interface {
 	GetSearchLog(ctx context.Context, id int64) (model.SearchLog, []model.ProviderCallLog, error)
 	GetSearchLogByRequestID(ctx context.Context, requestID string) (model.SearchLog, []model.ProviderCallLog, error)
 	RecordRejectedRequestLog(ctx context.Context, input model.SearchLogInput) error
+	RecordUserRequestLog(ctx context.Context, input model.UserRequestLogInput) error
+	ListUserRequestLogs(ctx context.Context, limit int) ([]model.UserRequestLog, error)
+	GetUserRequestLog(ctx context.Context, id int64) (model.UserRequestLog, *int64, error)
 	UsageSummary(ctx context.Context) (model.UsageSummary, error)
 	UsageSummarySince(ctx context.Context, from time.Time) (model.UsageSummary, error)
 	BillingSummary(ctx context.Context, days int) (model.BillingSummary, error)
@@ -110,12 +113,12 @@ func (h *Handler) Mount(r chi.Router) {
 	}
 
 	r.Route("/v1", func(r chi.Router) {
-		r.With(h.auth.requireAPITokenScope("search")).Post("/search", h.search)
-		r.With(h.auth.requireAPIToken, h.requireExtractAPITokenScope(model.CompatFormatNative)).Post("/extract", h.extract)
-		r.With(h.auth.requireTavilyAPITokenScope("search")).Post("/compat/tavily/search", h.tavilySearch)
-		r.With(tavilyBodyAPIKeyMiddleware, h.auth.requireAPIToken, h.requireExtractAPITokenScope(model.CompatFormatTavily)).Post("/compat/tavily/extract", h.tavilyExtract)
-		r.With(h.auth.requireAPITokenScope("search")).Post("/compat/serper/search", h.serperSearch)
-		r.With(h.auth.requireAPITokenScope("search")).Post("/compat/openai/responses-search", h.openAISearch)
+		r.With(h.captureUserRequest("search", model.CompatFormatNative), h.auth.requireAPITokenScope("search")).Post("/search", h.search)
+		r.With(h.captureUserRequest("extract", model.CompatFormatNative), h.auth.requireAPIToken, h.requireExtractAPITokenScope(model.CompatFormatNative)).Post("/extract", h.extract)
+		r.With(h.captureUserRequest("search", model.CompatFormatTavily), h.auth.requireTavilyAPITokenScope("search")).Post("/compat/tavily/search", h.tavilySearch)
+		r.With(h.captureUserRequest("extract", model.CompatFormatTavily), tavilyBodyAPIKeyMiddleware, h.auth.requireAPIToken, h.requireExtractAPITokenScope(model.CompatFormatTavily)).Post("/compat/tavily/extract", h.tavilyExtract)
+		r.With(h.captureUserRequest("search", model.CompatFormatSerper), h.auth.requireAPITokenScope("search")).Post("/compat/serper/search", h.serperSearch)
+		r.With(h.captureUserRequest("search", model.CompatFormatOpenAI), h.auth.requireAPITokenScope("search")).Post("/compat/openai/responses-search", h.openAISearch)
 	})
 
 	r.Route("/api/admin", func(r chi.Router) {
@@ -146,6 +149,8 @@ func (h *Handler) Mount(r chi.Router) {
 			r.Post("/settings/admin-api-key", h.rotateAdminAPIKey)
 			r.Get("/logs", h.logs)
 			r.Get("/logs/{id}", h.logDetail)
+			r.Get("/request-logs", h.userRequestLogs)
+			r.Get("/request-logs/{id}", h.userRequestLogDetail)
 			r.Get("/usage/summary", h.usageSummary)
 			r.Get("/usage/billing", h.billingSummary)
 			r.Get("/metrics", h.metrics)
@@ -264,6 +269,7 @@ func (h *Handler) tavilySearch(w http.ResponseWriter, r *http.Request) {
 	if !requireSearchTokenProviders(w, r, &native) {
 		return
 	}
+	observeUserRequestExecution(r.Context(), RequestID(r.Context()))
 	response, err := h.orchestrator.Search(r.Context(), native, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -272,6 +278,8 @@ func (h *Handler) tavilySearch(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, compat.TavilyFromNative(req.Query, response))
 }
 
+// tavilyExtract preserves Tavily validation and error envelopes while recording
+// execution identity only after the compatibility and provider policy checks.
 func (h *Handler) tavilyExtract(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	body, err := readBody(r)
@@ -311,6 +319,7 @@ func (h *Handler) tavilyExtract(w http.ResponseWriter, r *http.Request) {
 		writeTavilyExtractError(w, http.StatusForbidden, err.Error())
 		return
 	}
+	observeUserRequestExecution(r.Context(), RequestID(r.Context()))
 	response, err := h.orchestrator.Extract(r.Context(), native, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
 		if message, ok := extractValidationMessage(err); ok {
@@ -357,6 +366,7 @@ func (h *Handler) serperSearch(w http.ResponseWriter, r *http.Request) {
 	if !requireSearchTokenProviders(w, r, &native) {
 		return
 	}
+	observeUserRequestExecution(r.Context(), RequestID(r.Context()))
 	response, err := h.orchestrator.Search(r.Context(), native, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -393,6 +403,7 @@ func (h *Handler) openAISearch(w http.ResponseWriter, r *http.Request) {
 	if !requireSearchTokenProviders(w, r, &native) {
 		return
 	}
+	observeUserRequestExecution(r.Context(), RequestID(r.Context()))
 	response, err := h.orchestrator.Search(r.Context(), native, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -411,6 +422,7 @@ func (h *Handler) runSearch(w http.ResponseWriter, r *http.Request, req model.Se
 	if !requireSearchTokenProviders(w, r, &req) {
 		return
 	}
+	observeUserRequestExecution(r.Context(), RequestID(r.Context()))
 	response, err := h.orchestrator.Search(r.Context(), req, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -436,6 +448,8 @@ func requireSearchTokenProviders(w http.ResponseWriter, r *http.Request, req *mo
 	return true
 }
 
+// runExtract retains native validation/error mapping and selects execution
+// identity after API validation and provider authorization have succeeded.
 func (h *Handler) runExtract(w http.ResponseWriter, r *http.Request, req model.ExtractRequest) {
 	started := time.Now()
 	if err := validateExtractRequest(req); err != nil {
@@ -446,6 +460,7 @@ func (h *Handler) runExtract(w http.ResponseWriter, r *http.Request, req model.E
 		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}
+	observeUserRequestExecution(r.Context(), RequestID(r.Context()))
 	response, err := h.orchestrator.Extract(r.Context(), req, RequestID(r.Context()), APITokenID(r.Context()))
 	if err != nil {
 		if message, ok := extractValidationMessage(err); ok {
@@ -472,10 +487,13 @@ func (h *Handler) authorizeExtractProviders(r *http.Request, req *model.ExtractR
 	return nil
 }
 
+// recordRejectedExtract exempts these denials from Token admission accounting
+// before selecting their existing metadata-only execution write, even on failure.
 func (h *Handler) recordRejectedExtract(r *http.Request, compatFormat model.CompatFormat, message string, latency time.Duration) {
 	if rejected, ok := r.Context().Value(extractRejectedKey).(*bool); ok {
 		*rejected = true
 	}
+	observeUserRequestExecution(r.Context(), RequestID(r.Context()))
 	if h.store == nil {
 		return
 	}
