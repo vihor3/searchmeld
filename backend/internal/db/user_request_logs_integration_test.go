@@ -391,7 +391,9 @@ func TestPGXUserRequestLogSQLBounds(t *testing.T) {
 		change func(*model.UserRequestLogInput)
 	}{
 		{"empty request ID", func(in *model.UserRequestLogInput) { in.RequestID = "" }},
-		{"long request ID", func(in *model.UserRequestLogInput) { in.RequestID = strings.Repeat("r", model.UserRequestLogIDMaxBytes+1) }},
+		{"long request ID", func(in *model.UserRequestLogInput) {
+			in.RequestID = strings.Repeat("r", model.UserRequestLogIDMaxBytes+1)
+		}},
 		{"empty execution ID", func(in *model.UserRequestLogInput) {
 			value := ""
 			in.ExecutionRequestID = &value
@@ -401,13 +403,19 @@ func TestPGXUserRequestLogSQLBounds(t *testing.T) {
 			in.ExecutionRequestID = &value
 		}},
 		{"multibyte request ID", func(in *model.UserRequestLogInput) { in.RequestID = strings.Repeat("\u754c", 86) }},
-		{"long method", func(in *model.UserRequestLogInput) { in.Method = strings.Repeat("M", model.UserRequestLogMethodMaxBytes+1) }},
+		{"long method", func(in *model.UserRequestLogInput) {
+			in.Method = strings.Repeat("M", model.UserRequestLogMethodMaxBytes+1)
+		}},
 		{"empty method", func(in *model.UserRequestLogInput) { in.Method = "" }},
 		{"long path", func(in *model.UserRequestLogInput) { in.Path = strings.Repeat("p", model.UserRequestLogPathMaxBytes+1) }},
 		{"multibyte path", func(in *model.UserRequestLogInput) { in.Path = strings.Repeat("\u754c", 683) }},
 		{"empty path", func(in *model.UserRequestLogInput) { in.Path = "" }},
-		{"long IP", func(in *model.UserRequestLogInput) { in.ClientIP = strings.Repeat("i", model.UserRequestLogClientIPMaxBytes+1) }},
-		{"long name", func(in *model.UserRequestLogInput) { in.TokenName = strings.Repeat("n", model.UserRequestLogTokenNameMaxBytes+1) }},
+		{"long IP", func(in *model.UserRequestLogInput) {
+			in.ClientIP = strings.Repeat("i", model.UserRequestLogClientIPMaxBytes+1)
+		}},
+		{"long name", func(in *model.UserRequestLogInput) {
+			in.TokenName = strings.Repeat("n", model.UserRequestLogTokenNameMaxBytes+1)
+		}},
 		{"multibyte name", func(in *model.UserRequestLogInput) { in.TokenName = strings.Repeat("\u754c", 86) }},
 		{"unknown operation", func(in *model.UserRequestLogInput) { in.Operation = "other" }},
 		{"unknown format", func(in *model.UserRequestLogInput) { in.CompatFormat = "mcp" }},

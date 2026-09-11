@@ -11,7 +11,7 @@ import (
 func TestUserRequestLogJSONNullability(t *testing.T) {
 	createdAt := time.Date(2026, time.September, 11, 8, 0, 0, 0, time.UTC)
 	log := UserRequestLog{
-		ID:                  7,
+		ID: 7,
 		UserRequestLogInput: UserRequestLogInput{
 			RequestID:  "entry-wire",
 			CreatedAt:  createdAt,

@@ -1201,7 +1201,7 @@ async function populatedLogs(browser, viewport, name) {
   fixture.executions.push({ log: executionLog({ id: 905, request_id: long.execution_request_id, query: 'long entry execution' }), calls: [] })
   const app = await openLogs(browser, { viewport, fixture })
   const all = fixture.entries.map((row) => row.id)
-  const search = app.page.locator('[data-log-filter="user-text"] input')
+  const search = app.page.locator('input[data-log-filter="user-text"]')
   await logRowsAre(app, 'user', all)
   assert.equal(await app.page.locator('.logs-view-tabs [role="tab"][aria-selected="true"]').innerText(), '\u7528\u6237\u8bf7\u6c42')
   assert.equal(await app.page.locator('.kpi-row').count(), 0, 'Execution totals appeared in the entry view')
@@ -1271,7 +1271,7 @@ async function populatedLogs(browser, viewport, name) {
   await logReadSettled(app, '/api/admin/logs')
   await logRowsAre(app, 'execution', [41, 42, 43, 44])
   await app.page.locator('.kpi-row').waitFor()
-  const executionSearch = app.page.locator('[data-log-filter="execution-text"] input')
+  const executionSearch = app.page.locator('input[data-log-filter="execution-text"]')
   await executionSearch.fill('historical-44')
   await logRowsAre(app, 'execution', [44])
   await logView(app, 'user')
@@ -1334,7 +1334,7 @@ async function populatedLogs(browser, viewport, name) {
 /** Follows exact numeric links outside the execution window and preserves retry/cache/legacy result details. */
 async function logCorrelation(browser) {
   const app = await openLogs(browser)
-  const search = app.page.locator('[data-log-filter="user-text"] input')
+  const search = app.page.locator('input[data-log-filter="user-text"]')
   for (const [entryId, executionId] of [[41, 901], [49, 902], [45, 903], [48, 904]]) {
     await search.fill('entry-' + entryId)
     await logRowsAre(app, 'user', [entryId])
