@@ -1623,19 +1623,25 @@ func (s *Store) DeleteExpiredCache(ctx context.Context) error {
 	return err
 }
 
-func (s *Store) DeleteOldLogs(ctx context.Context, retentionDays int) (int64, int64, error) {
+// DeleteOldLogs independently expires execution, audit and user-request records.
+// Nonpositive retention uses three days; failures retain earlier deletion counts.
+func (s *Store) DeleteOldLogs(ctx context.Context, retentionDays int) (searchDeleted, auditDeleted, userRequestDeleted int64, err error) {
 	if retentionDays <= 0 {
 		retentionDays = 3
 	}
 	searchResult, err := s.pool.Exec(ctx, `DELETE FROM search_requests WHERE created_at < now() - make_interval(days => $1)`, retentionDays)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	auditResult, err := s.pool.Exec(ctx, `DELETE FROM audit_logs WHERE created_at < now() - make_interval(days => $1)`, retentionDays)
 	if err != nil {
-		return searchResult.RowsAffected(), 0, err
+		return searchResult.RowsAffected(), 0, 0, err
 	}
-	return searchResult.RowsAffected(), auditResult.RowsAffected(), nil
+	userRequestResult, err := s.pool.Exec(ctx, `DELETE FROM user_request_logs WHERE created_at < now() - make_interval(days => $1)`, retentionDays)
+	if err != nil {
+		return searchResult.RowsAffected(), auditResult.RowsAffected(), 0, err
+	}
+	return searchResult.RowsAffected(), auditResult.RowsAffected(), userRequestResult.RowsAffected(), nil
 }
 
 func weightOrDefault(value int) int {

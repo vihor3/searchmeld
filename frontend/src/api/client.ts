@@ -260,6 +260,32 @@ export interface SearchLog {
   created_at: string
 }
 
+/** Request-time entry metadata; nullable fields never imply HTTP success or an execution. */
+export interface UserRequestLog {
+  id: number
+  request_id: string
+  created_at: string
+  operation: 'search' | 'extract' | 'mcp'
+  compat_format: string
+  method: string
+  path: string
+  client_ip: string
+  auth_type: 'unknown' | 'anonymous' | 'api_token' | 'admin_key'
+  token_name: string
+  api_token_id: number | null
+  http_status: number | null
+  completion: 'completed' | 'interrupted' | 'canceled' | 'write_error'
+  latency_ms: number
+  mcp_error_count: number
+  mcp_tool_error_count: number
+  execution_request_id: string | null
+}
+
+export interface UserRequestLogDetail {
+  log: UserRequestLog
+  execution_log_id: number | null
+}
+
 export interface ProviderCallLog {
   provider_key_id: number
   provider_name: string
@@ -368,6 +394,10 @@ export const api = {
   rotateAdminAPIKey: () => apiFetch<AdminAPIKey>('/api/admin/settings/admin-api-key', { method: 'POST' }),
   logs: (limit?: number) => apiFetch<{ logs: SearchLog[] }>(limit == null ? '/api/admin/logs' : `/api/admin/logs?limit=${Math.max(1, Math.min(limit, 1000))}`),
   logDetail: (id: number) => apiFetch<{ log: SearchLog; calls: ProviderCallLog[] }>('/api/admin/logs/' + id),
+  /** Read the configured recent entry window through the shared admin/session boundary. */
+  userRequestLogs: (limit?: number) => apiFetch<{ logs: UserRequestLog[] }>(limit == null ? '/api/admin/request-logs' : `/api/admin/request-logs?limit=${Math.max(1, Math.min(limit, 1000))}`),
+  /** Resolve a numeric execution link server-side, independently of either loaded list. */
+  userRequestLogDetail: (id: number) => apiFetch<UserRequestLogDetail>('/api/admin/request-logs/' + id),
   usageSummary: () => apiFetch<UsageSummary>('/api/admin/usage/summary'),
   billingSummary: (days = 30) => apiFetch<BillingSummary>(`/api/admin/usage/billing?days=${days}`),
   providerHealth: () => apiFetch<{ providers: ProviderHealth[] }>('/api/admin/providers/health'),

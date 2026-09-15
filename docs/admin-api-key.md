@@ -189,8 +189,10 @@ curl "$BASE_URL/api/admin/dashboard" \
 | `PUT` | `/api/admin/settings` | 可以 | 覆盖更新运行时设置。 |
 | `GET` | `/api/admin/settings/admin-api-key` | 可以 | 查看管理员 API Key 元信息。 |
 | `POST` | `/api/admin/settings/admin-api-key` | 可以 | 生成/轮换管理员 API Key。 |
-| `GET` | `/api/admin/logs` | 可以 | 获取请求日志列表（Search / Extract）。支持 `limit`。 |
-| `GET` | `/api/admin/logs/{id}` | 可以 | 获取单条请求日志详情和 Provider 调用明细。 |
+| `GET` | `/api/admin/request-logs` | 可以 | 获取用户入口请求日志列表（Search / Extract / MCP）。支持 `limit`。 |
+| `GET` | `/api/admin/request-logs/{id}` | 可以 | 获取入口元数据和关联执行日志 ID。 |
+| `GET` | `/api/admin/logs` | 可以 | 获取执行日志列表（Search / Extract）。支持 `limit`。 |
+| `GET` | `/api/admin/logs/{id}` | 可以 | 获取单条执行日志详情和 Provider 调用明细。 |
 | `GET` | `/api/admin/usage/summary` | 可以 | 获取总体用量汇总。 |
 | `GET` | `/api/admin/usage/billing` | 可以 | 获取账单/计量汇总。支持 `days`。 |
 | `GET` | `/api/admin/metrics` | 可以 | 获取网关指标聚合。 |
@@ -550,20 +552,55 @@ curl -X PUT "$BASE_URL/api/admin/settings" \
 | `allow_private_extract_targets` | 是否允许 Extract 请求明显的私网、环回、链路本地或常见内网域名目标；默认 `false`，仅可信内网场景开启。 |
 | `provider_health_window_minutes` | Provider 健康统计窗口。 |
 | `provider_routing_strategy` | Provider 级路由策略：`fixed`、`priority`、`weighted`、`weighted_random`、`available_keys`、`random`。 |
-| `log_retention_days` | 搜索日志和审计日志保留天数。 |
+| `log_retention_days` | 用户入口、搜索／抽取执行及审计日志的保留天数。 |
+| `search_logs_limit` | 请求日志页每个视图的近窗条数，最多 1000；不表示历史总量。 |
 
 ### 5.11 查看日志和审计日志
 
-管理台的仪表盘、搜索日志和审计日志表格会限制在右侧内容区域内滚动，避免内容较多时触发浏览器全局滚动条。
+“请求日志”默认展示“用户请求”，可切换到“执行日志”查看原有历史。入口记录与执行记录分别计数，新增入口记录不增加 Token 用量、配额或账单。界面筛选作用于当前载入的近窗，不是全库历史查询。
 
-搜索日志列表：
+用户入口日志列表：
+
+```bash
+curl "$BASE_URL/api/admin/request-logs?limit=100" \
+  -H "Authorization: Bearer $ADMIN_API_KEY"
+```
+
+返回 `{"logs":[...]}`。省略或传入无效 `limit` 时沿用 `search_logs_limit`；每次最多返回 1000 条，按请求开始时间、日志 ID 倒序排列。普通业务 Token 无权读取日志。
+
+用户入口日志详情：
+
+```bash
+curl "$BASE_URL/api/admin/request-logs/1" \
+  -H "Authorization: Bearer $ADMIN_API_KEY"
+```
+
+返回 `{"log":{...},"execution_log_id":123}`，无对应执行记录时 `execution_log_id` 为 `null`。入口日志 ID 与执行日志 ID 是两个独立编号；有执行 ID 时，可用下方 `/api/admin/logs/{id}` 读取渠道调用和结果。无效或非正数入口 ID 返回 400，不存在的入口返回 404。
+
+| 入口字段 | 说明 |
+| --- | --- |
+| `request_id`、`created_at` | 服务端请求 ID 和请求开始时间；请求 ID 保留已有的客户端相关前缀规则。 |
+| `operation`、`compat_format` | 路由操作及兼容格式；MCP 操作为 `mcp`。 |
+| `method`、`path`、`client_ip` | 请求方法、接口路径和可信对端 IP，不含 URL 查询参数、端口或任意转发头内容。 |
+| `auth_type` | `api_token`、`admin_key`、`anonymous` 或 `unknown`；未验证的凭证不会被当作已识别用户。 |
+| `api_token_id`、`token_name` | 已验证普通 Token 的 ID 和请求时名称快照；改名或删除 Token 不改写历史。未识别普通 Token 时 ID 为 `null`。 |
+| `http_status`、`completion` | 首个最终 HTTP 状态及处理结果：`completed`、`interrupted`、`canceled`、`write_error`。写出最终状态前中断时状态可为 `null`，不会伪造 500。 |
+| `latency_ms` | 处理耗时，不包含新增入口记录的数据库写入等待。 |
+| `mcp_error_count`、`mcp_tool_error_count` | MCP 协议错误和工具错误计数；应与 HTTP 状态分别判断。 |
+| `execution_request_id` | 实际选定的执行请求 ID；未进入执行、也未选择已有拒绝日志路径时为 `null`。有此 ID 但执行日志不可用时，不表示提供商一定未被调用。 |
+
+入口记录覆盖到达 Go 业务路由的六个原生／兼容 POST 接口，以及启用的 MCP 路径和别名。纯发现、通知、参数错误、认证失败、权限拒绝和限流也可生成入口记录。MCP 每批仍最多一次工具调用；多个 Provider 或重试属于同一执行日志。管理接口（含调试）、健康检查、静态文件、CORS 预检、未匹配路由及 Nginx 转发前的拒绝不生成此类记录。
+
+新入口日志只保存有长度限制的元数据，不复制 Authorization、X-API-Key、Cookie、Tavily 请求体 Key、原始请求／响应或任意错误正文。请求 ID 和管理员定义的 Token 名称沿用已有显示字段。写入采用独立、最多两秒的尽力记录，失败不替换原接口响应，也不重放计费；数据库不可用或进程退出时可能缺失。入口、执行和审计日志共用现有保留天数及定期清理，历史执行数据不会补造来源或入口记录。
+
+执行日志列表：
 
 ```bash
 curl "$BASE_URL/api/admin/logs?limit=100" \
   -H "Authorization: Bearer $ADMIN_API_KEY"
 ```
 
-搜索日志详情：
+执行日志详情：
 
 ```bash
 curl "$BASE_URL/api/admin/logs/1" \

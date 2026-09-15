@@ -296,6 +296,12 @@ type statusRecorder struct {
 	status int
 }
 
+// Unwrap lets route-local observers and ResponseController reach the original
+// transport without adding unsupported optional interfaces to this wrapper.
+func (s *statusRecorder) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}
+
 func (s *statusRecorder) WriteHeader(status int) {
 	s.status = status
 	s.ResponseWriter.WriteHeader(status)

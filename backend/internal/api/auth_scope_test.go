@@ -317,6 +317,12 @@ type scopeAuthStore struct {
 	usageMarks    int
 }
 
+// RecordUserRequestLog isolates existing auth fixtures from entry persistence;
+// dedicated entry fixtures override this method to assert captured metadata.
+func (*scopeAuthStore) RecordUserRequestLog(context.Context, model.UserRequestLogInput) error {
+	return nil
+}
+
 func (s *scopeAuthStore) GetAdminByUsername(context.Context, string) (model.AdminUser, error) {
 	return model.AdminUser{}, nil
 }

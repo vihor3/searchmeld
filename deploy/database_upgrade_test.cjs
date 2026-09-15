@@ -8,6 +8,7 @@ const { execFile } = require('node:child_process')
 const { randomBytes } = require('node:crypto')
 const { mkdir, rm, writeFile } = require('node:fs/promises')
 const http = require('node:http')
+const { isIP } = require('node:net')
 const { join, resolve } = require('node:path')
 const { isDeepStrictEqual, promisify } = require('node:util')
 
@@ -404,10 +405,87 @@ async function verifyPreserved(name, expected, seeded, { current = false } = {})
   check(usage.requests_total === 3 && usage.cache_hits === 3, 'Persisted usage must remain visible')
 }
 
+/** Reads whole new-table rows only from the current image, retaining snapshots solely in process memory. */
+async function userRequestSnapshot(name) {
+  return decodeJSON(await sql(name, "SELECT COALESCE(json_agg(t ORDER BY id), '[]'::json) FROM user_request_logs t;"), 'User entry snapshot')
+}
+
+/**
+ * Runs only after current-image startup: requires an empty additive table and
+ * reads the old execution payload through its unchanged detail endpoint.
+ */
+async function verifyEntryMigration(name, seeded) {
+  check(await sql(name, "SELECT to_regclass('public.user_request_logs') IS NOT NULL;") === 't', 'Current migration must create the user entry table')
+  check(isDeepStrictEqual(await userRequestSnapshot(name), []), 'Migration must not fabricate entries from historical executions')
+  const headers = { 'X-API-Key': seeded.adminKey }
+  const options = { current: true }
+  const entries = (await api('/api/admin/request-logs', { headers }, 200, options)).json
+  check(isDeepStrictEqual(entries, { logs: [] }), 'Current entry API must start empty after a historical upgrade')
+  const logs = (await api('/api/admin/logs', { headers }, 200, options)).json.logs
+  const historical = logs.find((log) => log.request_id === 'upgrade-persisted-request')
+  check(Number.isSafeInteger(historical?.id) && historical.id > 0, 'Historical execution identity must remain available')
+  const detail = (await api(`/api/admin/logs/${historical.id}`, { headers }, 200, options)).json
+  check(detail.log.request_id === 'upgrade-persisted-request' && detail.log.query === 'synthetic upgrade record', 'Historical execution detail must retain its identity and query')
+  check(isDeepStrictEqual(detail.log.request_json, { query: 'synthetic upgrade record' }) &&
+    isDeepStrictEqual(detail.log.response_json, { fixture: 'persisted' }) && isDeepStrictEqual(detail.calls, []), 'Historical execution payload and empty calls must stay readable')
+  check(!Object.hasOwn(detail.log, 'client_ip') && !Object.hasOwn(detail.log, 'auth_type') && !Object.hasOwn(detail.log, 'http_status'), 'Old execution detail must not invent entry metadata')
+}
+
+/** Validates allowlisted API/SQL metadata and caller snapshots while keeping every failure credential-safe. */
+function checkUserRequest(log, expected, privateValues) {
+  check(log !== null && typeof log === 'object' && !Array.isArray(log), 'User entry must be an object')
+  const serialized = JSON.stringify(log)
+  check(privateValues.every((value) => !serialized.includes(value)), 'User entries must exclude credential and payload sentinels')
+  check(isDeepStrictEqual(Object.keys(log).sort(), [
+    'id', 'request_id', 'created_at', 'operation', 'compat_format', 'method', 'path', 'client_ip',
+    'auth_type', 'api_token_id', 'token_name', 'http_status', 'completion', 'latency_ms',
+    'mcp_error_count', 'mcp_tool_error_count', 'execution_request_id'
+  ].sort()), 'User entry must contain only the frozen metadata fields')
+  check(Number.isSafeInteger(log.id) && log.id > 0 && Number.isFinite(Date.parse(log.created_at)), 'User entry needs a persistent ID and request timestamp')
+  check(Number.isSafeInteger(log.latency_ms) && log.latency_ms >= 0 && isIP(log.client_ip) > 0, 'User entry needs nonnegative duration and a port-free peer IP')
+  for (const [field, value] of Object.entries(expected)) check(log[field] === value, `User entry ${field} must retain the request outcome`)
+}
+
+/**
+ * Waits up to ten seconds for current-image completion writes, retrying only absent
+ * rows. Checks one exact entry per reply and explicit null execution links.
+ */
+async function currentUserRequests(headers, cases, privateValues) {
+  check(new Set(cases.map((entry) => entry.request_id)).size === cases.length, 'Each business reply must have a distinct server request ID')
+  const options = { current: true }
+  const deadline = Date.now() + 10000
+  let logs
+  while (Date.now() < deadline) {
+    const reply = await api('/api/admin/request-logs?limit=1000', {
+      headers, timeout: Math.max(1, Math.min(2000, deadline - Date.now()))
+    }, 200, options)
+    check(isDeepStrictEqual(Object.keys(reply.json), ['logs']) && Array.isArray(reply.json.logs), 'Current entry list must return an array envelope')
+    logs = reply.json.logs
+    if (cases.every((entry) => logs.some((log) => log.request_id === entry.request_id))) break
+    await new Promise((done) => setTimeout(done, Math.max(0, Math.min(100, deadline - Date.now()))))
+  }
+  check(cases.every((entry) => logs?.some((log) => log.request_id === entry.request_id)), 'Completion entries must persist within ten seconds')
+  check(logs.length === cases.length, 'Admin probes must not produce user entries or fabricated history')
+  const details = []
+  for (const expected of cases) {
+    const matching = logs.filter((log) => log.request_id === expected.request_id)
+    check(matching.length === 1, 'One persisted user entry is required per business request')
+    const [log] = matching
+    checkUserRequest(log, expected, privateValues)
+    const detail = (await api(`/api/admin/request-logs/${log.id}`, { headers }, 200, options)).json
+    check(isDeepStrictEqual(Object.keys(detail).sort(), ['execution_log_id', 'log']), 'Current entry detail must retain the frozen envelope')
+    checkUserRequest(detail.log, expected, privateValues)
+    check(isDeepStrictEqual(detail.log, log) && detail.execution_log_id === null, 'Entry-only validation must retain its metadata and explicit null execution link')
+    details.push(detail)
+  }
+  return details
+}
+
 /**
  * Checks old-account login with new Cookie/proof policy, header-session rejection,
- * public-auth exclusion and logout/restart revocation. Persisted Key/Token calls
- * use empty queries to establish admission without invoking providers.
+ * public-auth exclusion and logout/restart revocation. Current-image entry-only
+ * requests must persist without changing execution/accounting, including across
+ * migration replay; the old/recovery image never calls the new table or routes.
  */
 async function verifyCookieMigration(name, credentials, seeded) {
   const cookie = await loginCurrent(credentials)
@@ -420,15 +498,65 @@ async function verifyCookieMigration(name, credentials, seeded) {
     }
   }
   await api('/api/admin/me', { headers: { Cookie: cookie } }, 403, options)
+  const beforeBusiness = await snapshot(name)
+  const payloadSentinel = `upgrade-entry-private-${randomBytes(16).toString('hex')}`
+  const privateValues = [credentials.password, seeded.oldSession, seeded.adminKey, seeded.businessToken, cookie.slice(`${cookieName}=`.length), payloadSentinel]
+  const cases = []
   // Empty queries prove admission without running any provider or paid request.
-  for (const [credentials, status] of [[{ Cookie: cookie }, 401], [{ Authorization: `Bearer ${seeded.businessToken}` }, 400], [{ 'X-API-Key': seeded.adminKey }, 400]]) {
-    await api('/v1/search', { method: 'POST', headers: credentials, body: { query: '' } }, status)
+  for (const [credential, status, authType] of [
+    [{ Cookie: cookie }, 401, 'unknown'],
+    [{ Authorization: `Bearer ${seeded.businessToken}` }, 400, 'api_token'],
+    [{ 'X-API-Key': seeded.adminKey }, 400, 'admin_key']
+  ]) {
+    const reply = await request(`/v1/search?api_key=${payloadSentinel}`, {
+      method: 'POST', headers: credential, body: { query: '', unretained: payloadSentinel }
+    })
+    check(reply.status === status, 'Mounted business call must retain its credential/validation status')
+    const body = decodeJSON(reply.body, 'Business validation reply')
+    check(body.error?.status === status && (status !== 400 || body.error.message === 'query is required'), 'Empty-query requests must stop before provider execution')
+    const requestID = reply.headers['x-request-id']
+    check(typeof requestID === 'string' && requestID.length > 0 && Buffer.byteLength(requestID) <= 256, 'Mounted Go validation must return its server request ID')
+    cases.push({
+      request_id: requestID, operation: 'search', compat_format: 'native', method: 'POST', path: '/v1/search',
+      auth_type: authType, api_token_id: authType === 'api_token' ? seeded.tokenID : null,
+      token_name: authType === 'api_token' ? 'upgrade-synthetic-token' : '', http_status: status,
+      completion: 'completed', mcp_error_count: 0, mcp_tool_error_count: 0, execution_request_id: null
+    })
   }
+  const entries = await currentUserRequests(headers, cases, privateValues)
+  const persistedEntries = await userRequestSnapshot(name)
+  check(persistedEntries.length === cases.length, 'The new table must contain only current-image entry requests')
+  for (const expected of cases) {
+    const matching = persistedEntries.filter((log) => log.request_id === expected.request_id)
+    check(matching.length === 1, 'Current API entries must each have one physical database row')
+    checkUserRequest(matching[0], expected, privateValues)
+    const listed = entries.find((detail) => detail.log.request_id === expected.request_id).log
+    check(matching[0].id === listed.id && matching[0].client_ip === listed.client_ip &&
+      matching[0].latency_ms === listed.latency_ms && Date.parse(matching[0].created_at) === Date.parse(listed.created_at), 'Stored entry metadata must agree with the admin API')
+  }
+  for (const credential of [{ Authorization: `Bearer ${seeded.adminKey}` }, { 'X-API-Key': seeded.adminKey }]) {
+    check(isDeepStrictEqual(await currentUserRequests(credential, cases, privateValues), entries), 'Key-only and Cookie entry reads must agree')
+  }
+  for (const path of ['/api/admin/request-logs', `/api/admin/request-logs/${entries[0].log.id}`]) {
+    for (const credential of [proof, { Authorization: `Bearer ${seeded.businessToken}` }, { 'X-API-Key': seeded.businessToken }, { ...headers, Authorization: `Bearer ${seeded.businessToken}` }]) {
+      await api(path, { headers: credential }, 401, options)
+    }
+    await api(path, { headers: { Cookie: cookie } }, 403, options)
+  }
+  const afterBusiness = await snapshot(name)
+  for (const table of ['requests', 'usage', 'cache']) check(isDeepStrictEqual(afterBusiness[table], beforeBusiness[table]), `Entry-only validation must not change historical ${table}`)
+  const beforeToken = beforeBusiness.tokens.find((token) => token.id === seeded.tokenID)
+  const afterToken = afterBusiness.tokens.find((token) => token.id === seeded.tokenID)
+  check(afterToken.usage_count === beforeToken.usage_count + 1, 'One admitted ordinary request must increment Token usage exactly once')
   await api('/api/admin/logout', { method: 'POST', headers }, 200, options)
   await api('/api/admin/me', { headers }, 401, options)
   const beforeRestart = await loginCurrent(credentials)
+  const beforeRestartData = await snapshot(name)
   await docker(['restart', '--time', '30', name], { timeout: 60000 })
   await waitHealthy(name)
+  await verifyPreserved(name, beforeRestartData, seeded, { current: true })
+  check(isDeepStrictEqual(await userRequestSnapshot(name), persistedEntries), 'Current-image restart and migration replay must retain every entry row unchanged')
+  check(isDeepStrictEqual(await currentUserRequests({ 'X-API-Key': seeded.adminKey }, cases, privateValues), entries), 'Entry details and null execution links must survive restart')
   await api('/api/admin/me', { headers: { ...proof, Cookie: beforeRestart } }, 401, options)
   await api('/api/admin/me', { headers: { 'X-API-Key': seeded.adminKey } }, 200, options)
   await loginCurrent(credentials)
@@ -511,8 +639,9 @@ async function verifyMismatch(environmentPath) {
 /**
  * Checks the Actions checkout SHA and records the current image ID. Exercises
  * historical PG16 data upgrade with original encryption/database secrets and an
- * empty startup admin password, clean stopped-backup recovery under the historical
- * image, and PG17 rejection/recovery. finish() owns success/failure/signal cleanup.
+ * empty startup admin password, additive entry migration/restart persistence, clean
+ * stopped-backup recovery under the historical image, and PG17 rejection/recovery.
+ * finish() owns success/failure/signal cleanup.
  */
 async function main() {
   check(/^searchmeld-db-upgrade-[0-9]+-[0-9]+$/.test(prefix || ''), 'A run-scoped UPGRADE_CONTAINER_PREFIX is required')
@@ -558,6 +687,7 @@ async function main() {
   await removeContainer(oldName)
   await startApp(currentName, currentImage, dataVolume, currentEnvironment)
   await verifyPreserved(currentName, expected, seeded, { current: true })
+  await verifyEntryMigration(currentName, seeded)
   await verifyCookieMigration(currentName, credentials, seeded)
   console.log('Historical credentials, encrypted secrets, settings, history and new Cookie transport passed')
   await stopApp(currentName)
